@@ -16,7 +16,6 @@ import ActivityRail from "./components/ActivityRail";
 import AppearanceSettings from "./components/AppearanceSettings";
 import AssistantRail from "./components/AssistantRail";
 import AiAssistant from "./components/AiAssistant";
-import type { AssistantMessage } from "./components/AiAssistant";
 import CodeEditor from "./components/CodeEditor";
 import type {
   CodeEditorHandle,
@@ -43,6 +42,7 @@ import type { AssistantSettings } from "./lib/assistantSettings";
 import { generateCommitMessage } from "./lib/commitMessage";
 import {
   loadAssistantSettings,
+  loadStoredApiKey,
   saveAssistantSettings,
 } from "./lib/assistantSettings";
 import {
@@ -57,13 +57,28 @@ import {
 } from "./lib/git";
 import type { GitStatus } from "./lib/git";
 import { pathPrompt, selectionPrompt } from "./lib/assistantPrompt";
+import {
+  appendDelta,
+  finishBlocks,
+  historyContent,
+  upsertStep,
+} from "./lib/assistantMessages";
+import type {
+  AssistantMessage,
+  MessageBlock,
+} from "./lib/assistantMessages";
 import { setInlineCompletionModel } from "./lib/inlineCompletion";
 import { languageForPath } from "./lib/languages";
 import { isFontPath, isImagePath } from "./lib/media";
 import { applyTheme, loadThemeId, saveThemeId } from "./lib/themes";
 import { monaco } from "./lib/monacoSetup";
-import { cancelAgent, runAgent } from "./lib/nim";
-import type { AgentDelta, AgentStep, ChatMessage } from "./lib/nim";
+import { cancelAgent, decideChange, runAgent } from "./lib/nim";
+import type {
+  AgentDelta,
+  AgentStep,
+  ApprovalRequest,
+  ChatMessage,
+} from "./lib/nim";
 import { isTauri, toError } from "./lib/tauriBridge";
 import type { ExplorerNode, FolderNode } from "./lib/workspace";
 import { modelUri } from "./lib/workspace";
@@ -95,6 +110,7 @@ import {
 } from "./lib/workspaceTree";
 
 const MAX_CONTEXT_CHARS = 24_000;
+const AUTO_APPROVE_KEY = "nexium.assistant.autoApprove";
 
 /** The Rust client reports a dead connection when NVIDIA stays silent. */
 function stalled(message: string): boolean {
@@ -172,11 +188,32 @@ export default function App() {
   const [assistantPending, setAssistantPending] = useState(false);
   // A prompt from a right-click action; the assistant composer takes it once.
   const [assistantSeed, setAssistantSeed] = useState<string | null>(null);
-  const [live, setLive] = useState<{
-    steps: AgentStep[];
-    reasoning: string;
-    text: string;
-  } | null>(null);
+  // The running turn as a timeline. The ref is the source of truth so the
+  // finished message can be built from it the moment the run resolves.
+  const [live, setLive] = useState<{ blocks: MessageBlock[] } | null>(null);
+  const liveBlocks = useRef<MessageBlock[] | null>(null);
+  const updateLive = useCallback(
+    (update: (blocks: MessageBlock[]) => MessageBlock[]) => {
+      if (!liveBlocks.current) {
+        return;
+      }
+
+      liveBlocks.current = update(liveBlocks.current);
+      setLive({ blocks: liveBlocks.current });
+    },
+    [],
+  );
+  const startLive = useCallback((blocks: MessageBlock[] = []) => {
+    liveBlocks.current = blocks;
+    setLive({ blocks });
+  }, []);
+  // Proposed file changes waiting on Accept/Reject, keyed by step id.
+  const [approvals, setApprovals] = useState<Record<number, ApprovalRequest>>(
+    {},
+  );
+  const [autoApprove, setAutoApprove] = useState(
+    () => localStorage.getItem(AUTO_APPROVE_KEY) === "true",
+  );
   const [view, setView] = useState<"editor" | "settings">("editor");
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("appearance");
@@ -184,6 +221,21 @@ export default function App() {
   const [settings, setSettings] = useState<AssistantSettings>(
     loadAssistantSettings,
   );
+  // The key lives in the OS credential store, which can only be read
+  // asynchronously, so it joins the settings once it arrives.
+  useEffect(() => {
+    let cancelled = false;
+
+    void loadStoredApiKey().then((apiKey) => {
+      if (!cancelled && apiKey) {
+        setSettings((current) => ({ ...current, apiKey }));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const nextMessageId = useRef(1);
   const workspaceSources = useRef<Set<string>>(new Set());
   // Settings owns the whole window, so the assistant and the left panel step
@@ -253,6 +305,14 @@ export default function App() {
 
       event.preventDefault();
       event.stopPropagation();
+
+      // The shell starts in the project folder, so there is nothing to show
+      // until one is open.
+      if (!rootPath) {
+        setNotice("Open a project to use the terminal.");
+        return;
+      }
+
       setView("editor");
       setTerminalUsed(true);
       // Settings hides the panel without closing it, so asking for the
@@ -263,7 +323,7 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown, true);
 
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [view]);
+  }, [view, rootPath]);
 
   // In chat-only mode the assistant covers the window, so Escape is the way back.
   useEffect(() => {
@@ -722,14 +782,11 @@ export default function App() {
   );
 
   const handleSendPrompt = useCallback(
-    async (text: string) => {
+    async (text: string, earlier: AssistantMessage[] = assistantMessages) => {
       const userId = nextMessageId.current;
       nextMessageId.current += 1;
 
-      setAssistantMessages((current) => [
-        ...current,
-        { id: userId, role: "user", text },
-      ]);
+      setAssistantMessages([...earlier, { id: userId, role: "user", text }]);
 
       if (!settings.apiKey || !settings.model) {
         setAssistantMessages((current) => [
@@ -744,36 +801,37 @@ export default function App() {
         return;
       }
 
+      // The open file rides along as context; Rust folds it into its own
+      // system prompt so the model only ever sees one.
       const system: ChatMessage[] =
         contextPath && activeContent !== undefined
           ? [
               {
                 role: "system",
-                content: `You are the assistant inside Nexium Studio, a local code editor. The user has ${contextPath} open. Help with this file when relevant and keep answers concise.\n\nFile: ${contextPath}\n\`\`\`\n${activeContent.slice(0, MAX_CONTEXT_CHARS)}\n\`\`\``,
+                content: `The user has \`${contextPath}\` open in the editor. Help with this file when relevant.\n\nFile: ${contextPath}\n\`\`\`\n${activeContent.slice(0, MAX_CONTEXT_CHARS)}\n\`\`\``,
               },
             ]
           : [];
 
       const history: ChatMessage[] = [
         ...system,
-        ...assistantMessages
+        ...earlier
           .filter((message) => !message.error)
           .map((message) => ({
             role: message.role as "user" | "assistant",
-            content: message.text,
+            content:
+              message.role === "assistant"
+                ? historyContent(message)
+                : message.text,
           })),
         { role: "user", content: text },
       ];
 
-      setAssistantPending(true);
-      setLive({ steps: [], reasoning: "", text: "" });
-
-      try {
-        const reply = await runAgent(
-          settings.apiKey,
-          settings.model,
-          history,
-        );
+      const finish = (
+        reply: Awaited<ReturnType<typeof runAgent>>,
+        prefix: MessageBlock[] = [],
+      ) => {
+        const blocks = finishBlocks(liveBlocks.current ?? prefix, reply);
 
         setAssistantMessages((current) => [
           ...current,
@@ -781,10 +839,37 @@ export default function App() {
             id: nextMessageId.current++,
             role: "assistant",
             text: reply.text,
-            reasoning: reply.reasoning,
-            steps: reply.steps,
+            blocks,
+            outOfSteps: reply.out_of_steps === true,
           },
         ]);
+      };
+
+      // A stopped or failed run keeps what it already did on screen.
+      const fail = (message: string, stopped: boolean) => {
+        const blocks = (liveBlocks.current ?? []).filter(
+          (block) => block.type === "step",
+        );
+
+        setAssistantMessages((current) => [
+          ...current,
+          {
+            id: nextMessageId.current++,
+            role: "assistant",
+            error: !stopped,
+            text: message,
+            blocks: blocks.length > 0 && stopped ? blocks : undefined,
+          },
+        ]);
+      };
+
+      setAssistantPending(true);
+      startLive();
+
+      try {
+        finish(
+          await runAgent(settings.apiKey, settings.model, history, autoApprove),
+        );
       } catch (cause) {
         const failure = toError(cause, "The request failed.");
         const stopped = failure.message === "Stopped.";
@@ -799,60 +884,88 @@ export default function App() {
             status: "done",
           };
 
-          setLive({ steps: [note], reasoning: "", text: "" });
+          startLive([{ type: "step", step: note }]);
 
           try {
-            const reply = await runAgent(
-              settings.apiKey,
-              alternative,
-              history,
+            finish(
+              await runAgent(settings.apiKey, alternative, history, autoApprove),
             );
-
-            setAssistantMessages((current) => [
-              ...current,
-              {
-                id: nextMessageId.current++,
-                role: "assistant",
-                text: reply.text,
-                reasoning: reply.reasoning,
-                steps: [note, ...reply.steps],
-              },
-            ]);
-            return;
           } catch (retryCause) {
             const retryFailure = toError(retryCause, "The request failed.");
-            const retryStopped = retryFailure.message === "Stopped.";
-
-            setAssistantMessages((current) => [
-              ...current,
-              {
-                id: nextMessageId.current++,
-                role: "assistant",
-                error: !retryStopped,
-                text: retryFailure.message,
-                steps: [note],
-              },
-            ]);
-            return;
+            fail(retryFailure.message, retryFailure.message === "Stopped.");
           }
+        } else {
+          fail(failure.message, stopped);
         }
-
-        setAssistantMessages((current) => [
-          ...current,
-          {
-            id: nextMessageId.current++,
-            role: "assistant",
-            error: !stopped,
-            text: failure.message,
-          },
-        ]);
       } finally {
+        liveBlocks.current = null;
         setAssistantPending(false);
         setLive(null);
+        setApprovals({});
       }
     },
-    [activeContent, assistantMessages, contextPath, settings],
+    [
+      activeContent,
+      assistantMessages,
+      autoApprove,
+      contextPath,
+      settings,
+      startLive,
+    ],
   );
+
+  const handleDecide = useCallback((stepId: number, accept: boolean) => {
+    setApprovals((current) => {
+      const next = { ...current };
+      delete next[stepId];
+      return next;
+    });
+    void decideChange(stepId, accept).catch((cause) => {
+      setNotice(toError(cause, "The decision could not be sent.").message);
+    });
+  }, []);
+
+  const handleRetry = useCallback(
+    (messageId: number) => {
+      const index = assistantMessages.findIndex(
+        (message) => message.id === messageId,
+      );
+      let userIndex = index - 1;
+
+      while (userIndex >= 0 && assistantMessages[userIndex].role !== "user") {
+        userIndex -= 1;
+      }
+
+      if (userIndex < 0) {
+        return;
+      }
+
+      void handleSendPrompt(
+        assistantMessages[userIndex].text,
+        assistantMessages.slice(0, userIndex),
+      );
+    },
+    [assistantMessages, handleSendPrompt],
+  );
+
+  const handleContinue = useCallback(() => {
+    void handleSendPrompt(
+      "Continue where you left off and finish the task.",
+    );
+  }, [handleSendPrompt]);
+
+  const handleNewChat = useCallback(() => {
+    setAssistantMessages([]);
+    setApprovals({});
+  }, []);
+
+  const toggleAutoApprove = useCallback(() => {
+    setAutoApprove((current) => {
+      const next = !current;
+      localStorage.setItem(AUTO_APPROVE_KEY, String(next));
+      return next;
+    });
+  }, []);
 
   // Tool steps and streamed tokens arrive as events while the agent works.
   useEffect(() => {
@@ -876,34 +989,15 @@ export default function App() {
     };
 
     attach<AgentStep>("agent-step", (step) => {
-      setLive((current) => {
-        if (!current) {
-          return current;
-        }
-
-        const steps = [...current.steps];
-        const index = steps.findIndex((entry) => entry.id === step.id);
-
-        if (index >= 0) {
-          steps[index] = step;
-        } else {
-          steps.push(step);
-        }
-
-        return { ...current, steps };
-      });
+      updateLive((blocks) => upsertStep(blocks, step));
     });
 
     attach<AgentDelta>("agent-delta", (delta) => {
-      setLive((current) => {
-        if (!current) {
-          return current;
-        }
+      updateLive((blocks) => appendDelta(blocks, delta));
+    });
 
-        return delta.kind === "reasoning"
-          ? { ...current, reasoning: current.reasoning + delta.text }
-          : { ...current, text: current.text + delta.text };
-      });
+    attach<ApprovalRequest>("agent-approval", (request) => {
+      setApprovals((current) => ({ ...current, [request.stepId]: request }));
     });
 
     return () => {
@@ -913,7 +1007,7 @@ export default function App() {
         stop();
       }
     };
-  }, []);
+  }, [updateLive]);
 
   // The assistant can rewrite a file through its tools; keep the editor in sync.
   const contentsRef = useRef<Record<string, string>>({});
@@ -1023,6 +1117,37 @@ export default function App() {
   // The preview and the editor follow each other by source line. The guard
   // windows below stop the two from echoing each other in a loop.
   const editorRef = useRef<CodeEditorHandle>(null);
+
+  // What the assistant panel needs beyond the conversation itself; shared by
+  // the side panel and the full-screen layout.
+  const assistantExtras = {
+    approvals,
+    onDecide: handleDecide,
+    onOpenChange: (request: ApprovalRequest) => {
+      setAssistantFull(false);
+      setView("editor");
+      setDiff({
+        path: request.path,
+        staged: false,
+        original: request.before,
+        modified: request.after,
+      });
+    },
+    onOpenFile: (path: string) => {
+      setAssistantFull(false);
+      setView("editor");
+      void handleSelect(path);
+    },
+    onInsertCode:
+      activeContent !== undefined && !diff
+        ? (code: string) => editorRef.current?.insertText(code)
+        : null,
+    onNewChat: handleNewChat,
+    onRetry: handleRetry,
+    onContinue: handleContinue,
+    autoApprove,
+    onToggleAutoApprove: toggleAutoApprove,
+  };
   const previewRef = useRef<MarkdownPreviewHandle>(null);
   const editorSyncUntil = useRef(0);
   const previewSyncUntil = useRef(0);
@@ -1175,6 +1300,7 @@ export default function App() {
               />
             )}
             <AiAssistant
+            {...assistantExtras}
               messages={assistantMessages}
               configured={configured}
               model={settings.model}
@@ -1474,8 +1600,11 @@ export default function App() {
             </>
           )}
 
-          {terminalUsed && (
+          {/* Keyed by the workspace: opening another project unmounts the
+              panel, which kills the old shell and starts one in the new folder. */}
+          {terminalUsed && rootPath && (
             <TerminalPanel
+              key={workspaceKey}
               active={terminalOpen && view !== "settings"}
               themeId={themeId}
               onHide={() => setTerminalOpen(false)}
@@ -1485,6 +1614,7 @@ export default function App() {
 
         {assistantOpen && view !== "settings" && (
           <AiAssistant
+            {...assistantExtras}
             messages={assistantMessages}
             configured={Boolean(settings.apiKey && settings.model)}
             model={settings.model}

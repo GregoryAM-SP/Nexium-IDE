@@ -12,6 +12,8 @@ export type CodeEditorHandle = {
   scrollToLine: (line: number) => void;
   /** Run a built-in Monaco command, such as "undo" or "actions.find". */
   runAction: (id: string) => void;
+  /** Replace the selection (or insert at the caret) as one undoable edit. */
+  insertText: (text: string) => void;
 };
 
 /** What the editor's right-click actions can ask the assistant about. */
@@ -85,6 +87,21 @@ export default function CodeEditor({
       },
       runAction(id) {
         instanceRef.current?.getAction(id)?.run();
+      },
+      insertText(text) {
+        const instance = instanceRef.current;
+        const selection = instance?.getSelection();
+
+        if (!instance || !selection) {
+          return;
+        }
+
+        instance.pushUndoStop();
+        instance.executeEdits("assistant", [
+          { range: selection, text, forceMoveMarkers: true },
+        ]);
+        instance.pushUndoStop();
+        instance.focus();
       },
     }),
     [],

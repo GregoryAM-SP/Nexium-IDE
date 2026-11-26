@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::future::{select, Either};
@@ -12,9 +14,16 @@ use crate::nim;
 use crate::nim::ChatMessage;
 use crate::workspace;
 
-const MAX_STEPS: usize = 8;
+const MAX_STEPS: usize = 25;
 const MAX_TOOL_CONTENT: usize = 40_000;
 const MAX_WRITE_CHARS: usize = 200_000;
+/// How often a run waiting on the user's Accept/Reject checks for an answer.
+const APPROVAL_POLL: Duration = Duration::from_millis(120);
+const REJECTED: &str = "The user rejected this change, so the file was left as it was. Do not retry the same change; ask what they would like instead, or take a different approach.";
+
+/// Decisions on proposed file changes, keyed by the step that proposed them.
+/// The UI's Accept/Reject buttons fill it in through `agent_decide`.
+pub type Approvals = Mutex<HashMap<usize, bool>>;
 
 #[derive(Serialize, Clone)]
 pub struct AgentStep {
@@ -23,6 +32,29 @@ pub struct AgentStep {
     pub title: String,
     pub detail: Option<String>,
     pub status: String,
+    /// The tool behind a `tool` step, so the UI can pick an icon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The workspace file the step is about, so the UI can link to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A proposed write, shown to the user as a diff before it reaches the disk.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalRequest {
+    step_id: usize,
+    path: String,
+    before: String,
+    after: String,
+    created: bool,
+}
+
+struct Change {
+    path: String,
+    before: Option<String>,
+    after: String,
 }
 
 #[derive(Serialize)]
@@ -31,6 +63,8 @@ pub struct AgentReply {
     pub reasoning: Option<String>,
     pub steps: Vec<AgentStep>,
     pub tools_enabled: bool,
+    /// The run spent every tool step; the UI offers to continue.
+    pub out_of_steps: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -66,6 +100,8 @@ fn make_step(
         title,
         detail,
         status: status.to_string(),
+        tool: None,
+        path: None,
     }
 }
 
@@ -124,7 +160,7 @@ fn tool_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write the full contents of a file in the workspace, creating it if needed. The content replaces the whole file, so include everything that should remain.",
+                "description": "Create a new file, or replace a whole file when most of it changes. The content replaces the entire file, so include everything that should remain. For targeted changes to an existing file use edit_file instead. The user reviews every write before it is saved.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -138,6 +174,35 @@ fn tool_schema() -> Value {
                         }
                     },
                     "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Change part of an existing file by replacing an exact piece of text. old_string must match the file exactly, including indentation, and must be unique unless replace_all is true; include a few surrounding lines to make it unique. Read the file first. The user reviews every edit before it is saved.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to the workspace root."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "The exact text to replace, copied from the file."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "The text to put in its place."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of exactly one. Defaults to false."
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
                 }
             }
         },
@@ -181,6 +246,7 @@ fn describe_call(name: &str, args: &Value) -> String {
         }
         "read_file" => format!("Reading {}", argument(args, "path")),
         "write_file" => format!("Writing {}", argument(args, "path")),
+        "edit_file" => format!("Editing {}", argument(args, "path")),
         "search_text" => format!("Searching for \"{}\"", argument(args, "query")),
         other => format!("Calling {other}"),
     }
@@ -190,26 +256,172 @@ fn execute_tool(root: &Path, name: &str, args: &Value) -> Result<String, String>
     match name {
         "list_files" => workspace::list(root, argument(args, "path"), 400),
         "read_file" => workspace::read(root, argument(args, "path")),
-        "write_file" => {
-            let path = argument(args, "path");
-            let content = argument(args, "content");
-
-            if path.is_empty() {
-                return Err("write_file needs a path.".into());
-            }
-
-            if content.chars().count() > MAX_WRITE_CHARS {
-                return Err(format!(
-                    "That write is too large ({MAX_WRITE_CHARS} characters maximum). Split it up."
-                ));
-            }
-
-            workspace::write(root, path, content)?;
-            Ok(format!("Saved {path} ({} lines).", content.lines().count()))
-        }
         "search_text" => workspace::search(root, argument(args, "path"), argument(args, "query"), 120),
         other => Err(format!("Unknown tool '{other}'.")),
     }
+}
+
+fn is_change(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file")
+}
+
+/// Replaces `old` with `new` in `current`, refusing anything ambiguous so a
+/// model can never edit a different spot than the one it meant.
+fn apply_edit(current: &str, old: &str, new: &str, all: bool) -> Result<String, String> {
+    if old.is_empty() {
+        return Err("old_string is empty. Copy the exact text to replace from read_file.".into());
+    }
+
+    // Files saved on Windows often use CRLF while models write plain LF.
+    let (old, new) = if !current.contains(old) && current.contains("\r\n") && !old.contains('\r') {
+        (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
+    } else {
+        (old.to_string(), new.to_string())
+    };
+
+    match current.matches(old.as_str()).count() {
+        0 => Err("old_string was not found. Read the file again and copy the exact text, including indentation.".into()),
+        1 => Ok(current.replacen(old.as_str(), &new, 1)),
+        _ if all => Ok(current.replace(old.as_str(), &new)),
+        count => Err(format!(
+            "old_string matches {count} places. Include more surrounding lines so it is unique, or set replace_all."
+        )),
+    }
+}
+
+/// Works out what a write_file or edit_file call would leave on disk, without
+/// touching it, so the change can be reviewed first.
+fn prepare_change(root: &Path, name: &str, args: &Value) -> Result<Change, String> {
+    let path = argument(args, "path").trim().to_string();
+
+    if path.is_empty() {
+        return Err(format!("{name} needs a path."));
+    }
+
+    let target = workspace::safe_join(root, &path)?;
+    let before = if target.is_file() {
+        Some(workspace::read(root, &path)?)
+    } else {
+        None
+    };
+
+    let after = match name {
+        "write_file" => argument(args, "content").to_string(),
+        "edit_file" => {
+            let Some(current) = before.as_deref() else {
+                return Err(format!("{path} does not exist. Use write_file to create it."));
+            };
+            let all = args
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            apply_edit(
+                current,
+                argument(args, "old_string"),
+                argument(args, "new_string"),
+                all,
+            )
+            .map_err(|error| format!("{path}: {error}"))?
+        }
+        other => return Err(format!("Unknown tool '{other}'.")),
+    };
+
+    if after.chars().count() > MAX_WRITE_CHARS {
+        return Err(format!(
+            "That file would be too large ({MAX_WRITE_CHARS} characters maximum). Split it up."
+        ));
+    }
+
+    if before.as_deref() == Some(after.as_str()) {
+        return Err(format!("That change would leave {path} exactly as it is."));
+    }
+
+    Ok(Change {
+        path,
+        before,
+        after,
+    })
+}
+
+/// Lines added and removed, counted outside the unchanged head and tail.
+fn line_stats(before: &str, after: &str) -> (usize, usize) {
+    let old: Vec<&str> = before.lines().collect();
+    let new: Vec<&str> = after.lines().collect();
+    let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    (new.len() - head - tail, old.len() - head - tail)
+}
+
+/// Shows the change to the user and, once accepted (or straight away when
+/// edits are auto-approved), writes it. A rejection comes back as the tool's
+/// error so the model knows to stop and ask.
+#[allow(clippy::too_many_arguments)]
+async fn apply_change(
+    root: &Path,
+    app: &AppHandle,
+    name: &str,
+    args: &Value,
+    step: &AgentStep,
+    auto_approve: bool,
+    approvals: &Approvals,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let change = prepare_change(root, name, args)?;
+    let created = change.before.is_none();
+    let before = change.before.unwrap_or_default();
+
+    if !auto_approve {
+        if let Ok(mut pending) = approvals.lock() {
+            pending.remove(&step.id);
+        }
+
+        let mut awaiting = step.clone();
+        awaiting.status = "awaiting".into();
+        let _ = app.emit("agent-step", awaiting);
+        let _ = app.emit(
+            "agent-approval",
+            ApprovalRequest {
+                step_id: step.id,
+                path: change.path.clone(),
+                before: before.clone(),
+                after: change.after.clone(),
+                created,
+            },
+        );
+
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(Failure::Cancelled.message());
+            }
+
+            let decision = approvals
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&step.id));
+
+            match decision {
+                Some(true) => break,
+                Some(false) => return Err(REJECTED.into()),
+                None => tokio::time::sleep(APPROVAL_POLL).await,
+            }
+        }
+    }
+
+    workspace::write(root, &change.path, &change.after)?;
+    let (added, removed) = line_stats(&before, &change.after);
+
+    Ok(format!(
+        "{} {} (+{added} −{removed} lines).",
+        if created { "Created" } else { "Updated" },
+        change.path
+    ))
 }
 
 fn policy(root: &Path) -> String {
@@ -218,7 +430,10 @@ fn policy(root: &Path) -> String {
     format!(
         "You are the assistant inside Nexium Studio, a local code editor, working in the folder \"{}\".\n\
          Use the tools to inspect and change files. Never invent file contents: read a file before editing it.\n\
-         Use write_file with the complete file contents when changing a file, and mention which files you touched.\n\
+         To change an existing file use edit_file with an exact, unique old_string; use write_file only for new files or full rewrites.\n\
+         The user reviews each edit as a diff and may reject it. If an edit is rejected, do not repeat it; ask what they want instead.\n\
+         When the user asks for a change, make it rather than describing it, then summarise what you changed and which files you touched.\n\
+         Write answers in Markdown. Refer to code as `path` or `path:line`, and put code in fenced blocks tagged with the language.\n\
          When the message already contains the code to look at, answer it directly instead of exploring the folder first.\n\
          Keep answers short and concrete. If a request is ambiguous, ask one short question instead of guessing.\n\n\
          Current workspace listing:\n{}",
@@ -537,12 +752,15 @@ async fn request_turn(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     root: Option<PathBuf>,
     app: &AppHandle,
     api_key: &str,
     model: &str,
     messages: Vec<ChatMessage>,
+    auto_approve: bool,
+    approvals: &Approvals,
     cancel: &AtomicBool,
 ) -> Result<AgentReply, String> {
     if api_key.trim().is_empty() {
@@ -555,11 +773,22 @@ pub async fn run(
     let mut streaming = true;
     let mut next_step_id = 1usize;
 
-    if let Some(path) = root.as_deref() {
-        conversation.push(json!({ "role": "system", "content": policy(path) }));
+    // Several system messages confuse many models (some only honour the first,
+    // some reject the request), so the editor's context joins the policy.
+    let mut system = root.as_deref().map(policy).unwrap_or_default();
+
+    for message in messages.iter().filter(|message| message.role == "system") {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(&message.content);
     }
 
-    for message in messages {
+    if !system.is_empty() {
+        conversation.push(json!({ "role": "system", "content": system }));
+    }
+
+    for message in messages.into_iter().filter(|message| message.role != "system") {
         conversation.push(json!({ "role": message.role, "content": message.content }));
     }
 
@@ -638,6 +867,7 @@ pub async fn run(
                 },
                 steps,
                 tools_enabled,
+                out_of_steps: false,
             });
         }
 
@@ -666,32 +896,65 @@ pub async fn run(
             let id = next_step_id;
             next_step_id += 1;
 
-            let running = make_step(id, "tool", title.clone(), None, "running");
+            let file = argument(&args, "path").trim();
+            let mut running = make_step(id, "tool", title.clone(), None, "running");
+            running.tool = Some(call.name.clone());
+            running.path = (!file.is_empty()).then(|| file.to_string());
             let _ = app.emit("agent-step", running.clone());
-            steps.push(running);
+            steps.push(running.clone());
 
             // Without an open folder there is no root to resolve paths against.
             let result = match root.as_deref() {
+                Some(path) if is_change(&call.name) => {
+                    apply_change(
+                        path,
+                        app,
+                        &call.name,
+                        &args,
+                        &running,
+                        auto_approve,
+                        approvals,
+                        cancel,
+                    )
+                    .await
+                }
                 Some(path) => execute_tool(path, &call.name, &args),
                 None => Err("No folder is open, so files cannot be read.".to_string()),
             };
 
+            if cancel.load(Ordering::SeqCst) {
+                return Err(Failure::Cancelled.message());
+            }
+
+            let rejected = matches!(&result, Err(error) if error == REJECTED);
             let (output, ok) = match result {
                 Ok(text) => (truncate(text, MAX_TOOL_CONTENT), true),
                 Err(error) => (error, false),
             };
 
-            if ok && call.name == "write_file" {
-                let _ = app.emit("workspace:file-changed", argument(&args, "path").to_string());
+            if ok && is_change(&call.name) {
+                let _ = app.emit("workspace:file-changed", file.to_string());
             }
 
-            let finished = make_step(
+            let mut finished = make_step(
                 id,
-                if ok { "tool" } else { "error" },
+                if ok {
+                    "tool"
+                } else if rejected {
+                    "rejected"
+                } else {
+                    "error"
+                },
                 title,
-                Some(summarize(&output)),
+                Some(if rejected {
+                    "Rejected".to_string()
+                } else {
+                    summarize(&output)
+                }),
                 if ok { "done" } else { "error" },
             );
+            finished.tool = running.tool.clone();
+            finished.path = running.path.clone();
             let _ = app.emit("agent-step", finished.clone());
 
             if let Some(existing) = steps.iter_mut().find(|step| step.id == id) {
@@ -753,6 +1016,7 @@ pub async fn run(
                 },
                 steps,
                 tools_enabled,
+                out_of_steps: true,
             });
         }
     }
@@ -781,12 +1045,42 @@ pub async fn run(
         reasoning: None,
         steps,
         tools_enabled,
+        out_of_steps: true,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_replace_exactly_one_unique_match() {
+        let source = "let a = 1;\nlet b = 2;\n";
+        assert_eq!(
+            apply_edit(source, "let b = 2;", "let b = 3;", false).unwrap(),
+            "let a = 1;\nlet b = 3;\n"
+        );
+        assert!(apply_edit(source, "let c", "x", false).is_err());
+        assert!(apply_edit("x x", "x", "y", false).is_err());
+        assert_eq!(apply_edit("x x", "x", "y", true).unwrap(), "y y");
+        assert!(apply_edit(source, "", "y", false).is_err());
+    }
+
+    #[test]
+    fn edits_match_lf_text_against_crlf_files() {
+        let source = "one\r\ntwo\r\nthree\r\n";
+        assert_eq!(
+            apply_edit(source, "one\ntwo", "uno\ndos", false).unwrap(),
+            "uno\r\ndos\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn counts_changed_lines_outside_the_shared_head_and_tail() {
+        assert_eq!(line_stats("a\nb\nc", "a\nB\nB2\nc"), (2, 1));
+        assert_eq!(line_stats("", "a\nb"), (2, 0));
+        assert_eq!(line_stats("a\nb", "a\nb"), (0, 0));
+    }
 
     #[test]
     fn parses_sse_data_lines_only() {

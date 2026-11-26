@@ -215,7 +215,21 @@ export type AgentStep = {
   kind: string;
   title: string;
   detail?: string | null;
+  /** running | awaiting (a change waiting on Accept/Reject) | done | error */
   status: string;
+  /** The tool behind the step: list_files, read_file, edit_file, … */
+  tool?: string;
+  /** The workspace file the step is about. */
+  path?: string;
+};
+
+/** A file change the agent proposes; nothing is written until it is accepted. */
+export type ApprovalRequest = {
+  stepId: number;
+  path: string;
+  before: string;
+  after: string;
+  created: boolean;
 };
 
 export type AgentDelta = {
@@ -228,6 +242,8 @@ export type AgentReply = {
   reasoning: string | null;
   steps: AgentStep[];
   tools_enabled: boolean;
+  /** Every tool step was spent; the conversation can be continued. */
+  out_of_steps?: boolean;
 };
 
 /**
@@ -239,10 +255,16 @@ export async function runAgent(
   apiKey: string,
   model: string,
   messages: ChatMessage[],
+  autoApprove = false,
 ): Promise<AgentReply> {
   if (isTauri()) {
     try {
-      return await invoke<AgentReply>("nim_agent", { apiKey, model, messages });
+      return await invoke<AgentReply>("nim_agent", {
+        apiKey,
+        model,
+        messages,
+        autoApprove,
+      });
     } catch (cause) {
       throw toError(cause, "The assistant request failed.");
     }
@@ -251,6 +273,22 @@ export async function runAgent(
   const text = await chat(apiKey, model, messages);
 
   return { text, reasoning: null, steps: [], tools_enabled: false };
+}
+
+/** Accepts or rejects a change the running agent proposed. */
+export async function decideChange(
+  stepId: number,
+  accept: boolean,
+): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+
+  try {
+    await invoke<void>("agent_decide", { stepId, accept });
+  } catch (cause) {
+    throw toError(cause, "The decision could not be sent.");
+  }
 }
 
 /** Asks the running agent loop to stop; it returns "Stopped.". */

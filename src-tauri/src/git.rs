@@ -46,6 +46,15 @@ fn execute(root: &Path, args: &[&str], allow_prompt: bool) -> Result<String, Str
 
     command.arg("-C").arg(root).args(args);
 
+    // The release build is a GUI-subsystem process with no console, so Windows
+    // would open (and flash) a fresh console window for every git call.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
     if !allow_prompt {
         // A window cannot answer git's credential prompt, so it must fail
         // instead of waiting on a terminal or a credential-manager dialog.

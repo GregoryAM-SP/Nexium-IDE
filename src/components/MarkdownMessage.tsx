@@ -1,3 +1,5 @@
+import { Check, Copy, TextCursorInput } from "lucide-react";
+import { useState } from "react";
 import type { ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -9,7 +11,90 @@ type MarkdownMessageProps = {
   large?: boolean;
   /** Marks block elements with their source line, so a preview can sync scroll. */
   sourceLines?: boolean;
+  /** Assistant replies get Copy (and Insert, when a file is open) on code. */
+  codeActions?: boolean;
+  /** Puts a code block at the editor's cursor; omitted when no file is open. */
+  onInsertCode?: (code: string) => void;
 };
+
+type HastNode = {
+  type?: string;
+  value?: string;
+  children?: HastNode[];
+  position?: { start: { line: number } };
+};
+
+/** The raw text of a code block, from the syntax tree rather than the DOM. */
+function nodeText(node: HastNode | undefined): string {
+  if (!node) {
+    return "";
+  }
+
+  if (node.type === "text") {
+    return node.value ?? "";
+  }
+
+  return (node.children ?? []).map(nodeText).join("");
+}
+
+function CodeBlock({
+  code,
+  onInsert,
+  children,
+  lineProps,
+}: {
+  code: string;
+  onInsert?: (code: string) => void;
+  children: ReactNode;
+  lineProps: { "data-line"?: number };
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = () => {
+    void navigator.clipboard.writeText(code).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    });
+  };
+
+  const button =
+    "flex h-6 items-center gap-1 rounded-md border border-ink/[0.08] bg-raised/90 px-1.5 text-[10px] text-ink/50 backdrop-blur transition-colors duration-150 hover:border-ink/20 hover:text-ink";
+
+  return (
+    <div {...lineProps} className="group relative mt-2 first:mt-0">
+      <div className="absolute top-1.5 right-1.5 z-10 flex gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
+        {onInsert && (
+          <button
+            type="button"
+            onClick={() => onInsert(code)}
+            title="Insert at the cursor in the open file"
+            className={button}
+          >
+            <TextCursorInput className="size-3" strokeWidth={1.75} />
+            Insert
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={copy}
+          title="Copy code"
+          aria-label="Copy code"
+          className={button}
+        >
+          {copied ? (
+            <Check className="size-3" strokeWidth={2} />
+          ) : (
+            <Copy className="size-3" strokeWidth={1.75} />
+          )}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre className="overflow-x-auto rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-[11.5px] leading-relaxed">
+        {children}
+      </pre>
+    </div>
+  );
+}
 
 type SourceNode = { position?: { start: { line: number } } };
 
@@ -33,6 +118,8 @@ export default function MarkdownMessage({
   caret = false,
   large = false,
   sourceLines = false,
+  codeActions = false,
+  onInsertCode,
 }: MarkdownMessageProps) {
   const src = (node: SourceNode | undefined) =>
     sourceLines && node?.position
@@ -130,7 +217,16 @@ export default function MarkdownMessage({
               {children}
             </code>
           ),
-          pre: ({ children, node }) => (
+          pre: ({ children, node }) =>
+            codeActions ? (
+              <CodeBlock
+                code={nodeText(node as HastNode).replace(/\n$/, "")}
+                onInsert={onInsertCode}
+                lineProps={src(node)}
+              >
+                {children}
+              </CodeBlock>
+            ) : (
             <pre
               {...src(node)}
               className="mt-2 overflow-x-auto rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-[11.5px] leading-relaxed first:mt-0"

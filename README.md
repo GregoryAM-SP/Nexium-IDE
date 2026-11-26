@@ -53,7 +53,10 @@ The interface is built from three values per theme — a page colour, an ink and
 ### Assistant
 
 - **Real streaming**, not a static spinner: assistant text, reasoning and tool activity all arrive incrementally from Rust over Tauri events (`agent-delta`, `agent-step`).
-- **Tool calling on your real files**: `list_files`, `read_file`, `write_file`, `search_text` — each call is shown as a step note ("Reading src/App.tsx", "Searching for `useEffect`"), and writes are persisted to disk and pushed to the open editor through the `workspace:file-changed` event.
+- **Tool calling on your real files**: `list_files`, `read_file`, `search_text`, `edit_file` (replaces one exact, unique piece of text, and matches LF text against CRLF files) and `write_file` (new files or full rewrites). Each call appears as a step with its own icon and a clickable file path. Accepted writes are saved to disk and pushed to the open editor through the `workspace:file-changed` event.
+- **Review before writing**: every edit the assistant proposes appears in the chat as a compact diff with **Accept** and **Reject** (and a button to open it in the full diff view). Nothing reaches the disk until you accept it. A rejected edit is reported back to the model, which is told not to repeat it. The composer's **Review edits / Auto-apply edits** toggle (remembered in `localStorage`) skips the review when you trust the run.
+- **One timeline per turn**: text, thinking and tool steps appear in the order they happened, and consecutive steps are grouped. Earlier turns go back to the model with a short note of the files they read or changed, so it does not start from scratch each turn. The open file is added to the assistant's single system prompt instead of being sent as a second one.
+- **Message actions**: Retry re-asks the last question in place of the failed or unwanted answer, Copy copies an answer as Markdown, and code blocks have **Copy** and **Insert** (at the editor cursor, as one undoable edit). **New chat** clears the conversation. A run that uses all 25 tool steps offers **Continue**.
 - **AI inline completions**: typing pauses for a moment and the selected model is asked for the next few tokens of the file — its answer appears as grey ghost text at the caret, `Tab` accepts it and `Escape` dismisses it, and nothing is inserted on its own. The provider (`src/lib/inlineCompletion.ts`) sends only the ~2.6 KB before the cursor and ~600 bytes after it, debounces keystrokes by 700 ms, drops any answer that newer typing has already superseded, caches answers per cursor position, and silently gives up when the model is slow, errors or the free tier rate-limits. It is driven by the key and model verified in Settings and never runs without both.
 - **Ask AI from the right-click menu**: right-clicking inside the editor offers **Ask AI about this file**, and highlighting code turns the menu selection-aware: **Explain this selection**, **Refactor this selection**, **Find bugs in this selection** and **Document this selection** each seed the composer with that question plus the highlighted lines; the explorer's menu offers the same for the file or folder under the pointer. Each one opens the assistant if it was hidden and pre-fills the composer with a ready prompt — the highlighted lines travel inside the message with their path and line range, while file and folder prompts name the path for the assistant's own tools — caret at the end, nothing sent until you press Enter.
 - **Markdown rendering** of replies (GFM tables, lists, code blocks, inline code) through a monochrome component map — no raw HTML is ever injected.
@@ -112,7 +115,7 @@ Then:
 2. Open **API Keys** and create one; it looks like `nvapi-xxxxxxxx…`.
 3. Paste it into **Settings** inside the app.
 
-Keys are stored in the WebView's `localStorage`, are only read by the app's own Rust code, and are sent only to `https://integrate.api.nvidia.com`. The free tier is rate-limited (roughly 40 requests per minute), so very long agent runs can hit a 429 — see [Troubleshooting](#troubleshooting).
+Keys are stored in Windows Credential Manager (entry `com.nexium.studio`), are only read by the app's own Rust code, and are sent only to `https://integrate.api.nvidia.com`. The free tier is rate-limited (roughly 40 requests per minute), so very long agent runs can hit a 429 — see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -275,7 +278,7 @@ Nexium-IDE/
 │       ├── nim.ts              # model catalogue, verification, chat calls
 │       ├── assistantPrompt.ts  # right-click selection/file prompts for the composer
 │       ├── inlineCompletion.ts # ghost-text AI completions in the editor
-│       └── assistantSettings.ts# localStorage persistence
+│       └── assistantSettings.ts# settings persistence (key → credential store)
 └── src-tauri/
     ├── Cargo.toml
     ├── tauri.conf.json         # window (undecorated, centered), dev/build hooks, bundle targets
@@ -293,12 +296,14 @@ Nexium-IDE/
 
 ## Security model
 
-- The API key is typed into the UI, persisted in `localStorage`, and passed to Rust per request. It is **never** placed in a URL, a log line or a file on disk by the app.
+- The API key is typed into the UI and, in the desktop app, stored in the operating system's credential store (Windows Credential Manager) rather than `localStorage`; a key left in `localStorage` by an older build is moved over on the next start. It is passed to Rust per request and **never** placed in a URL or a log line. The browser-only dev mode has no credential store and keeps the key in `localStorage`.
+- A Content Security Policy (`app.security.csp` in `tauri.conf.json`) limits the window to its own scripts, styles, fonts and workers plus `data:`/`blob:` images, and blocks plugins, frames and form posts.
+- Every command that touches the disk or runs git is `async` and runs on a background thread, so a slow `git push` or a large folder never freezes the window; git runs without a console window.
 - Every filesystem command is confined to the folder you opened (`safe_join`); `delete_workspace_entry` and `rename_workspace_entry` refuse anything that resolves outside it.
 - Tauri capabilities are minimal: `core:default`, `dialog:default`, and only the five window permissions the custom title bar needs (`minimize`, `toggle-maximize`, `is-maximized`, `close`, `start-dragging`).
 - Assistant output is rendered as Markdown without HTML, so a model cannot inject markup or script into the window.
 - Writes performed by the assistant go through the same path checks as your own edits, and the UI is told which file changed so the editor never shows stale content. Deleting asks for confirmation first and is the only destructive action in the app.
-- The terminal is a real shell behind a pseudo-terminal, started in the open folder; commands typed into it run with your own permissions and are not sandboxed.
+- The terminal is a real shell behind a pseudo-terminal. It is only available once a project is open and always starts in that project's folder (opening another project restarts it there); commands typed into it run with your own permissions and are not sandboxed.
 - Source control shells out to `git` inside the open folder, only ever with `status --untracked-files=all`, `show` (read-only, for the diff sides), `add`, `restore`, `reset`, `rm --cached`, `commit -m` and `push` (with `GIT_TERMINAL_PROMPT=0`, so a credential prompt fails instead of blocking the window); paths are passed after `--` so they cannot be read as options.
 
 ---
@@ -307,11 +312,12 @@ Nexium-IDE/
 
 | Data | Location |
 | --- | --- |
-| API key, chosen model, verified models, latencies | WebView `localStorage`, key `nexium.assistant.nim` |
+| API key | OS credential store (Windows Credential Manager), service `com.nexium.studio`, account `nvidia-nim-api-key` |
+| Chosen model, verified models, latencies | WebView `localStorage`, key `nexium.assistant.nim` |
 | Conversation | In memory for the session (cleared when the window closes) |
 | Your project files | Untouched on disk until you or the assistant saves |
 
-Reset the assistant by clearing that `localStorage` key (or pasting a new key in Settings). Nothing else is written outside your project folder.
+Reset the assistant with **Remove key** in Settings (or by deleting the credential and clearing that `localStorage` key). Nothing else is written outside your project folder.
 
 ---
 
@@ -385,8 +391,8 @@ Dragging only works on the title bar's empty areas, the brand and the breadcrumb
 ## Limitations
 
 - One folder per window; there is no multi-root workspace.
-- No integrated terminal, debugger, git panel or extensions.
+- No debugger or extensions. The terminal and Source Control panel are single-session and single-repository.
 - Monaco's TypeScript worker only sees the files the app hands it, so imports from unopened packages resolve only through the bundled ambient shim for `lucide-react`.
-- The assistant writes whole files (`write_file` replaces the file), not patches.
+- Assistant edits are exact-text replacements; there is no fuzzy patching, so a stale `old_string` fails and the model has to re-read the file.
 - The custom title bar is Windows-shaped: no double-click-to-maximize, and the resize borders come from the native frame that stays underneath.
 - Editing is local-only; there is no sync, account or cloud storage.

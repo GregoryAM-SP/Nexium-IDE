@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   ShieldCheck,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { AssistantSettings } from "../lib/assistantSettings";
 import { emptyAssistantSettings } from "../lib/assistantSettings";
@@ -40,6 +40,10 @@ export default function SettingsPage({
 }: SettingsPageProps) {
   const [apiKey, setApiKey] = useState(settings.apiKey);
   const [showKey, setShowKey] = useState(false);
+  // The stored key arrives from the credential store after the first render.
+  useEffect(() => {
+    setApiKey(settings.apiKey);
+  }, [settings.apiKey]);
   const [model, setModel] = useState(settings.model);
   const [workingModels, setWorkingModels] = useState<string[]>(
     settings.workingModels,

@@ -1,6 +1,7 @@
 mod agent;
 mod git;
 mod nim;
+mod secrets;
 mod terminal;
 mod workspace;
 
@@ -14,30 +15,44 @@ use tauri::{Manager, State};
 struct AppState {
     root: Mutex<Option<PathBuf>>,
     cancel: Arc<AtomicBool>,
+    approvals: Arc<agent::Approvals>,
     terminals: Mutex<HashMap<String, terminal::Session>>,
 }
 
-fn with_root<T>(
-    state: &State<'_, AppState>,
-    action: impl FnOnce(&PathBuf) -> Result<T, String>,
-) -> Result<T, String> {
+fn current_root(state: &State<'_, AppState>) -> Result<PathBuf, String> {
     let guard = state
         .root
         .lock()
         .map_err(|_| "The workspace state is unavailable.".to_string())?;
 
-    match guard.as_ref() {
-        Some(root) => action(root),
-        None => Err("Open a folder first.".into()),
-    }
+    guard.clone().ok_or_else(|| "Open a folder first.".to_string())
+}
+
+/// Plain (non-async) Tauri commands run on the main thread, so a slow disk walk
+/// or a `git push` would freeze the whole window. Everything that touches the
+/// disk or spawns git goes through here and runs on the blocking thread pool.
+async fn blocking<T: Send + 'static>(
+    action: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(action)
+        .await
+        .map_err(|_| "The background task stopped unexpectedly.".to_string())?
+}
+
+async fn with_root<T: Send + 'static>(
+    state: &State<'_, AppState>,
+    action: impl FnOnce(&PathBuf) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let root = current_root(state)?;
+    blocking(move || action(&root)).await
 }
 
 #[tauri::command]
-fn open_workspace(
+async fn open_workspace(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<workspace::WorkspaceSnapshot, String> {
-    let snapshot = workspace::open(&PathBuf::from(&path))?;
+    let snapshot = blocking(move || workspace::open(&PathBuf::from(&path))).await?;
 
     let mut guard = state
         .root
@@ -51,67 +66,71 @@ fn open_workspace(
 /// Creates the folder for a new project and opens it. The path comes from a
 /// save dialog, so it may sit anywhere outside the current workspace.
 #[tauri::command]
-fn create_workspace(
+async fn create_workspace(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<workspace::WorkspaceSnapshot, String> {
-    std::fs::create_dir_all(&path)
-        .map_err(|error| format!("The project folder could not be created: {error}"))?;
+    let target = path.clone();
+    blocking(move || {
+        std::fs::create_dir_all(&target)
+            .map_err(|error| format!("The project folder could not be created: {error}"))
+    })
+    .await?;
 
-    open_workspace(state, path)
+    open_workspace(state, path).await
 }
 
 #[tauri::command]
-fn read_workspace_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    with_root(&state, |root| workspace::read(root, &path))
+async fn read_workspace_file(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    with_root(&state, move |root| workspace::read(root, &path)).await
 }
 
 #[tauri::command]
-fn read_media_file(
+async fn read_media_file(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<workspace::MediaFile, String> {
-    with_root(&state, |root| workspace::read_media(root, &path))
+    with_root(&state, move |root| workspace::read_media(root, &path)).await
 }
 
 #[tauri::command]
-fn read_workspace_sources(
+async fn read_workspace_sources(
     state: State<'_, AppState>,
 ) -> Result<Vec<workspace::SourceFile>, String> {
-    with_root(&state, |root| Ok(workspace::sources(root)))
+    with_root(&state, |root| Ok(workspace::sources(root))).await
 }
 
 #[tauri::command]
-fn write_workspace_file(
+async fn write_workspace_file(
     state: State<'_, AppState>,
     path: String,
     contents: String,
 ) -> Result<(), String> {
-    with_root(&state, |root| workspace::write(root, &path, &contents))
+    with_root(&state, move |root| workspace::write(root, &path, &contents)).await
 }
 
 #[tauri::command]
-fn create_workspace_entry(
+async fn create_workspace_entry(
     state: State<'_, AppState>,
     parent: String,
     name: String,
     kind: String,
 ) -> Result<String, String> {
-    with_root(&state, |root| workspace::create(root, &parent, &name, &kind))
+    with_root(&state, move |root| workspace::create(root, &parent, &name, &kind)).await
 }
 
 #[tauri::command]
-fn rename_workspace_entry(
+async fn rename_workspace_entry(
     state: State<'_, AppState>,
     from: String,
     to: String,
 ) -> Result<(), String> {
-    with_root(&state, |root| workspace::rename(root, &from, &to))
+    with_root(&state, move |root| workspace::rename(root, &from, &to)).await
 }
 
 #[tauri::command]
-fn delete_workspace_entry(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    with_root(&state, |root| workspace::delete(root, &path))
+async fn delete_workspace_entry(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    with_root(&state, move |root| workspace::delete(root, &path)).await
 }
 
 /// Git identity works even before a folder is opened: the global config is not
@@ -132,84 +151,102 @@ fn git_working_directory(state: &State<'_, AppState>) -> Result<PathBuf, String>
 }
 
 #[tauri::command]
-fn git_identity(state: State<'_, AppState>) -> Result<git::GitIdentity, String> {
-    git::identity(&git_working_directory(&state)?)
+async fn git_identity(state: State<'_, AppState>) -> Result<git::GitIdentity, String> {
+    let directory = git_working_directory(&state)?;
+    blocking(move || git::identity(&directory)).await
 }
 
 #[tauri::command]
-fn git_set_identity(
+async fn git_set_identity(
     state: State<'_, AppState>,
     name: String,
     email: String,
 ) -> Result<git::GitIdentity, String> {
-    git::set_identity(&git_working_directory(&state)?, &name, &email)
+    let directory = git_working_directory(&state)?;
+    blocking(move || git::set_identity(&directory, &name, &email)).await
 }
 
 #[tauri::command]
-fn git_status(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
-    with_root(&state, |root| git::status(root))
+async fn git_status(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
+    with_root(&state, |root| git::status(root)).await
 }
 
 #[tauri::command]
-fn git_file_diff(
+async fn git_file_diff(
     state: State<'_, AppState>,
     path: String,
     staged: bool,
 ) -> Result<git::GitFileDiff, String> {
-    with_root(&state, |root| git::file_diff(root, &path, staged))
+    with_root(&state, move |root| git::file_diff(root, &path, staged)).await
 }
 
 #[tauri::command]
-fn git_stage(state: State<'_, AppState>, path: String) -> Result<git::GitStatus, String> {
-    with_root(&state, |root| {
+async fn git_stage(state: State<'_, AppState>, path: String) -> Result<git::GitStatus, String> {
+    with_root(&state, move |root| {
         git::stage(root, &path)?;
         git::status(root)
     })
+    .await
 }
 
 #[tauri::command]
-fn git_unstage(state: State<'_, AppState>, path: String) -> Result<git::GitStatus, String> {
-    with_root(&state, |root| {
+async fn git_unstage(state: State<'_, AppState>, path: String) -> Result<git::GitStatus, String> {
+    with_root(&state, move |root| {
         git::unstage(root, &path)?;
         git::status(root)
     })
+    .await
 }
 
 #[tauri::command]
-fn git_stage_all(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
+async fn git_stage_all(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
     with_root(&state, |root| {
         git::stage_all(root)?;
         git::status(root)
     })
+    .await
 }
 
 #[tauri::command]
-fn git_unstage_all(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
+async fn git_unstage_all(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
     with_root(&state, |root| {
         git::unstage_all(root)?;
         git::status(root)
     })
+    .await
 }
 
 #[tauri::command]
-fn git_commit(state: State<'_, AppState>, message: String) -> Result<git::GitStatus, String> {
-    with_root(&state, |root| {
+async fn git_commit(state: State<'_, AppState>, message: String) -> Result<git::GitStatus, String> {
+    with_root(&state, move |root| {
         git::commit(root, &message)?;
         git::status(root)
     })
+    .await
 }
 
 #[tauri::command]
-fn git_commit_and_sync(
+async fn git_commit_and_sync(
     state: State<'_, AppState>,
     message: String,
 ) -> Result<git::GitStatus, String> {
-    with_root(&state, |root| {
+    with_root(&state, move |root| {
         git::commit(root, &message)?;
         git::sync(root)
             .map_err(|error| format!("Committed, but the sync failed: {error}"))?;
         git::status(root)
     })
+    .await
+}
+
+#[tauri::command]
+async fn secret_get_api_key() -> Result<Option<String>, String> {
+    blocking(secrets::get_api_key).await
+}
+
+#[tauri::command]
+async fn secret_set_api_key(key: String) -> Result<(), String> {
+    blocking(move || secrets::set_api_key(&key)).await
 }
 
 #[tauri::command]
@@ -220,11 +257,9 @@ fn terminal_start(
     rows: u16,
     cols: u16,
 ) -> Result<String, String> {
-    let root = state
-        .root
-        .lock()
-        .map_err(|_| "The workspace state is unavailable.".to_string())?
-        .clone();
+    // The shell always starts in the open project, never in the app's own
+    // working directory.
+    let root = current_root(&state)?;
 
     terminal::start(&app, root, &state.terminals, id, rows, cols)
 }
@@ -254,6 +289,17 @@ fn nim_cancel(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
 }
 
+/// The user's answer to a proposed file change from the running agent.
+#[tauri::command]
+fn agent_decide(state: State<'_, AppState>, step_id: usize, accept: bool) -> Result<(), String> {
+    state
+        .approvals
+        .lock()
+        .map_err(|_| "The assistant state is unavailable.".to_string())?
+        .insert(step_id, accept);
+    Ok(())
+}
+
 #[tauri::command]
 async fn nim_agent(
     state: State<'_, AppState>,
@@ -261,6 +307,7 @@ async fn nim_agent(
     api_key: String,
     model: String,
     messages: Vec<nim::ChatMessage>,
+    auto_approve: bool,
 ) -> Result<agent::AgentReply, String> {
     let root = state
         .root
@@ -270,8 +317,23 @@ async fn nim_agent(
 
     state.cancel.store(false, Ordering::SeqCst);
     let cancel = state.cancel.clone();
+    let approvals = state.approvals.clone();
 
-    let result = agent::run(root, &app, api_key.trim(), &model, messages, &cancel).await;
+    if let Ok(mut pending) = approvals.lock() {
+        pending.clear();
+    }
+
+    let result = agent::run(
+        root,
+        &app,
+        api_key.trim(),
+        &model,
+        messages,
+        auto_approve,
+        &approvals,
+        &cancel,
+    )
+    .await;
 
     if let Err(error) = &result {
         eprintln!("nim_agent failed: {error}");
@@ -334,6 +396,7 @@ pub fn run() {
         .manage(AppState {
             root: Mutex::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
             terminals: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
@@ -356,6 +419,8 @@ pub fn run() {
             git_unstage_all,
             git_commit,
             git_commit_and_sync,
+            secret_get_api_key,
+            secret_set_api_key,
             terminal_start,
             terminal_write,
             terminal_resize,
@@ -364,6 +429,7 @@ pub fn run() {
             nim::nim_ping,
             nim::nim_chat,
             nim_cancel,
+            agent_decide,
             nim_agent
         ])
         .run(tauri::generate_context!())

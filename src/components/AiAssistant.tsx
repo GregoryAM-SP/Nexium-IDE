@@ -1,41 +1,53 @@
 import {
   ArrowUp,
+  Ban,
   Brain,
   Check,
   ChevronDown,
+  ChevronRight,
+  Clock,
+  Copy,
   Cpu,
   File,
+  FilePen,
+  FilePlus,
+  FileText,
+  FolderTree,
+  Info,
   LoaderCircle,
   Maximize2,
   Minimize2,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
+  Play,
+  RotateCcw,
+  Search,
   Settings2,
+  ShieldCheck,
   Sparkles,
+  SquarePen,
   Square,
   Wrench,
+  X,
+  Zap,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
-import type { AgentStep } from "../lib/nim";
+import type { AssistantMessage, MessageBlock } from "../lib/assistantMessages";
+import { lineDiff } from "../lib/lineDiff";
+import type { AgentStep, ApprovalRequest } from "../lib/nim";
 import MarkdownMessage from "./MarkdownMessage";
 
-export type AssistantMessage = {
-  id: number;
-  role: "user" | "assistant";
-  text: string;
-  error?: boolean;
-  reasoning?: string | null;
-  steps?: AgentStep[];
-};
+export type { AssistantMessage } from "../lib/assistantMessages";
 
 type AiAssistantProps = {
   messages: AssistantMessage[];
   configured: boolean;
   model: string;
   pending: boolean;
-  live: { steps: AgentStep[]; reasoning: string; text: string } | null;
+  live: { blocks: MessageBlock[] } | null;
   contextPath: string | null;
   models: string[];
   latency: Record<string, number>;
@@ -52,7 +64,25 @@ type AiAssistantProps = {
   onStop: () => void;
   onOpenSettings: () => void;
   onHide: () => void;
+  /** Changes the agent proposed that wait on Accept/Reject, by step id. */
+  approvals: Record<number, ApprovalRequest>;
+  onDecide: (stepId: number, accept: boolean) => void;
+  /** Shows a proposed change in the editor area's full diff view. */
+  onOpenChange: (request: ApprovalRequest) => void;
+  onOpenFile: (path: string) => void;
+  /** Puts code at the editor cursor; null when no file is open. */
+  onInsertCode: ((code: string) => void) | null;
+  onNewChat: () => void;
+  /** Sends the user message before this assistant message again. */
+  onRetry: (messageId: number) => void;
+  onContinue: () => void;
+  /** When on, the agent's edits are written without asking first. */
+  autoApprove: boolean;
+  onToggleAutoApprove: () => void;
 };
+
+const iconButton =
+  "flex size-6 items-center justify-center rounded-md text-ink/30 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink disabled:pointer-events-none disabled:opacity-40";
 
 export default function AiAssistant({
   messages,
@@ -74,6 +104,16 @@ export default function AiAssistant({
   onStop,
   onOpenSettings,
   onHide,
+  approvals,
+  onDecide,
+  onOpenChange,
+  onOpenFile,
+  onInsertCode,
+  onNewChat,
+  onRetry,
+  onContinue,
+  autoApprove,
+  onToggleAutoApprove,
 }: AiAssistantProps) {
   const full = fullscreen;
   const [prompt, setPrompt] = useState("");
@@ -101,6 +141,18 @@ export default function AiAssistant({
       node.scrollTop = node.scrollHeight;
     }
   }, [seed, onSeedConsumed]);
+
+  // The composer grows with its draft, up to a third of the panel.
+  useEffect(() => {
+    const node = promptRef.current;
+
+    if (!node) {
+      return;
+    }
+
+    node.style.height = "auto";
+    node.style.height = `${Math.min(node.scrollHeight, 220)}px`;
+  }, [prompt]);
 
   // Close the model list on an outside click or Escape (captured so the
   // full-screen Escape handler does not also fire).
@@ -169,7 +221,7 @@ export default function AiAssistant({
 
     node.scrollTop = node.scrollHeight;
     setAtBottom(true);
-  }, [messages, pending, live]);
+  }, [messages, pending, live, approvals]);
 
   const canSend = configured && !pending && prompt.trim().length > 0;
 
@@ -178,8 +230,22 @@ export default function AiAssistant({
       return;
     }
 
+    followRef.current = true;
     onSend(prompt.trim());
     setPrompt("");
+  };
+
+  const lastAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant");
+
+  const timelineProps = {
+    approvals,
+    onDecide,
+    onOpenChange,
+    onOpenFile,
+    onInsertCode,
+    large: full,
   };
 
   return (
@@ -202,6 +268,17 @@ export default function AiAssistant({
           Assistant
         </span>
         <span className="flex items-center gap-0.5">
+          <button
+            type="button"
+            onClick={onNewChat}
+            disabled={pending || messages.length === 0}
+            aria-label="New chat"
+            title="New chat"
+            className={iconButton}
+          >
+            <SquarePen className="size-3.5" strokeWidth={1.75} />
+          </button>
+
           {full && (
             <button
               type="button"
@@ -226,7 +303,7 @@ export default function AiAssistant({
             onClick={onToggleFullscreen}
             aria-label={full ? "Exit full screen" : "Full screen assistant"}
             title={full ? "Exit full screen (Esc)" : "Full screen assistant"}
-            className="flex size-6 items-center justify-center rounded-md text-ink/30 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink"
+            className={iconButton}
           >
             {full ? (
               <Minimize2 className="size-3.5" strokeWidth={1.75} />
@@ -240,7 +317,7 @@ export default function AiAssistant({
             onClick={onOpenSettings}
             aria-label="Open settings"
             title="Settings"
-            className="flex size-6 items-center justify-center rounded-md text-ink/30 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink"
+            className={iconButton}
           >
             <Settings2 className="size-3.5" strokeWidth={1.75} />
           </button>
@@ -250,7 +327,7 @@ export default function AiAssistant({
             onClick={onHide}
             aria-label="Hide AI assistant"
             title="Hide AI assistant"
-            className="flex size-6 items-center justify-center rounded-md text-ink/30 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink"
+            className={iconButton}
           >
             <PanelRightClose className="size-3.5" strokeWidth={1.75} />
           </button>
@@ -263,123 +340,93 @@ export default function AiAssistant({
           onScroll={updateAtBottom}
           className={`min-h-0 flex-1 overflow-y-auto ${full ? "px-6 py-6" : "px-3.5 py-4"}`}
         >
-        <div className={full ? "mx-auto w-full max-w-[760px]" : undefined}>
-        {!configured ? (
-          <div
-            className={`flex flex-col items-center gap-3.5 text-center ${full ? "mt-32" : "mt-12"}`}
-          >
-            <span className="flex size-10 items-center justify-center rounded-xl bg-ink/[0.03] ring-1 ring-ink/[0.08] ring-inset">
-              <Sparkles className="size-4 text-ink/30" strokeWidth={1.5} />
-            </span>
-            <div>
-              <p className="text-[12.5px] text-ink/55">
-                NVIDIA NIM is not connected
-              </p>
-              <p className="mt-1 text-[11px] leading-relaxed text-ink/30">
-                Add an API key to let the assistant read and edit this
-                workspace.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={onOpenSettings}
-              className="rounded-lg bg-ink px-3 py-1.5 text-[11.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90"
-            >
-              Open settings
-            </button>
-          </div>
-        ) : messages.length === 0 && !pending ? (
-          <div
-            className={`flex flex-col items-center gap-3 text-center ${full ? "mt-32" : "mt-12"}`}
-          >
-            <span className="flex size-10 items-center justify-center rounded-xl bg-ink/[0.03] ring-1 ring-ink/[0.08] ring-inset">
-              <Sparkles className="size-4 text-ink/25" strokeWidth={1.5} />
-            </span>
-            <p className="text-[12px] leading-relaxed text-ink/35">
-              Ask about the files in this workspace, or anything else.
-            </p>
-          </div>
-        ) : (
-          <ul className="space-y-5">
-            {messages.map((message) => (
-              <li key={message.id} className="text-[13px] leading-relaxed">
-                <p className="mb-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25">
-                  {message.role === "user" ? "You" : "Assistant"}
-                </p>
-                {message.role === "user" ? (
-                  <div
-                    className={`rounded-xl border border-ink/[0.07] bg-ink/[0.04] leading-relaxed whitespace-pre-wrap text-ink/80 ${
-                      full ? "px-3.5 py-2.5 text-[13px]" : "px-3 py-2 text-[12.5px]"
-                    }`}
-                  >
-                    {message.text}
-                  </div>
-                ) : message.error ? (
-                  <p className="whitespace-pre-wrap rounded-lg border border-ink/[0.06] bg-ink/[0.02] px-3 py-2 text-[12.5px] leading-relaxed text-ink/45">
-                    {message.text}
+          <div className={full ? "mx-auto w-full max-w-[760px]" : undefined}>
+            {!configured ? (
+              <div
+                className={`flex flex-col items-center gap-3.5 text-center ${full ? "mt-32" : "mt-12"}`}
+              >
+                <span className="flex size-10 items-center justify-center rounded-xl bg-ink/[0.03] ring-1 ring-ink/[0.08] ring-inset">
+                  <Sparkles className="size-4 text-ink/30" strokeWidth={1.5} />
+                </span>
+                <div>
+                  <p className="text-[12.5px] text-ink/55">
+                    NVIDIA NIM is not connected
                   </p>
-                ) : (
-                  <MarkdownMessage text={message.text} large={full} />
-                )}
-
-                {message.reasoning && (
-                  <details className="mt-2">
-                    <summary className="flex cursor-pointer items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25 transition-colors duration-150 hover:text-ink/55">
-                      <Brain className="size-3" strokeWidth={1.75} />
-                      Thinking
-                    </summary>
-                    <p className="mt-1.5 whitespace-pre-wrap border-l border-ink/[0.07] pl-2.5 text-[11px] leading-relaxed text-ink/35">
-                      {message.reasoning}
-                    </p>
-                  </details>
-                )}
-
-                {message.steps && message.steps.length > 0 && (
-                  <details className="mt-1.5">
-                    <summary className="flex cursor-pointer items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25 transition-colors duration-150 hover:text-ink/55">
-                      <Wrench className="size-3" strokeWidth={1.75} />
-                      {message.steps.length}{" "}
-                      {message.steps.length === 1 ? "step" : "steps"}
-                    </summary>
-                    <ul className="mt-1.5 space-y-1.5 border-l border-ink/[0.07] pl-2.5">
-                      {message.steps.map((step) => (
-                        <li
-                          key={`${message.id}-${step.id}`}
-                          className="flex items-start gap-1.5 text-[11px] leading-relaxed"
+                  <p className="mt-1 text-[11px] leading-relaxed text-ink/30">
+                    Add an API key to let the assistant read and edit this
+                    workspace.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  className="rounded-lg bg-ink px-3 py-1.5 text-[11.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90"
+                >
+                  Open settings
+                </button>
+              </div>
+            ) : messages.length === 0 && !pending ? (
+              <EmptyState full={full} onPick={setPrompt} />
+            ) : (
+              <ul className="space-y-6">
+                {messages.map((message) => (
+                  <li key={message.id} className="text-[13px] leading-relaxed">
+                    {message.role === "user" ? (
+                      <div className="flex justify-end">
+                        <div
+                          className={`max-w-[92%] rounded-xl rounded-br-sm border border-ink/[0.07] bg-ink/[0.05] leading-relaxed whitespace-pre-wrap text-ink/85 ${
+                            full
+                              ? "px-3.5 py-2.5 text-[13px]"
+                              : "px-3 py-2 text-[12.5px]"
+                          }`}
                         >
-                          <Check
-                            className={`mt-0.5 size-3 shrink-0 ${
-                              step.kind === "error"
-                                ? "text-ink/25"
-                                : "text-ink/50"
-                            }`}
+                          {message.text}
+                        </div>
+                      </div>
+                    ) : (
+                      <div>
+                        <p className="mb-2 flex items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25">
+                          <Sparkles className="size-3" strokeWidth={1.75} />
+                          Assistant
+                        </p>
+                        {message.error ? (
+                          <p className="whitespace-pre-wrap rounded-lg border border-ink/[0.08] bg-ink/[0.03] px-3 py-2 text-[12px] leading-relaxed text-ink/55">
+                            {message.text}
+                          </p>
+                        ) : message.blocks ? (
+                          <Timeline blocks={message.blocks} {...timelineProps} />
+                        ) : (
+                          <MarkdownMessage
+                            text={message.text}
+                            large={full}
+                            codeActions
+                            onInsertCode={onInsertCode ?? undefined}
                           />
-                          <span className="min-w-0">
-                            <span className="text-ink/50">{step.title}</span>
-                            {step.detail && (
-                              <span className="block truncate font-mono text-[10px] text-ink/25">
-                                {step.detail}
-                              </span>
-                            )}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
+                        )}
+
+                        {message === lastAssistant && !pending && (
+                          <MessageActions
+                            message={message}
+                            onRetry={() => onRetry(message.id)}
+                            onContinue={onContinue}
+                          />
+                        )}
+                      </div>
+                    )}
+                  </li>
+                ))}
+                {pending && (
+                  <li className="text-[13px] leading-relaxed">
+                    <p className="mb-2 flex items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/30">
+                      <Sparkles className="size-3" strokeWidth={1.75} />
+                      Assistant
+                    </p>
+                    <LiveRun live={live} model={model} {...timelineProps} />
+                  </li>
                 )}
-              </li>
-            ))}
-            {pending && (
-              <li className="text-[13px] leading-relaxed">
-                <p className="mb-1 text-[10px] uppercase tracking-[0.16em] text-ink/30">
-                  Assistant
-                </p>
-                <LiveRun live={live} model={model} large={full} />
-              </li>
+              </ul>
             )}
-          </ul>
-        )}
-        </div>
+          </div>
         </div>
 
         {!atBottom && (
@@ -399,157 +446,644 @@ export default function AiAssistant({
         className={`shrink-0 border-t border-line ${full ? "px-6 py-4" : "p-3"}`}
       >
         <div className={full ? "mx-auto w-full max-w-[760px]" : undefined}>
-        {contextPath && (
-          <div
-            title={`The assistant reads ${contextPath}`}
-            className="mb-2 flex items-center gap-1.5 rounded-md border border-ink/[0.07] bg-ink/[0.02] px-2 py-1 text-[10px] text-ink/35"
-          >
-            <File className="size-3 shrink-0 text-ink/25" strokeWidth={1.75} />
-            <span className="truncate font-mono">{contextPath}</span>
-          </div>
-        )}
-        <div className="rounded-xl border border-ink/[0.08] bg-ink/[0.03] transition-colors duration-150 focus-within:border-ink/20 focus-within:bg-ink/[0.045]">
-          {configured && (
+          {contextPath && (
             <div
-              ref={switcherRef}
-              className="relative flex items-center border-b border-ink/[0.05] px-2 py-2"
+              title={`The assistant can see ${contextPath}`}
+              className="mb-2 flex items-center gap-1.5 rounded-md border border-ink/[0.07] bg-ink/[0.02] px-2 py-1 text-[10px] text-ink/35"
             >
-              <button
-                type="button"
-                onClick={() => setSwitcherOpen((open) => !open)}
-                aria-haspopup="listbox"
-                aria-expanded={switcherOpen}
-                aria-label={`Model: ${model}. Change model`}
-                title={switcherOpen ? "Close model list" : "Change model"}
-                className={`flex min-w-0 items-center gap-1.5 rounded-md border px-1.5 py-1 transition-colors duration-150 ${
-                  switcherOpen
-                    ? "border-ink/20 bg-ink/[0.07] text-ink/80"
-                    : "border-ink/[0.07] bg-ink/[0.02] text-ink/45 hover:border-ink/15 hover:text-ink/70"
-                }`}
-              >
-                <Cpu className="size-3 shrink-0" strokeWidth={1.75} />
-                <span className="min-w-0 max-w-[11rem] truncate font-mono text-[10px]">
-                  {model}
-                </span>
-                <ChevronDown
-                  className={`size-3 shrink-0 transition-transform duration-150 ${
-                    switcherOpen ? "rotate-180" : ""
-                  }`}
-                  strokeWidth={2}
-                />
-              </button>
-
-              {switcherOpen && (
-                <div
-                  role="listbox"
-                  aria-label="Model"
-                  className="absolute bottom-full left-2 z-30 mb-2 max-h-64 w-[286px] max-w-[calc(100%-1rem)] overflow-y-auto rounded-xl border border-ink/[0.09] bg-raised/95 p-1 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.95)] backdrop-blur-xl"
-                >
-                  {models.length === 0 ? (
-                    <p className="px-2.5 py-2 text-[11px] leading-relaxed text-ink/35">
-                      No verified models yet. Verify your key in Settings.
-                    </p>
-                  ) : (
-                    models.map((id) => {
-                      const selected = id === model;
-                      const ms = latency[id];
-
-                      return (
-                        <button
-                          key={id}
-                          type="button"
-                          role="option"
-                          aria-selected={selected}
-                          onClick={() => {
-                            onSelectModel(id);
-                            setSwitcherOpen(false);
-                          }}
-                          className={`flex h-8 w-full items-center gap-2 rounded-lg px-2.5 text-left transition-colors duration-100 ${
-                            selected
-                              ? "bg-ink/[0.07] text-ink"
-                              : "text-ink/60 hover:bg-ink/[0.05] hover:text-ink/90"
-                          }`}
-                        >
-                          <span className="min-w-0 flex-1 truncate font-mono text-[11px]">
-                            {id}
-                          </span>
-                          {ms !== undefined && (
-                            <span className="shrink-0 font-mono text-[9.5px] text-ink/25">
-                              {ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`}
-                            </span>
-                          )}
-                          {selected && (
-                            <Check
-                              className="size-3 shrink-0 text-ink"
-                              strokeWidth={2.5}
-                            />
-                          )}
-                        </button>
-                      );
-                    })
-                  )}
-                </div>
-              )}
+              <File className="size-3 shrink-0 text-ink/25" strokeWidth={1.75} />
+              <span className="truncate font-mono">{contextPath}</span>
             </div>
           )}
-          <textarea
-            ref={promptRef}
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                submit();
-              }
-            }}
-            rows={2}
-            disabled={!configured || pending}
-            placeholder={
-              configured ? "Ask the assistant…" : "Connect a model in Settings"
-            }
-            aria-label="Message the assistant"
-            className="w-full resize-none bg-transparent px-3 pt-2 pb-1 text-[12.5px] leading-relaxed text-ink placeholder:text-ink/25 focus:outline-none disabled:cursor-not-allowed disabled:text-ink/30"
-          />
-          <div className="flex items-center justify-between gap-2 px-2 pt-0.5 pb-2">
-            <span className="truncate text-[9.5px] text-ink/25">
-              Enter to send · Shift+Enter for newline
-            </span>
-            {pending ? (
-              <button
-                type="button"
-                onClick={onStop}
-                aria-label="Stop the assistant"
-                title="Stop the assistant"
-                className="flex size-7 items-center justify-center rounded-lg border border-ink/15 text-ink/60 transition-colors duration-150 hover:border-ink/40 hover:bg-ink/[0.06] hover:text-ink"
+          <div className="rounded-xl border border-ink/[0.08] bg-ink/[0.03] transition-colors duration-150 focus-within:border-ink/20 focus-within:bg-ink/[0.045]">
+            {configured && (
+              <div
+                ref={switcherRef}
+                className="relative flex items-center justify-between gap-2 border-b border-ink/[0.05] px-2 py-2"
               >
-                <Square className="size-3 fill-current" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={submit}
-                disabled={!canSend}
-                aria-label="Send message"
-                className="flex size-7 items-center justify-center rounded-lg bg-ink text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/10 disabled:text-ink/30"
-              >
-                <ArrowUp className="size-3.5" strokeWidth={2.4} />
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setSwitcherOpen((open) => !open)}
+                  aria-haspopup="listbox"
+                  aria-expanded={switcherOpen}
+                  aria-label={`Model: ${model}. Change model`}
+                  title={switcherOpen ? "Close model list" : "Change model"}
+                  className={`flex min-w-0 items-center gap-1.5 rounded-md border px-1.5 py-1 transition-colors duration-150 ${
+                    switcherOpen
+                      ? "border-ink/20 bg-ink/[0.07] text-ink/80"
+                      : "border-ink/[0.07] bg-ink/[0.02] text-ink/45 hover:border-ink/15 hover:text-ink/70"
+                  }`}
+                >
+                  <Cpu className="size-3 shrink-0" strokeWidth={1.75} />
+                  <span className="min-w-0 max-w-[9rem] truncate font-mono text-[10px]">
+                    {model}
+                  </span>
+                  <ChevronDown
+                    className={`size-3 shrink-0 transition-transform duration-150 ${
+                      switcherOpen ? "rotate-180" : ""
+                    }`}
+                    strokeWidth={2}
+                  />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onToggleAutoApprove}
+                  aria-pressed={autoApprove}
+                  title={
+                    autoApprove
+                      ? "Edits are saved without asking. Click to review each edit first."
+                      : "Each edit is shown as a diff to accept or reject. Click to save edits without asking."
+                  }
+                  className={`flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-1 text-[10px] transition-colors duration-150 ${
+                    autoApprove
+                      ? "border-ink/20 bg-ink/[0.07] text-ink/75"
+                      : "border-ink/[0.07] bg-ink/[0.02] text-ink/45 hover:border-ink/15 hover:text-ink/70"
+                  }`}
+                >
+                  {autoApprove ? (
+                    <Zap className="size-3" strokeWidth={1.75} />
+                  ) : (
+                    <ShieldCheck className="size-3" strokeWidth={1.75} />
+                  )}
+                  {autoApprove ? "Auto-apply edits" : "Review edits"}
+                </button>
+
+                {switcherOpen && (
+                  <div
+                    role="listbox"
+                    aria-label="Model"
+                    className="absolute bottom-full left-2 z-30 mb-2 max-h-64 w-[286px] max-w-[calc(100%-1rem)] overflow-y-auto rounded-xl border border-ink/[0.09] bg-raised/95 p-1 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.95)] backdrop-blur-xl"
+                  >
+                    {models.length === 0 ? (
+                      <p className="px-2.5 py-2 text-[11px] leading-relaxed text-ink/35">
+                        No verified models yet. Verify your key in Settings.
+                      </p>
+                    ) : (
+                      models.map((id) => {
+                        const selected = id === model;
+                        const ms = latency[id];
+
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            role="option"
+                            aria-selected={selected}
+                            onClick={() => {
+                              onSelectModel(id);
+                              setSwitcherOpen(false);
+                            }}
+                            className={`flex h-8 w-full items-center gap-2 rounded-lg px-2.5 text-left transition-colors duration-100 ${
+                              selected
+                                ? "bg-ink/[0.07] text-ink"
+                                : "text-ink/60 hover:bg-ink/[0.05] hover:text-ink/90"
+                            }`}
+                          >
+                            <span className="min-w-0 flex-1 truncate font-mono text-[11px]">
+                              {id}
+                            </span>
+                            {ms !== undefined && (
+                              <span className="shrink-0 font-mono text-[9.5px] text-ink/25">
+                                {ms < 1000
+                                  ? `${ms}ms`
+                                  : `${(ms / 1000).toFixed(1)}s`}
+                              </span>
+                            )}
+                            {selected && (
+                              <Check
+                                className="size-3 shrink-0 text-ink"
+                                strokeWidth={2.5}
+                              />
+                            )}
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                )}
+              </div>
             )}
+            <textarea
+              ref={promptRef}
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  submit();
+                }
+              }}
+              rows={2}
+              disabled={!configured || pending}
+              placeholder={
+                !configured
+                  ? "Connect a model in Settings"
+                  : pending
+                    ? "The assistant is working…"
+                    : "Ask, or describe a change…"
+              }
+              aria-label="Message the assistant"
+              className="block max-h-[220px] w-full resize-none bg-transparent px-3 pt-2 pb-1 text-[12.5px] leading-relaxed text-ink placeholder:text-ink/25 focus:outline-none disabled:cursor-not-allowed disabled:text-ink/30"
+            />
+            <div className="flex items-center justify-between gap-2 px-2 pt-0.5 pb-2">
+              <span className="truncate text-[9.5px] text-ink/25">
+                Enter to send · Shift+Enter for newline
+              </span>
+              {pending ? (
+                <button
+                  type="button"
+                  onClick={onStop}
+                  aria-label="Stop the assistant"
+                  title="Stop the assistant"
+                  className="flex size-7 items-center justify-center rounded-lg border border-ink/15 text-ink/60 transition-colors duration-150 hover:border-ink/40 hover:bg-ink/[0.06] hover:text-ink"
+                >
+                  <Square className="size-3 fill-current" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={submit}
+                  disabled={!canSend}
+                  aria-label="Send message"
+                  className="flex size-7 items-center justify-center rounded-lg bg-ink text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/10 disabled:text-ink/30"
+                >
+                  <ArrowUp className="size-3.5" strokeWidth={2.4} />
+                </button>
+              )}
+            </div>
           </div>
-        </div>
         </div>
       </div>
     </aside>
   );
 }
 
-type LiveRunProps = {
-  live: { steps: AgentStep[]; reasoning: string; text: string } | null;
-  model: string;
+const STARTERS = [
+  "Explain how this project is structured",
+  "Find likely bugs in the open file",
+  "Add comments to the open file",
+];
+
+function EmptyState({
+  full,
+  onPick,
+}: {
+  full: boolean;
+  onPick: (prompt: string) => void;
+}) {
+  return (
+    <div
+      className={`flex flex-col items-center gap-3 text-center ${full ? "mt-32" : "mt-12"}`}
+    >
+      <span className="flex size-10 items-center justify-center rounded-xl bg-ink/[0.03] ring-1 ring-ink/[0.08] ring-inset">
+        <Sparkles className="size-4 text-ink/25" strokeWidth={1.5} />
+      </span>
+      <p className="text-[12px] leading-relaxed text-ink/40">
+        Ask about this workspace, or describe a change.
+        <br />
+        <span className="text-ink/25">
+          Edits are shown as a diff before anything is saved.
+        </span>
+      </p>
+      <div className="mt-1 flex w-full max-w-[280px] flex-col gap-1.5">
+        {STARTERS.map((starter) => (
+          <button
+            key={starter}
+            type="button"
+            onClick={() => onPick(starter)}
+            className="rounded-lg border border-ink/[0.07] bg-ink/[0.02] px-2.5 py-1.5 text-left text-[11px] text-ink/45 transition-colors duration-150 hover:border-ink/15 hover:text-ink/75"
+          >
+            {starter}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MessageActions({
+  message,
+  onRetry,
+  onContinue,
+}: {
+  message: AssistantMessage;
+  onRetry: () => void;
+  onContinue: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const action =
+    "flex h-6 items-center gap-1 rounded-md px-1.5 text-[10.5px] text-ink/35 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/75";
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-0.5">
+      {message.outOfSteps && (
+        <button
+          type="button"
+          onClick={onContinue}
+          title="Let the assistant keep working where it stopped"
+          className="mr-1 flex h-6 items-center gap-1 rounded-md border border-ink/15 bg-ink/[0.05] px-2 text-[10.5px] text-ink/70 transition-colors duration-150 hover:border-ink/30 hover:text-ink"
+        >
+          <Play className="size-3" strokeWidth={2} />
+          Continue
+        </button>
+      )}
+      <button type="button" onClick={onRetry} className={action} title="Ask again">
+        <RotateCcw className="size-3" strokeWidth={1.75} />
+        Retry
+      </button>
+      {!message.error && (
+        <button
+          type="button"
+          onClick={() => {
+            void navigator.clipboard.writeText(message.text).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1400);
+            });
+          }}
+          className={action}
+          title="Copy the answer as Markdown"
+        >
+          {copied ? (
+            <Check className="size-3" strokeWidth={2} />
+          ) : (
+            <Copy className="size-3" strokeWidth={1.75} />
+          )}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+type TimelineProps = {
+  blocks: MessageBlock[];
+  approvals: Record<number, ApprovalRequest>;
+  onDecide: (stepId: number, accept: boolean) => void;
+  onOpenChange: (request: ApprovalRequest) => void;
+  onOpenFile: (path: string) => void;
+  onInsertCode: ((code: string) => void) | null;
   large: boolean;
+  /** The turn is still streaming; the newest thinking stays expanded. */
+  live?: boolean;
 };
 
-function LiveRun({ live, model, large }: LiveRunProps) {
+type Group =
+  | { type: "steps"; steps: AgentStep[] }
+  | { type: "text"; text: string }
+  | { type: "reasoning"; text: string };
+
+/** Consecutive tool steps read better as one list than as separate blocks. */
+function groupBlocks(blocks: MessageBlock[]): Group[] {
+  const groups: Group[] = [];
+
+  for (const block of blocks) {
+    const last = groups[groups.length - 1];
+
+    if (block.type === "step") {
+      if (last?.type === "steps") {
+        last.steps.push(block.step);
+      } else {
+        groups.push({ type: "steps", steps: [block.step] });
+      }
+    } else if (block.text.trim().length > 0) {
+      groups.push({ type: block.type, text: block.text });
+    }
+  }
+
+  return groups;
+}
+
+function Timeline({
+  blocks,
+  approvals,
+  onDecide,
+  onOpenChange,
+  onOpenFile,
+  onInsertCode,
+  large,
+  live = false,
+}: TimelineProps) {
+  const groups = useMemo(() => groupBlocks(blocks), [blocks]);
+
+  return (
+    <div className="space-y-2.5">
+      {groups.map((group, index) => {
+        const newest = index === groups.length - 1;
+
+        if (group.type === "steps") {
+          return (
+            <ul
+              key={`steps-${group.steps[0].id}`}
+              className="space-y-1 rounded-lg border border-ink/[0.06] bg-ink/[0.015] p-1.5"
+            >
+              {group.steps.map((step) => (
+                <StepRow
+                  key={step.id}
+                  step={step}
+                  approval={approvals[step.id]}
+                  onDecide={onDecide}
+                  onOpenChange={onOpenChange}
+                  onOpenFile={onOpenFile}
+                />
+              ))}
+            </ul>
+          );
+        }
+
+        if (group.type === "reasoning") {
+          return (
+            <Reasoning
+              key={`reasoning-${index}`}
+              text={group.text}
+              open={live && newest}
+            />
+          );
+        }
+
+        return (
+          <MarkdownMessage
+            key={`text-${index}`}
+            text={group.text}
+            caret={live && newest}
+            large={large}
+            codeActions={!live}
+            onInsertCode={onInsertCode ?? undefined}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function Reasoning({ text, open }: { text: string; open: boolean }) {
+  const [expanded, setExpanded] = useState(open);
+
+  useEffect(() => {
+    setExpanded(open);
+  }, [open]);
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        className="flex items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25 transition-colors duration-150 hover:text-ink/55"
+      >
+        <ChevronRight
+          className={`size-3 transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
+          strokeWidth={2}
+        />
+        <Brain className="size-3" strokeWidth={1.75} />
+        Thinking
+      </button>
+      {expanded && (
+        <p className="mt-1.5 max-h-60 overflow-y-auto whitespace-pre-wrap border-l border-ink/[0.07] pl-2.5 text-[11px] leading-relaxed text-ink/35">
+          {text}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function toolIcon(step: AgentStep) {
+  switch (step.tool) {
+    case "list_files":
+      return FolderTree;
+    case "read_file":
+      return FileText;
+    case "search_text":
+      return Search;
+    case "edit_file":
+      return FilePen;
+    case "write_file":
+      return FilePlus;
+    default:
+      return step.kind === "notice" ? Info : Wrench;
+  }
+}
+
+function StatusIcon({ step }: { step: AgentStep }) {
+  if (step.status === "running") {
+    return <LoaderCircle className="size-3 animate-spin text-ink/45" />;
+  }
+
+  if (step.status === "awaiting") {
+    return <Clock className="size-3 text-ink/70" strokeWidth={2} />;
+  }
+
+  if (step.kind === "rejected") {
+    return <Ban className="size-3 text-ink/35" strokeWidth={2} />;
+  }
+
+  if (step.status === "error") {
+    return <X className="size-3 text-ink/35" strokeWidth={2.25} />;
+  }
+
+  return <Check className="size-3 text-ink/40" strokeWidth={2.25} />;
+}
+
+/** The step title with its file path turned into a link to that file. */
+function StepTitle({
+  step,
+  onOpenFile,
+}: {
+  step: AgentStep;
+  onOpenFile: (path: string) => void;
+}): ReactNode {
+  const path = step.path;
+  const at = path ? step.title.lastIndexOf(path) : -1;
+
+  if (!path || at < 0) {
+    return step.title;
+  }
+
+  return (
+    <>
+      {step.title.slice(0, at)}
+      <button
+        type="button"
+        onClick={() => onOpenFile(path)}
+        title={`Open ${path}`}
+        className="font-mono text-[10.5px] text-ink/70 underline decoration-ink/20 underline-offset-2 transition-colors duration-150 hover:text-ink hover:decoration-ink/60"
+      >
+        {path}
+      </button>
+      {step.title.slice(at + path.length)}
+    </>
+  );
+}
+
+function StepRow({
+  step,
+  approval,
+  onDecide,
+  onOpenChange,
+  onOpenFile,
+}: {
+  step: AgentStep;
+  approval: ApprovalRequest | undefined;
+  onDecide: (stepId: number, accept: boolean) => void;
+  onOpenChange: (request: ApprovalRequest) => void;
+  onOpenFile: (path: string) => void;
+}) {
+  const Icon = toolIcon(step);
+  const active = step.status === "running" || step.status === "awaiting";
+
+  return (
+    <li className="rounded-md px-1.5 py-1 text-[11px] leading-relaxed">
+      <div className="flex items-start gap-2">
+        <Icon
+          className={`mt-0.5 size-3 shrink-0 ${active ? "text-ink/60" : "text-ink/30"}`}
+          strokeWidth={1.75}
+        />
+        <span className="min-w-0 flex-1">
+          <span className={active ? "text-ink/75" : "text-ink/50"}>
+            <StepTitle step={step} onOpenFile={onOpenFile} />
+          </span>
+          {step.detail && (
+            <span
+              title={step.detail}
+              className={`block truncate font-mono text-[10px] ${
+                step.status === "error" ? "text-ink/40" : "text-ink/25"
+              }`}
+            >
+              {step.detail}
+            </span>
+          )}
+        </span>
+        <span className="mt-0.5 shrink-0">
+          <StatusIcon step={step} />
+        </span>
+      </div>
+
+      {step.status === "awaiting" && approval && (
+        <ApprovalCard
+          request={approval}
+          onDecide={(accept) => onDecide(step.id, accept)}
+          onOpen={() => onOpenChange(approval)}
+        />
+      )}
+    </li>
+  );
+}
+
+const MAX_PREVIEW_LINES = 400;
+
+function ApprovalCard({
+  request,
+  onDecide,
+  onOpen,
+}: {
+  request: ApprovalRequest;
+  onDecide: (accept: boolean) => void;
+  onOpen: () => void;
+}) {
+  const diff = useMemo(
+    () => lineDiff(request.before, request.after),
+    [request.before, request.after],
+  );
+  const [busy, setBusy] = useState(false);
+  let shown = 0;
+
+  const decide = (accept: boolean) => {
+    setBusy(true);
+    onDecide(accept);
+  };
+
+  return (
+    <div className="mt-1.5 overflow-hidden rounded-lg border border-ink/15 bg-app">
+      <div className="flex items-center gap-2 border-b border-ink/[0.08] px-2.5 py-1.5">
+        <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink/70">
+          {request.created ? "New file · " : ""}
+          {request.path}
+        </span>
+        <span className="shrink-0 font-mono text-[10px] text-ink/50">
+          +{diff.added} −{diff.removed}
+        </span>
+        <button
+          type="button"
+          onClick={onOpen}
+          title="Open in the full diff view"
+          aria-label="Open in the full diff view"
+          className="flex size-5 shrink-0 items-center justify-center rounded text-ink/35 transition-colors duration-150 hover:bg-ink/[0.07] hover:text-ink"
+        >
+          <Maximize2 className="size-3" strokeWidth={1.75} />
+        </button>
+      </div>
+
+      <div className="max-h-64 overflow-auto py-1 font-mono text-[10.5px] leading-[1.55]">
+        {diff.hunks.map((hunk, hunkIndex) => (
+          <div key={`${hunk.oldStart}-${hunk.newStart}`}>
+            {hunkIndex > 0 && (
+              <div className="my-1 border-t border-dashed border-ink/[0.08]" />
+            )}
+            {hunk.lines.map((line, index) => {
+              shown += 1;
+
+              if (shown > MAX_PREVIEW_LINES) {
+                return null;
+              }
+
+              return (
+                <div
+                  key={index}
+                  className={`flex min-w-max gap-2 px-2.5 whitespace-pre ${
+                    line.kind === "added"
+                      ? "bg-ink/[0.07] text-ink/85"
+                      : line.kind === "removed"
+                        ? "text-ink/35 line-through decoration-ink/20"
+                        : "text-ink/40"
+                  }`}
+                >
+                  <span className="w-2 shrink-0 select-none text-ink/30">
+                    {line.kind === "added" ? "+" : line.kind === "removed" ? "−" : " "}
+                  </span>
+                  <span>{line.text || " "}</span>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+        {shown > MAX_PREVIEW_LINES && (
+          <p className="px-2.5 pt-1 text-ink/30">
+            {shown - MAX_PREVIEW_LINES} more lines — open the full diff to see
+            them.
+          </p>
+        )}
+      </div>
+
+      <div className="flex items-center justify-end gap-1.5 border-t border-ink/[0.08] px-2 py-1.5">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => decide(false)}
+          className="flex h-6 items-center gap-1 rounded-md border border-ink/[0.1] px-2 text-[10.5px] text-ink/55 transition-colors duration-150 hover:border-ink/25 hover:text-ink disabled:opacity-40"
+        >
+          <X className="size-3" strokeWidth={2} />
+          Reject
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => decide(true)}
+          className="flex h-6 items-center gap-1 rounded-md bg-ink px-2 text-[10.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:opacity-40"
+        >
+          <Check className="size-3" strokeWidth={2.5} />
+          Accept
+        </button>
+      </div>
+    </div>
+  );
+}
+
+type LiveRunProps = Omit<TimelineProps, "blocks" | "live"> & {
+  live: { blocks: MessageBlock[] } | null;
+  model: string;
+};
+
+function LiveRun({ live, model, ...timeline }: LiveRunProps) {
   const [seconds, setSeconds] = useState(0);
   const started = useRef(Date.now());
 
@@ -561,67 +1095,37 @@ function LiveRun({ live, model, large }: LiveRunProps) {
     return () => clearInterval(timer);
   }, []);
 
-  const steps = live?.steps ?? [];
-  const reasoning = live?.reasoning ?? "";
-  const text = live?.text ?? "";
+  const blocks = live?.blocks ?? [];
+  const last = blocks[blocks.length - 1];
+  const waitingOnUser = blocks.some(
+    (block) => block.type === "step" && block.step.status === "awaiting",
+  );
+  // Text or thinking that is still arriving shows its own progress; between
+  // steps (or before the first token) a quiet status line does.
+  const idle =
+    !waitingOnUser &&
+    (!last ||
+      (last.type === "step" && last.step.status !== "running"));
 
   return (
-    <div className="space-y-2">
-      {steps.length > 0 && (
-        <ul className="space-y-1.5 border-l border-ink/[0.07] pl-2.5">
-          {steps.map((step) => (
-            <li
-              key={step.id}
-              className="flex items-start gap-1.5 text-[11px] leading-relaxed"
-            >
-              {step.status === "running" ? (
-                <LoaderCircle className="mt-0.5 size-3 shrink-0 animate-spin text-ink/45" />
-              ) : (
-                <Check
-                  className={`mt-0.5 size-3 shrink-0 ${
-                    step.kind === "error" ? "text-ink/25" : "text-ink/50"
-                  }`}
-                />
-              )}
-              <span className="min-w-0">
-                <span
-                  className={
-                    step.status === "running" ? "text-ink/65" : "text-ink/45"
-                  }
-                >
-                  {step.title}
-                </span>
-                {step.detail && (
-                  <span className="block truncate font-mono text-[10px] text-ink/25">
-                    {step.detail}
-                  </span>
-                )}
-              </span>
-            </li>
-          ))}
-        </ul>
+    <div className="space-y-2.5">
+      {blocks.length > 0 && <Timeline blocks={blocks} live {...timeline} />}
+
+      {waitingOnUser && (
+        <p className="text-[10.5px] text-ink/45">
+          Waiting for you to accept or reject the change…
+        </p>
       )}
 
-      {reasoning.length > 0 && (
-        <div className="border-l border-ink/[0.07] pl-2.5">
-          <p className="mb-1 flex items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25">
-            <Brain className="size-3" strokeWidth={1.75} />
-            Thinking
-          </p>
-          <p className="whitespace-pre-wrap text-[11px] leading-relaxed text-ink/35">
-            {reasoning}
-          </p>
-        </div>
-      )}
-
-      {text.length > 0 ? (
-        <MarkdownMessage text={text} caret large={large} />
-      ) : (
+      {idle && (
         <div className="space-y-1">
-          <p className="text-[11px] text-ink/40">
-            {model ? `Waiting for ${model}` : "Thinking"}… {seconds}s
+          <p className="flex items-center gap-1.5 text-[11px] text-ink/40">
+            <LoaderCircle className="size-3 animate-spin" />
+            {blocks.length === 0
+              ? `${model ? `Waiting for ${model}` : "Thinking"}… ${seconds}s`
+              : "Working…"}
           </p>
-          {seconds >= 20 && (
+          {blocks.length === 0 && seconds >= 20 && (
             <p className="text-[10px] leading-relaxed text-ink/25">
               Large models can take a minute or more before the first token.
             </p>

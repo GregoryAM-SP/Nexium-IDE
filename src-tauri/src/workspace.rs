@@ -126,8 +126,12 @@ fn build_children(dir: &Path, root: &Path, counter: &mut usize) -> Vec<EntryNode
 }
 
 pub fn open(root: &Path) -> Result<WorkspaceSnapshot, String> {
+    // `fs::canonicalize` returns a `\\?\` verbatim path on Windows, which the
+    // terminal's PowerShell cannot map to a drive (its prompt showed
+    // `Microsoft.PowerShell.Core\FileSystem::\\?\...`). `dunce` returns the
+    // plain `C:\...` form whenever one exists.
     let canonical =
-        fs::canonicalize(root).map_err(|_| "That folder could not be opened.".to_string())?;
+        dunce::canonicalize(root).map_err(|_| "That folder could not be opened.".to_string())?;
 
     if !canonical.is_dir() {
         return Err("That path is not a folder.".into());
@@ -630,6 +634,23 @@ mod tests {
         assert!(!root.join("src").join("renamed.rs").exists());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `\\?\` root made the terminal's PowerShell start at an unmappable
+    /// provider path instead of the project folder.
+    #[cfg(windows)]
+    #[test]
+    fn opened_root_has_no_verbatim_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexium-verbatim-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let snapshot = open(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!snapshot.root.starts_with(r"\\?\"), "{}", snapshot.root);
     }
 
     #[test]

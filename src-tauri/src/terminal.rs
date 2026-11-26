@@ -63,7 +63,7 @@ fn shell() -> (CommandBuilder, String) {
 /// Returns the shell's display name for the panel header.
 pub fn start(
     app: &AppHandle,
-    root: Option<PathBuf>,
+    root: PathBuf,
     sessions: &Mutex<HashMap<String, Session>>,
     id: String,
     rows: u16,
@@ -75,9 +75,7 @@ pub fn start(
 
     let (mut command, shell) = shell();
 
-    if let Some(root) = root {
-        command.cwd(root);
-    }
+    command.cwd(root);
 
     command.env("TERM", "xterm-256color");
 
