@@ -1,0 +1,147 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Inter-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/Inter-500.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/Inter-600.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/JetBrains-Mono-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/JetBrains-Mono-500.woff2") format("woff2");
+}
+
+/*
+ * Themes set three values on <html>: the page colour, the ink drawn on it and
+ * an accent. Every other surface, hairline and overlay is mixed from those, so
+ * a theme never has to restate the whole palette and light themes stay legible.
+ */
+:root {
+  --nx-bg: #000000;
+  --nx-fg: #ffffff;
+  --nx-accent: #ffffff;
+}
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-app: var(--nx-bg);
+  --color-ink: var(--nx-fg);
+  --color-accent: var(--nx-accent);
+  --color-surface: color-mix(in srgb, var(--nx-bg) 96.5%, var(--nx-fg) 3.5%);
+  --color-raised: color-mix(in srgb, var(--nx-bg) 93%, var(--nx-fg) 7%);
+  --color-rail: color-mix(in srgb, var(--nx-bg) 98%, var(--nx-fg) 2%);
+  --color-bar: color-mix(in srgb, var(--nx-bg) 98%, var(--nx-fg) 2%);
+  --color-line: color-mix(in srgb, var(--nx-fg) 8%, transparent);
+  --color-line-strong: color-mix(in srgb, var(--nx-fg) 14%, transparent);
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    background-color: var(--nx-bg);
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: var(--nx-bg);
+    color: var(--nx-fg);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01", "calt";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: var(--nx-accent);
+    color: var(--nx-bg);
+  }
+
+  :focus-visible {
+    outline: 1px solid color-mix(in srgb, var(--nx-accent) 55%, transparent);
+    outline-offset: 2px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--nx-fg) 14%, transparent)
+      transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: color-mix(in srgb, var(--nx-fg) 12%, transparent);
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in srgb, var(--nx-fg) 22%, transparent);
+  }
+
+  kbd {
+    font-family: var(--font-mono);
+  }
+}
+
+/* Monaco places its mouse-follow tooltips ("Close (Escape)" over the find
+   widget's buttons, the find options' hints) under the cursor. Left clickable,
+   such a tooltip sits on top of the small button it describes and swallows the
+   click, so hovering the find widget's close button appeared to disable it.
+   They only carry text, so clicks should pass straight through. */
+.monaco-hover.compact,
+.workbench-hover-container:has(.monaco-hover.compact),
+.context-view:has(.monaco-hover.compact) {
+  pointer-events: none;
+}
+
+/* Fenced blocks: the wrapper handles the frame, the code element the text. */
+.assistant-markdown pre code {
+  background-color: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  color: color-mix(in srgb, var(--nx-fg) 75%, transparent);
+}

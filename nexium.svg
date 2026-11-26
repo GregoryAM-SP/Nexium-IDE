@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Nexium Studio">
+  <rect width="128" height="128" rx="30" fill="#000000" />
+  <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="25.5" fill="none" stroke="#ffffff" stroke-opacity="0.16" stroke-width="1" />
+  <path
+    d="M40 92V36L88 92V36"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="10.5"
+    stroke-linecap="butt"
+    stroke-linejoin="miter"
+  />
+</svg>
