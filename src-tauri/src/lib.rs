@@ -1,17 +1,20 @@
 mod agent;
 mod git;
 mod nim;
+mod terminal;
 mod workspace;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::State;
+use tauri::{Manager, State};
 
 struct AppState {
     root: Mutex<Option<PathBuf>>,
     cancel: Arc<AtomicBool>,
+    terminals: Mutex<HashMap<String, terminal::Session>>,
 }
 
 fn with_root<T>(
@@ -210,6 +213,43 @@ fn git_commit_and_sync(
 }
 
 #[tauri::command]
+fn terminal_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<String, String> {
+    let root = state
+        .root
+        .lock()
+        .map_err(|_| "The workspace state is unavailable.".to_string())?
+        .clone();
+
+    terminal::start(&app, root, &state.terminals, id, rows, cols)
+}
+
+#[tauri::command]
+fn terminal_write(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
+    terminal::write(&state.terminals, &id, &data)
+}
+
+#[tauri::command]
+fn terminal_resize(
+    state: State<'_, AppState>,
+    id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    terminal::resize(&state.terminals, &id, rows, cols)
+}
+
+#[tauri::command]
+fn terminal_kill(state: State<'_, AppState>, id: String) {
+    terminal::kill(&state.terminals, &id);
+}
+
+#[tauri::command]
 fn nim_cancel(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
 }
@@ -274,8 +314,6 @@ pub fn run() {
         .setup(|app| {
             #[cfg(windows)]
             {
-                use tauri::Manager;
-
                 if let Some(window) = app.get_webview_window("main") {
                     hand_shortcuts_to_the_page(&window);
                 }
@@ -286,9 +324,17 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(state) = window.try_state::<AppState>() {
+                    terminal::kill_all(&state.terminals);
+                }
+            }
+        })
         .manage(AppState {
             root: Mutex::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
+            terminals: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             open_workspace,
@@ -310,6 +356,10 @@ pub fn run() {
             git_unstage_all,
             git_commit,
             git_commit_and_sync,
+            terminal_start,
+            terminal_write,
+            terminal_resize,
+            terminal_kill,
             nim::nim_verify,
             nim::nim_ping,
             nim::nim_chat,

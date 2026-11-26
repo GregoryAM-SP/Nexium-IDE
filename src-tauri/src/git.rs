@@ -48,8 +48,10 @@ fn execute(root: &Path, args: &[&str], allow_prompt: bool) -> Result<String, Str
 
     if !allow_prompt {
         // A window cannot answer git's credential prompt, so it must fail
-        // instead of waiting on a terminal that will never appear.
-        command.env("GIT_TERMINAL_PROMPT", "0");
+        // instead of waiting on a terminal or a credential-manager dialog.
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never");
     }
 
     let output = command

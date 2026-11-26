@@ -181,6 +181,10 @@ A change opens as a read-only side-by-side diff in the editor area, titled `HEAD
 
 Every action returns the fresh status, so the panel never shows a stale tree. Saving a file or the assistant writing one refreshes it too. If the folder is not a repository the panel says so and suggests `git init`; git errors (missing identity, empty index, hooks) are shown verbatim in the panel footer. Nothing is ever committed automatically, and no history-rewriting command is reachable from the UI.
 
+## Terminal
+
+`Ctrl`/`Cmd` + backtick (the key above Tab) shows a terminal panel under the editor and hides it again; the panel's close button does the same. It is a real shell — `powershell.exe` on Windows, `$SHELL` (or `/bin/sh`) elsewhere — started in the open folder the first time the panel is opened and kept alive while hidden, so the scrollback and the working directory survive a toggle. `portable-pty` gives it a pseudo-terminal, so interactive programs, colours and resizing behave as they do in a console; output is streamed to the page as base64 and drawn by xterm.js, whose theme follows the app's. The shell ends when the window closes. In the browser preview the panel states that a shell only exists in the desktop app.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
@@ -188,6 +192,7 @@ Every action returns the fresh status, so the panel never shows a stale tree. Sa
 | `Ctrl`/`Cmd` + `S` | Save the active file |
 | `Ctrl`/`Cmd` + `F` | Find in the active file — Monaco's widget, floating over the code |
 | `Ctrl`/`Cmd` + `H` | Find and replace in the active file (adds the replace row to the same widget) |
+| `Ctrl`/`Cmd` + backtick | Show or hide the terminal panel |
 | `Ctrl`/`Cmd` + `R`, `F5` | Reload the desktop window (the shell runs Vite without HMR) |
 | `Escape` | Leave full-screen assistant mode, close the explorer's inline draft, or dismiss a context menu |
 | `Enter` (in the composer) | Send the message |
@@ -293,6 +298,7 @@ Nexium-IDE/
 - Tauri capabilities are minimal: `core:default`, `dialog:default`, and only the five window permissions the custom title bar needs (`minimize`, `toggle-maximize`, `is-maximized`, `close`, `start-dragging`).
 - Assistant output is rendered as Markdown without HTML, so a model cannot inject markup or script into the window.
 - Writes performed by the assistant go through the same path checks as your own edits, and the UI is told which file changed so the editor never shows stale content. Deleting asks for confirmation first and is the only destructive action in the app.
+- The terminal is a real shell behind a pseudo-terminal, started in the open folder; commands typed into it run with your own permissions and are not sandboxed.
 - Source control shells out to `git` inside the open folder, only ever with `status --untracked-files=all`, `show` (read-only, for the diff sides), `add`, `restore`, `reset`, `rm --cached`, `commit -m` and `push` (with `GIT_TERMINAL_PROMPT=0`, so a credential prompt fails instead of blocking the window); paths are passed after `--` so they cannot be read as options.
 
 ---

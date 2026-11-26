@@ -36,6 +36,7 @@ import type { SettingsSection } from "./components/SettingsNav";
 import SettingsPage from "./components/SettingsPage";
 import SourceControlSettings from "./components/SourceControlSettings";
 import SvgPreview from "./components/SvgPreview";
+import TerminalPanel from "./components/TerminalPanel";
 import TitleBarMenu from "./components/TitleBarMenu";
 import WindowControls from "./components/WindowControls";
 import type { AssistantSettings } from "./lib/assistantSettings";
@@ -159,6 +160,10 @@ export default function App() {
 
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [previewOpen, setPreviewOpen] = useState(true);
+  // The terminal is only created on first use; after that it stays mounted so
+  // hiding it keeps the shell's scrollback and its working directory.
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalUsed, setTerminalUsed] = useState(false);
   const [assistantOpen, setAssistantOpen] = useState(true);
   const [assistantFull, setAssistantFull] = useState(false);
   const [assistantMessages, setAssistantMessages] = useState<
@@ -232,6 +237,33 @@ export default function App() {
       );
     }
   }, [applyWorkspace]);
+
+  // Ctrl+` toggles the terminal from anywhere. Capture runs before Monaco or
+  // the terminal's own textarea can consume the key.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.code !== "Backquote" ||
+        event.altKey ||
+        event.shiftKey ||
+        (!event.ctrlKey && !event.metaKey)
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setView("editor");
+      setTerminalUsed(true);
+      // Settings hides the panel without closing it, so asking for the
+      // terminal there means show it rather than flip its hidden state.
+      setTerminalOpen((open) => (view === "settings" ? true : !open));
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [view]);
 
   // In chat-only mode the assistant covers the window, so Escape is the way back.
   useEffect(() => {
@@ -1440,6 +1472,14 @@ export default function App() {
                 )}
               </div>
             </>
+          )}
+
+          {terminalUsed && (
+            <TerminalPanel
+              active={terminalOpen && view !== "settings"}
+              themeId={themeId}
+              onHide={() => setTerminalOpen(false)}
+            />
           )}
         </div>
 
