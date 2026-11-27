@@ -1,6 +1,9 @@
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronRight,
+  ArrowDown,
+  ArrowUp,
+  CloudUpload,
   Download,
   Eye,
   FileText,
@@ -34,6 +37,8 @@ import ImagePreview from "./components/ImagePreview";
 import MarkdownPreview from "./components/MarkdownPreview";
 import type { MarkdownPreviewHandle } from "./components/MarkdownPreview";
 import SourceControlPanel from "./components/SourceControlPanel";
+import BranchMenu from "./components/BranchMenu";
+import PublishDialog from "./components/PublishDialog";
 import SettingsNav from "./components/SettingsNav";
 import type { SettingsSection } from "./components/SettingsNav";
 import ProvidersSettings from "./components/ProvidersSettings";
@@ -67,8 +72,14 @@ import {
   stagePath,
   unstageAll,
   unstagePath,
+  createBranch,
+  fetchRemote,
+  listBranches,
+  pullBranch,
+  pushBranch,
+  switchBranch,
 } from "./lib/git";
-import type { GitStatus, GitTag } from "./lib/git";
+import type { GitBranch as Branch, GitStatus, GitTag } from "./lib/git";
 import { pathPrompt, selectionPrompt } from "./lib/assistantPrompt";
 import {
   appendDelta,
@@ -271,12 +282,18 @@ export default function App() {
   const [contents, setContents] = useState<Record<string, string>>({});
   const [activePath, setActivePath] = useState("");
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
   const [loadingPath, setLoadingPath] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const [scmOpen, setScmOpen] = useState(false);
   const [git, setGit] = useState<GitStatus | null>(null);
   const [gitBusy, setGitBusy] = useState(false);
+  // The status bar's pull/push in progress, and its branch picker.
+  const [gitSync, setGitSync] = useState<"pull" | "push" | null>(null);
+  const [branchMenuOpen, setBranchMenuOpen] = useState(false);
+  const [publishOpen, setPublishOpen] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
   const [gitTags, setGitTags] = useState<GitTag[]>([]);
   // Opening a change replaces the editor with a read-only diff of that file.
@@ -1865,6 +1882,125 @@ export default function App() {
     };
   }, []);
 
+  /**
+   * After a pull or a branch switch the files on disk are different: list the
+   * folder again and reload every open file that has no unsaved edits (those
+   * are left as they are).
+   */
+  const reloadFromDisk = useCallback(async () => {
+    try {
+      const snapshot = await refreshWorkspace(rootRef.current);
+      setTree(snapshot.tree);
+    } catch {
+      // The folder may have been closed.
+    }
+
+    for (const path of Object.keys(contentsRef.current)) {
+      if (dirtyRef.current[path]) {
+        continue;
+      }
+
+      void readFile(path)
+        .then((text) => setContents((current) => ({ ...current, [path]: text })))
+        .catch(() => {
+          // Not on this branch; the tab keeps what it showed.
+        });
+    }
+
+    void refreshGradleRef.current();
+    void refreshWebRef.current();
+  }, []);
+
+  const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
+
+  const handlePull = useCallback(async () => {
+    setGitSync("pull");
+    const before = git?.behind ?? 0;
+
+    try {
+      const next = await pullBranch();
+      setGit(next);
+      setNotice(
+        before > 0
+          ? `Pulled ${plural(before, "commit")} from ${next.upstream ?? "the remote"}.`
+          : `${next.branch} is up to date with ${next.upstream ?? "the remote"}.`,
+      );
+      await reloadFromDisk();
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : "The pull failed.");
+    } finally {
+      setGitSync(null);
+    }
+  }, [git, reloadFromDisk]);
+
+  const handlePush = useCallback(async () => {
+    setGitSync("push");
+    const before = git?.ahead ?? 0;
+    const publishing = !git?.upstream;
+
+    try {
+      const next = await pushBranch();
+      setGit(next);
+      setNotice(
+        publishing
+          ? `Published ${next.branch} to ${next.upstream ?? "origin"}.`
+          : before > 0
+            ? `Pushed ${plural(before, "commit")} to ${next.upstream ?? "the remote"}.`
+            : `Nothing new to push; ${next.upstream ?? "the remote"} already has ${next.branch}.`,
+      );
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : "The push failed.");
+    } finally {
+      setGitSync(null);
+    }
+  }, [git]);
+
+  const handleSwitchBranch = useCallback(
+    async (branch: Branch): Promise<string | null> => {
+      try {
+        const next = await switchBranch(branch.name, branch.remote);
+        setGit(next);
+        setNotice(`Switched to ${next.branch}.`);
+        await reloadFromDisk();
+        return null;
+      } catch (cause) {
+        return cause instanceof Error ? cause.message : "Could not switch branch.";
+      }
+    },
+    [reloadFromDisk],
+  );
+
+  const handleCreateBranch = useCallback(async (name: string): Promise<string | null> => {
+    try {
+      const next = await createBranch(name);
+      setGit(next);
+      setNotice(`Created ${next.branch} and switched to it.`);
+      return null;
+    } catch (cause) {
+      return cause instanceof Error ? cause.message : "Could not create the branch.";
+    }
+  }, []);
+
+  // Fetch quietly when a repository with a remote opens, then every five
+  // minutes, so the status bar knows how many commits there are to pull.
+  const canFetch = Boolean(git?.isRepo && git?.hasRemote);
+  useEffect(() => {
+    if (!canFetch) {
+      return;
+    }
+
+    const quietFetch = () =>
+      void fetchRemote()
+        .then(setGit)
+        .catch(() => {
+          // Offline or needs credentials: the counts just stay as they were.
+        });
+
+    quietFetch();
+    const timer = window.setInterval(quietFetch, 5 * 60_000);
+    return () => window.clearInterval(timer);
+  }, [canFetch, rootPath]);
+
   // Renaming or deleting a file leaves its old Monaco model behind; drop any
   // model whose file is neither open nor listed in the tree. Everything the
   // tree lists is kept, so workspace models registered up front survive a
@@ -2205,6 +2341,7 @@ export default function App() {
             onCreateTag={handleCreateTag}
             onPushTag={handlePushTag}
             onDeleteTag={handleDeleteTag}
+            onPublish={() => setPublishOpen(true)}
           />
         ) : explorerOpen && tree ? (
           <Explorer
@@ -2565,26 +2702,143 @@ export default function App() {
           </span>
         )}
 
-        <button
-          type="button"
-          onClick={() => setScmOpen(true)}
-          title="Source control"
-          className="flex max-w-[16rem] items-center gap-1.5 border-l border-line px-2.5 text-ink/40 transition-colors duration-150 first:border-l-0 hover:bg-ink/[0.06] hover:text-ink/80"
-        >
-          <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
-          <span className="truncate">
-            {!tree
-              ? "no folder"
-              : git?.isRepo
-                ? git.branch
-                : "no repository"}
-          </span>
-          {git?.isRepo && git.changes.length > 0 && (
-            <span className="rounded bg-ink/[0.08] px-1 font-mono text-[9px] leading-4 text-ink/50">
-              {git.changes.length}
+        <span className="relative flex items-stretch border-l border-line first:border-l-0">
+          <button
+            type="button"
+            onClick={() => (git?.isRepo ? setBranchMenuOpen((open) => !open) : setScmOpen(true))}
+            aria-expanded={branchMenuOpen}
+            title={git?.isRepo ? "Switch or create a branch" : "Source control"}
+            className="flex max-w-[16rem] items-center gap-1.5 px-2.5 text-ink/40 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/80"
+          >
+            <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
+            <span className="truncate">
+              {!tree
+                ? "no folder"
+                : git?.isRepo
+                  ? git.branch
+                  : "no repository"}
             </span>
+          </button>
+          {git?.isRepo && git.changes.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setScmOpen(true)}
+              title={`${plural(git.changes.length, "change")} — open Source control`}
+              className="flex items-center pr-2 transition-colors duration-150 hover:bg-ink/[0.06]"
+            >
+              <span className="rounded bg-ink/[0.08] px-1 font-mono text-[9px] leading-4 text-ink/50">
+                {git.changes.length}
+              </span>
+            </button>
           )}
-        </button>
+          {branchMenuOpen && git?.isRepo && (
+            <BranchMenu
+              current={git.branch}
+              load={listBranches}
+              onSwitch={handleSwitchBranch}
+              onCreate={handleCreateBranch}
+              onClose={() => setBranchMenuOpen(false)}
+            />
+          )}
+        </span>
+
+        {git?.isRepo && git.hasRemote === false && (
+          <button
+            type="button"
+            onClick={() => setPublishOpen(true)}
+            title="Create a repository on GitHub and push this branch"
+            className="flex items-center gap-1.5 border-l border-line px-2.5 text-ink/55 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/85"
+          >
+            <CloudUpload className="size-3" strokeWidth={1.75} />
+            Publish to GitHub
+          </button>
+        )}
+
+        {publishOpen && (
+          <PublishDialog
+            isRepo={Boolean(git?.isRepo)}
+            branch={git?.branch ?? ""}
+            onPublished={(result) => {
+              setGit(result.status);
+              setNotice(
+                result.pushed
+                  ? `Published to ${result.repo.fullName} on GitHub.`
+                  : `Created ${result.repo.fullName} on GitHub.`,
+              );
+            }}
+            onOpenSettings={() => {
+              setSettingsSection("source-control");
+              openSettings();
+            }}
+            onClose={() => setPublishOpen(false)}
+          />
+        )}
+
+        {git?.isRepo && git.hasRemote && (
+          <span className="flex items-stretch border-l border-line">
+            {git.upstream ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void handlePull()}
+                  disabled={gitSync !== null}
+                  title={
+                    git.behind
+                      ? `Pull ${plural(git.behind ?? 0, "commit")} from ${git.upstream}`
+                      : `Pull from ${git.upstream} (up to date as of the last fetch)`
+                  }
+                  aria-label="Pull"
+                  className={`flex items-center gap-1 px-2 font-mono text-[10px] transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/80 disabled:pointer-events-none ${
+                    git.behind ? "text-ink/70" : "text-ink/35"
+                  }`}
+                >
+                  {gitSync === "pull" ? (
+                    <LoaderCircle className="size-3 animate-spin" />
+                  ) : (
+                    <ArrowDown className="size-3" strokeWidth={1.9} />
+                  )}
+                  {git.behind ?? 0}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handlePush()}
+                  disabled={gitSync !== null}
+                  title={
+                    git.ahead
+                      ? `Push ${plural(git.ahead ?? 0, "commit")} to ${git.upstream}`
+                      : `Push to ${git.upstream} (nothing new to push)`
+                  }
+                  aria-label="Push"
+                  className={`flex items-center gap-1 px-2 font-mono text-[10px] transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/80 disabled:pointer-events-none ${
+                    git.ahead ? "text-ink/70" : "text-ink/35"
+                  }`}
+                >
+                  {gitSync === "push" ? (
+                    <LoaderCircle className="size-3 animate-spin" />
+                  ) : (
+                    <ArrowUp className="size-3" strokeWidth={1.9} />
+                  )}
+                  {git.ahead ?? 0}
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void handlePush()}
+                disabled={gitSync !== null}
+                title={`Push ${git.branch} to origin and track it there`}
+                className="flex items-center gap-1.5 px-2.5 text-ink/55 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/85 disabled:pointer-events-none"
+              >
+                {gitSync === "push" ? (
+                  <LoaderCircle className="size-3 animate-spin" />
+                ) : (
+                  <CloudUpload className="size-3" strokeWidth={1.75} />
+                )}
+                Publish branch
+              </button>
+            )}
+          </span>
+        )}
 
         <span className="flex min-w-0 flex-1 items-center border-l border-line px-2.5">
           <span className="min-w-0 truncate font-mono text-[10px] text-ink/25">

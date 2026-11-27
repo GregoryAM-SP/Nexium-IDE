@@ -12,6 +12,26 @@ export type GitStatus = {
   branch: string;
   changes: GitChange[];
   message: string | null;
+  /** The remote branch this one tracks, e.g. `origin/main`. */
+  upstream?: string | null;
+  /** Commits to push. */
+  ahead?: number;
+  /** Commits to pull, as of the last fetch. */
+  behind?: number;
+  /** The repository has a remote at all. */
+  hasRemote?: boolean;
+};
+
+/** A local branch, or a remote one no local branch tracks yet. */
+export type GitBranch = {
+  /** `feature/login`, or `origin/feature/login` for a remote branch. */
+  name: string;
+  current: boolean;
+  remote: boolean;
+  upstream: string | null;
+  subject: string;
+  /** Latest commit time, seconds since 1970. */
+  updated: number;
 };
 
 export type GitFileDiff = {
@@ -40,7 +60,18 @@ let demo: GitStatus = {
     { path: "README.md", status: "M", staged: false },
   ],
   message: null,
+  upstream: "origin/main",
+  ahead: 1,
+  behind: 2,
+  hasRemote: true,
 };
+
+const now = Math.floor(Date.now() / 1000);
+let demoBranches: GitBranch[] = [
+  { name: "main", current: true, remote: false, upstream: "origin/main", subject: "Add the tag dialog", updated: now - 600 },
+  { name: "feature/sessions", current: false, remote: false, upstream: null, subject: "Save sessions in SQLite", updated: now - 7200 },
+  { name: "origin/docs", current: false, remote: true, upstream: null, subject: "Rewrite the README", updated: now - 86400 },
+];
 
 function demoStatus(): GitStatus {
   return { ...demo, changes: demo.changes.map((change) => ({ ...change })) };
@@ -425,4 +456,81 @@ export function nextVersions(
     { label: "Minor", name: `${prefix}${major}.${minor + 1}.0` },
     { label: "Major", name: `${prefix}${major + 1}.0.0` },
   ];
+}
+
+// ── remote and branches ─────────────────────────────────────────────────────
+
+/** Updates the remote-tracking branches so the "to pull" count is current. */
+export function fetchRemote(): Promise<GitStatus> {
+  return call("git_fetch");
+}
+
+/** Fast-forwards the branch to its upstream; never merges or rebases. */
+export async function pullBranch(): Promise<GitStatus> {
+  if (isTauri()) {
+    return call("git_pull");
+  }
+
+  demo = { ...demo, behind: 0 };
+  return demoStatus();
+}
+
+/** Pushes the branch, publishing it to origin the first time. */
+export async function pushBranch(): Promise<GitStatus> {
+  if (isTauri()) {
+    return call("git_push");
+  }
+
+  demo = { ...demo, ahead: 0, upstream: demo.upstream ?? `origin/${demo.branch}` };
+  return demoStatus();
+}
+
+export async function listBranches(): Promise<GitBranch[]> {
+  if (!isTauri()) {
+    return demoBranches.map((branch) => ({ ...branch }));
+  }
+
+  try {
+    return await invoke<GitBranch[]>("git_branches");
+  } catch (cause) {
+    throw toError(cause, "The branches could not be listed.");
+  }
+}
+
+/** Creates a branch from the current commit and switches to it. */
+export async function createBranch(name: string): Promise<GitStatus> {
+  if (isTauri()) {
+    return call("git_create_branch", { name, checkout: true });
+  }
+
+  const trimmed = name.trim();
+  if (!trimmed || /\s/.test(trimmed) || trimmed.startsWith("-")) {
+    throw new Error(`"${trimmed}" is not a valid branch name.`);
+  }
+  if (demoBranches.some((branch) => !branch.remote && branch.name === trimmed)) {
+    throw new Error(`A branch named "${trimmed}" already exists.`);
+  }
+  demoBranches = [
+    { name: trimmed, current: true, remote: false, upstream: null, subject: demoBranches[0]?.subject ?? "", updated: Math.floor(Date.now() / 1000) },
+    ...demoBranches.map((branch) => ({ ...branch, current: false })),
+  ];
+  demo = { ...demo, branch: trimmed, upstream: null, ahead: 0, behind: 0 };
+  return demoStatus();
+}
+
+/** Switches branch; a remote one is checked out as a local tracking branch. */
+export async function switchBranch(name: string, remote: boolean): Promise<GitStatus> {
+  if (isTauri()) {
+    return call("git_switch_branch", { name, remote });
+  }
+
+  const local = remote ? name.slice(name.indexOf("/") + 1) : name;
+  demoBranches = demoBranches
+    .filter((branch) => !(remote && branch.name === name))
+    .map((branch) => ({ ...branch, current: branch.name === local }));
+  if (!demoBranches.some((branch) => branch.name === local)) {
+    demoBranches.unshift({ name: local, current: true, remote: false, upstream: name, subject: "", updated: Math.floor(Date.now() / 1000) });
+  }
+  demo = { ...demo, branch: local, upstream: remote ? name : demoBranches.find((b) => b.name === local)?.upstream ?? null, ahead: 0, behind: 0 };
+  return demoStatus();
 }

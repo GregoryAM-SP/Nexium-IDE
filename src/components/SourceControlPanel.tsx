@@ -44,6 +44,8 @@ type SourceControlPanelProps = {
   ) => Promise<string | null>;
   onPushTag: (name: string) => Promise<boolean>;
   onDeleteTag: (name: string) => Promise<boolean>;
+  /** Opens "Publish to GitHub"; offered when there is no remote yet. */
+  onPublish: () => void;
 };
 
 const iconButton =
@@ -277,6 +279,7 @@ export default function SourceControlPanel({
   onCreateTag,
   onPushTag,
   onDeleteTag,
+  onPublish,
 }: SourceControlPanelProps) {
   const [message, setMessage] = useState("");
   const [committing, setCommitting] = useState(false);
@@ -424,6 +427,17 @@ export default function SourceControlPanel({
             <code className="mt-1.5 block rounded-md border border-ink/[0.07] bg-app px-2 py-1.5 font-mono text-[10.5px] text-ink/50">
               git init
             </code>
+            <p className="mt-3 text-[10.5px] leading-relaxed text-ink/25">
+              Or create a repository on GitHub for it (a local one is started too):
+            </p>
+            <button
+              type="button"
+              onClick={onPublish}
+              className="mt-1.5 flex h-7 w-full items-center justify-center gap-1.5 rounded-md bg-ink text-[11px] font-medium text-app transition-colors duration-150 hover:bg-ink/90"
+            >
+              <CloudUpload className="size-3.5" strokeWidth={1.75} />
+              Publish to GitHub
+            </button>
           </div>
         </div>
       ) : (
@@ -436,6 +450,17 @@ export default function SourceControlPanel({
             <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink/55">
               {status?.branch || (busy ? "Reading repository…" : "no branch")}
             </span>
+            {status?.isRepo && status.hasRemote === false && (
+              <button
+                type="button"
+                onClick={onPublish}
+                title="Create a repository on GitHub and push this branch"
+                className="flex h-5 shrink-0 items-center gap-1 rounded border border-ink/[0.12] px-1.5 text-[10px] text-ink/60 transition-colors duration-150 hover:border-ink/30 hover:text-ink"
+              >
+                <CloudUpload className="size-3" strokeWidth={1.75} />
+                Publish
+              </button>
+            )}
             <span className="shrink-0 font-mono text-[9.5px] text-ink/25">
               {total === 0 ? "clean" : `${total} change${total === 1 ? "" : "s"}`}
             </span>

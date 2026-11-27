@@ -86,6 +86,24 @@ pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
         .map_err(|error| format!("The API key could not be saved: {error}"))
 }
 
+/// The GitHub token used to create repositories and to push and pull over
+/// HTTPS; stored beside the API keys.
+const GITHUB_ACCOUNT: &str = "github-token";
+
+pub fn github_token() -> Result<Option<String>, String> {
+    read(GITHUB_ACCOUNT)
+}
+
+pub fn set_github_token(token: &str) -> Result<(), String> {
+    entry(GITHUB_ACCOUNT)?
+        .set_password(token.trim())
+        .map_err(|error| format!("The GitHub token could not be saved: {error}"))
+}
+
+pub fn remove_github_token() -> Result<(), String> {
+    remove(GITHUB_ACCOUNT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

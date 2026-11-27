@@ -39,12 +39,57 @@ pub struct GitStatus {
     pub branch: String,
     pub changes: Vec<GitChange>,
     pub message: Option<String>,
+    /// The remote branch the current one tracks, e.g. `origin/main`.
+    pub upstream: Option<String>,
+    /// Commits on this branch that the upstream does not have yet (to push).
+    pub ahead: u32,
+    /// Commits on the upstream this branch does not have yet (to pull), as of
+    /// the last fetch.
+    pub behind: u32,
+    /// The repository has at least one remote.
+    pub has_remote: bool,
 }
 
+/// A local branch, or a remote one no local branch tracks yet.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranch {
+    /// `feature/login`, or `origin/feature/login` for a remote branch.
+    pub name: String,
+    pub current: bool,
+    pub remote: bool,
+    pub upstream: Option<String>,
+    /// The subject of its latest commit.
+    pub subject: String,
+    /// Its latest commit time, in seconds since 1970.
+    pub updated: i64,
+}
+
+/// Extra environment for one git command: GitHub credentials, as
+/// `GIT_CONFIG_*` variables, for commands that talk to the remote.
+pub type Auth = [(String, String)];
+
 fn execute(root: &Path, args: &[&str], allow_prompt: bool) -> Result<String, String> {
+    execute_with(root, args, allow_prompt, &[])
+}
+
+fn execute_with(
+    root: &Path,
+    args: &[&str],
+    allow_prompt: bool,
+    auth: &Auth,
+) -> Result<String, String> {
+    // Fetch, pull and push update the same remote-tracking refs; two at once
+    // (the background fetch and a click on Pull) fail with "cannot lock ref".
+    // They take turns.
+    static NETWORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = matches!(args.first(), Some(&"fetch" | &"pull" | &"push"))
+        .then(|| NETWORK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+
     let mut command = Command::new("git");
 
     command.arg("-C").arg(root).args(args);
+    command.envs(auth.iter().map(|(key, value)| (key.as_str(), value.as_str())));
 
     // The release build is a GUI-subsystem process with no console, so Windows
     // would open (and flash) a fresh console window for every git call.
@@ -142,6 +187,10 @@ pub fn status(root: &Path) -> Result<GitStatus, String> {
             branch: String::new(),
             changes: Vec::new(),
             message: Some("This folder is not a Git repository.".into()),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            has_remote: false,
         });
     }
 
@@ -159,12 +208,227 @@ pub fn status(root: &Path) -> Result<GitStatus, String> {
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
 
+    let (upstream, ahead, behind) = tracking(root);
+
     Ok(GitStatus {
         is_repo: true,
         branch,
         changes: parse_changes(&raw),
         message: None,
+        upstream,
+        ahead,
+        behind,
+        has_remote: has_remote(root),
     })
+}
+
+fn has_remote(root: &Path) -> bool {
+    run(root, &["remote"])
+        .map(|remotes| !remotes.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn upstream_of_head(root: &Path) -> Option<String> {
+    execute(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        false,
+    )
+    .ok()
+    .map(|name| name.trim().to_string())
+    .filter(|name| !name.is_empty())
+}
+
+/// The upstream and how far the branch is ahead of and behind it. Local only:
+/// "behind" is as fresh as the last fetch.
+fn tracking(root: &Path) -> (Option<String>, u32, u32) {
+    let Some(upstream) = upstream_of_head(root) else {
+        return (None, 0, 0);
+    };
+
+    let (ahead, behind) = run(root, &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        .ok()
+        .and_then(|counts| parse_counts(&counts))
+        .unwrap_or((0, 0));
+
+    (Some(upstream), ahead, behind)
+}
+
+fn parse_counts(raw: &str) -> Option<(u32, u32)> {
+    let mut parts = raw.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+/// Updates the remote-tracking branches, so "behind" counts are current.
+/// Quiet and non-interactive: a remote that needs a password just fails.
+pub fn fetch(root: &Path, auth: &Auth) -> Result<(), String> {
+    if !has_remote(root) {
+        return Ok(());
+    }
+
+    execute_with(root, &["fetch", "--prune", "--quiet"], false, auth).map(|_| ())
+}
+
+/// Brings in the upstream's new commits, fast-forward only: it never makes a
+/// merge commit or rewrites anything. If both sides have new commits, it
+/// stops and says so.
+pub fn pull(root: &Path, auth: &Auth) -> Result<(), String> {
+    let branch = run(root, &["branch", "--show-current"])?.trim().to_string();
+
+    if branch.is_empty() {
+        return Err("The repository is on a detached HEAD; check out a branch to pull.".into());
+    }
+
+    let Some(upstream) = upstream_of_head(root) else {
+        return Err(if has_remote(root) {
+            format!("\"{branch}\" is not on the remote yet, so there is nothing to pull. Push it first.")
+        } else {
+            "This repository has no remote to pull from.".to_string()
+        });
+    };
+
+    execute_with(root, &["pull", "--ff-only"], false, auth)
+        .map(|_| ())
+        .map_err(|error| {
+            let lower = error.to_lowercase();
+            if lower.contains("not possible to fast-forward") || lower.contains("diverg") {
+                format!(
+                    "\"{branch}\" and {upstream} both have new commits, so they cannot simply be fast-forwarded. Run `git pull --rebase` (or `git pull --no-rebase` to merge) in the terminal and resolve any conflicts there."
+                )
+            } else {
+                error
+            }
+        })
+}
+
+/// Pushes the current branch (setting `origin` as its upstream the first
+/// time). Never force-pushes.
+pub fn push(root: &Path, auth: &Auth) -> Result<(), String> {
+    sync(root, auth)
+}
+
+const BRANCH_FORMAT: &str = "%(refname)%1f%(refname:short)%1f%(HEAD)%1f%(upstream:short)%1f%(subject)%1f%(committerdate:unix)";
+
+fn parse_branches(raw: &str) -> Vec<GitBranch> {
+    let mut branches: Vec<GitBranch> = raw
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(FIELD).collect();
+
+            if fields.len() < 6 || fields[0].ends_with("/HEAD") {
+                return None;
+            }
+
+            let remote = fields[0].starts_with("refs/remotes/");
+            // `origin/HEAD` shortens to plain `origin`; it is not a branch.
+            if remote && !fields[1].contains('/') {
+                return None;
+            }
+
+            Some(GitBranch {
+                name: fields[1].to_string(),
+                current: fields[2].trim() == "*",
+                remote,
+                upstream: Some(fields[3].to_string()).filter(|name| !name.is_empty()),
+                subject: fields[4].to_string(),
+                updated: fields[5].trim().parse().unwrap_or(0),
+            })
+        })
+        .collect();
+
+    // A remote branch already tracked by a local one would only be listed twice.
+    let tracked: Vec<String> = branches
+        .iter()
+        .filter_map(|branch| branch.upstream.clone())
+        .collect();
+    branches.retain(|branch| !branch.remote || !tracked.contains(&branch.name));
+    branches
+}
+
+/// Local branches, then remote ones no local branch tracks; newest first.
+pub fn branches(root: &Path) -> Result<Vec<GitBranch>, String> {
+    let raw = run(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            &format!("--format={BRANCH_FORMAT}"),
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+
+    let mut list = parse_branches(&raw);
+    list.sort_by_key(|branch| branch.remote);
+    Ok(list)
+}
+
+fn check_branch_name(root: &Path, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Enter a branch name.".into());
+    }
+
+    if name.starts_with('-') || name.chars().any(char::is_whitespace) {
+        return Err("A branch name cannot start with \"-\" or contain spaces.".into());
+    }
+
+    run(root, &["check-ref-format", "--branch", name])
+        .map(|_| ())
+        .map_err(|_| format!("\"{name}\" is not a valid branch name."))
+}
+
+fn branch_exists(root: &Path, name: &str) -> bool {
+    run(root, &["rev-parse", "-q", "--verify", &format!("refs/heads/{name}")]).is_ok()
+}
+
+/// Creates a branch from the current commit and, when `checkout` is set,
+/// switches to it (uncommitted changes come along).
+pub fn create_branch(root: &Path, name: &str, checkout: bool) -> Result<(), String> {
+    let name = name.trim();
+    check_branch_name(root, name)?;
+
+    if branch_exists(root, name) {
+        return Err(format!("A branch named \"{name}\" already exists."));
+    }
+
+    if checkout {
+        run(root, &["switch", "-c", name]).map(|_| ())
+    } else {
+        if run(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_err() {
+            return Err("Make a first commit before creating a branch without switching to it.".into());
+        }
+        run(root, &["branch", name]).map(|_| ())
+    }
+}
+
+/// Switches to a branch. A remote branch (`origin/feature`) is checked out as
+/// a local branch that tracks it, or as the local branch of that name if one
+/// exists. Git refuses if uncommitted changes would be overwritten.
+pub fn switch_branch(root: &Path, name: &str, remote: bool) -> Result<(), String> {
+    let name = name.trim();
+
+    if name.is_empty() || name.starts_with('-') {
+        return Err("Choose a branch to switch to.".into());
+    }
+
+    if !remote {
+        if !branch_exists(root, name) {
+            return Err(format!("There is no branch named \"{name}\"."));
+        }
+        return run(root, &["switch", name]).map(|_| ());
+    }
+
+    let Some((_, local)) = name.split_once('/') else {
+        return Err(format!("\"{name}\" is not a remote branch."));
+    };
+
+    if branch_exists(root, local) {
+        return run(root, &["switch", local]).map(|_| ());
+    }
+
+    run(root, &["switch", "--track", name]).map(|_| ())
 }
 
 /// The identity git uses for commits, wherever it is configured.
@@ -362,7 +626,7 @@ pub fn create_tag(root: &Path, name: &str, message: &str) -> Result<(), String> 
 }
 
 /// Pushes one tag to `origin`. Only that tag moves; branches are untouched.
-pub fn push_tag(root: &Path, name: &str) -> Result<(), String> {
+pub fn push_tag(root: &Path, name: &str, auth: &Auth) -> Result<(), String> {
     let name = name.trim();
     check_tag_name(root, name)?;
 
@@ -377,7 +641,7 @@ pub fn push_tag(root: &Path, name: &str) -> Result<(), String> {
     }
 
     let refspec = format!("refs/tags/{name}:refs/tags/{name}");
-    execute(root, &["push", "origin", &refspec], false).map(|_| ())
+    execute_with(root, &["push", "origin", &refspec], false, auth).map(|_| ())
 }
 
 /// Deletes a tag from this repository only; a tag already pushed stays on
@@ -395,7 +659,7 @@ pub fn delete_tag(root: &Path, name: &str) -> Result<(), String> {
 
 /// Pushes the current branch to its upstream, or sets `origin` as the upstream
 /// when the branch has none yet. Nothing is pulled, merged or rebased.
-pub fn sync(root: &Path) -> Result<(), String> {
+pub fn sync(root: &Path, auth: &Auth) -> Result<(), String> {
     let branch = run(root, &["branch", "--show-current"])?.trim().to_string();
 
     if branch.is_empty() {
@@ -416,7 +680,7 @@ pub fn sync(root: &Path) -> Result<(), String> {
     .unwrap_or_default();
 
     if !upstream.is_empty() {
-        return execute(root, &["push"], false).map(|_| ());
+        return execute_with(root, &["push"], false, auth).map(|_| ());
     }
 
     let remotes = run(root, &["remote"])?;
@@ -425,12 +689,42 @@ pub fn sync(root: &Path) -> Result<(), String> {
         return Err("This repository has no origin remote to sync with.".into());
     }
 
-    execute(
+    execute_with(
         root,
         &["push", "--set-upstream", "origin", &branch],
         false,
+        auth,
     )
     .map(|_| ())
+}
+
+// ── publishing a repository ─────────────────────────────────────────────────
+
+pub fn is_repo(root: &Path) -> bool {
+    run(root, &["rev-parse", "--is-inside-work-tree"]).is_ok()
+}
+
+/// Starts a repository in the folder, on `main`.
+pub fn init(root: &Path) -> Result<(), String> {
+    run(root, &["init", "-q", "-b", "main"]).map(|_| ())
+}
+
+pub fn has_commits(root: &Path) -> bool {
+    run(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok()
+}
+
+pub fn remote_url(root: &Path, name: &str) -> Option<String> {
+    run(root, &["remote", "get-url", name])
+        .ok()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+}
+
+pub fn add_origin(root: &Path, url: &str) -> Result<(), String> {
+    if url.starts_with('-') {
+        return Err("That remote address is not valid.".into());
+    }
+    run(root, &["remote", "add", "origin", url]).map(|_| ())
 }
 
 #[cfg(test)]
@@ -509,12 +803,166 @@ mod tests {
         assert_eq!(light.subject, "First");
         assert_eq!(light.commit, annotated.commit);
 
-        assert!(push_tag(&dir, "v1.0.0").unwrap_err().contains("no origin"));
+        assert!(push_tag(&dir, "v1.0.0", &[]).unwrap_err().contains("no origin"));
 
         delete_tag(&dir, "v1.0.0").unwrap();
         assert!(tags(&dir).unwrap().iter().all(|tag| tag.name != "v1.0.0"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_branches_and_hides_tracked_remotes() {
+        let f = FIELD;
+        let raw = format!(
+            "refs/heads/main{f}main{f}*{f}origin/main{f}Fix it{f}200\n\
+             refs/heads/feature{f}feature{f} {f}{f}Start{f}100\n\
+             refs/remotes/origin/HEAD{f}origin{f} {f}{f}Fix it{f}200\n\
+             refs/remotes/origin/main{f}origin/main{f} {f}{f}Fix it{f}200\n\
+             refs/remotes/origin/docs{f}origin/docs{f} {f}{f}Docs{f}150\n"
+        );
+        let list = parse_branches(&raw);
+        let names: Vec<&str> = list.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "feature", "origin/docs"]);
+        assert!(list[0].current && !list[0].remote);
+        assert_eq!(list[0].upstream.as_deref(), Some("origin/main"));
+        assert!(list[2].remote);
+        assert_eq!(list[2].updated, 150);
+        assert_eq!(parse_counts("2\t5\n"), Some((2, 5)));
+        assert_eq!(parse_counts(""), None);
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexium-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn identify(dir: &Path) {
+        run(dir, &["config", "user.name", "Test"]).unwrap();
+        run(dir, &["config", "user.email", "test@example.com"]).unwrap();
+    }
+
+    #[test]
+    fn pulls_pushes_and_counts_against_a_real_remote() {
+        let base = scratch("remote");
+        let origin = base.join("origin.git");
+        let one = base.join("one");
+        let two = base.join("two");
+        std::fs::create_dir_all(&origin).unwrap();
+        run(&origin, &["init", "-q", "--bare", "-b", "main"]).unwrap();
+
+        // First clone: a commit on a new branch, pushed with --set-upstream.
+        std::fs::create_dir_all(&one).unwrap();
+        run(&one, &["init", "-q", "-b", "main"]).unwrap();
+        identify(&one);
+        run(&one, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
+        std::fs::write(one.join("a.txt"), "a").unwrap();
+        run(&one, &["add", "a.txt"]).unwrap();
+        run(&one, &["commit", "-q", "-m", "First"]).unwrap();
+        assert!(pull(&one, &[]).unwrap_err().contains("not on the remote yet"));
+        let before = status(&one).unwrap();
+        assert!(before.has_remote && before.upstream.is_none());
+        push(&one, &[]).unwrap();
+        let pushed = status(&one).unwrap();
+        assert_eq!(pushed.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((pushed.ahead, pushed.behind), (0, 0));
+
+        // A local commit is one ahead.
+        std::fs::write(one.join("b.txt"), "b").unwrap();
+        run(&one, &["add", "b.txt"]).unwrap();
+        run(&one, &["commit", "-q", "-m", "Second"]).unwrap();
+        assert_eq!(status(&one).unwrap().ahead, 1);
+        push(&one, &[]).unwrap();
+        assert_eq!(status(&one).unwrap().ahead, 0);
+
+        // Second clone pushes; the first sees it after a fetch, then pulls.
+        run(&base, &["clone", "-q", origin.to_str().unwrap(), "two"]).unwrap();
+        identify(&two);
+        std::fs::write(two.join("c.txt"), "c").unwrap();
+        run(&two, &["add", "c.txt"]).unwrap();
+        run(&two, &["commit", "-q", "-m", "From two"]).unwrap();
+        push(&two, &[]).unwrap();
+
+        assert_eq!(status(&one).unwrap().behind, 0, "not fetched yet");
+        fetch(&one, &[]).unwrap();
+        assert_eq!(status(&one).unwrap().behind, 1);
+        pull(&one, &[]).unwrap();
+        assert!(one.join("c.txt").exists());
+        assert_eq!(status(&one).unwrap().behind, 0);
+
+        // Both sides move on: the pull refuses instead of merging.
+        std::fs::write(two.join("d.txt"), "d").unwrap();
+        run(&two, &["add", "d.txt"]).unwrap();
+        run(&two, &["commit", "-q", "-m", "Two again"]).unwrap();
+        push(&two, &[]).unwrap();
+        std::fs::write(one.join("e.txt"), "e").unwrap();
+        run(&one, &["add", "e.txt"]).unwrap();
+        run(&one, &["commit", "-q", "-m", "One again"]).unwrap();
+        fetch(&one, &[]).unwrap();
+        let diverged = status(&one).unwrap();
+        assert_eq!((diverged.ahead, diverged.behind), (1, 1));
+        assert!(pull(&one, &[]).unwrap_err().contains("both have new commits"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn creates_and_switches_branches() {
+        let base = scratch("branches");
+        let origin = base.join("origin.git");
+        let work = base.join("work");
+        std::fs::create_dir_all(&origin).unwrap();
+        run(&origin, &["init", "-q", "--bare", "-b", "main"]).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        run(&work, &["init", "-q", "-b", "main"]).unwrap();
+        identify(&work);
+        run(&work, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
+
+        // Before the first commit a branch can only be created by switching.
+        assert!(create_branch(&work, "early", false).unwrap_err().contains("first commit"));
+
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        run(&work, &["add", "a.txt"]).unwrap();
+        run(&work, &["commit", "-q", "-m", "First"]).unwrap();
+        push(&work, &[]).unwrap();
+
+        create_branch(&work, "feature/login", true).unwrap();
+        assert_eq!(status(&work).unwrap().branch, "feature/login");
+        assert!(create_branch(&work, "feature/login", true).unwrap_err().contains("already exists"));
+        assert!(create_branch(&work, "bad name", true).is_err());
+        assert!(create_branch(&work, "-x", true).is_err());
+        assert!(create_branch(&work, "a..b", true).is_err());
+
+        create_branch(&work, "later", false).unwrap();
+        assert_eq!(status(&work).unwrap().branch, "feature/login", "created without switching");
+
+        // Uncommitted changes come along to a new branch.
+        std::fs::write(work.join("draft.txt"), "draft").unwrap();
+        switch_branch(&work, "main", false).unwrap();
+        assert_eq!(status(&work).unwrap().branch, "main");
+        assert!(work.join("draft.txt").exists());
+        assert!(switch_branch(&work, "nope", false).is_err());
+
+        // A branch only on the remote is checked out as a tracking branch.
+        run(&work, &["push", "-q", "origin", "main:refs/heads/docs"]).unwrap();
+        fetch(&work, &[]).unwrap();
+        let listed = branches(&work).unwrap();
+        assert!(listed.iter().any(|b| b.name == "origin/docs" && b.remote));
+        assert!(!listed.iter().any(|b| b.name == "origin/main"), "tracked by main");
+        assert!(listed.iter().any(|b| b.name == "main" && b.current));
+        switch_branch(&work, "origin/docs", true).unwrap();
+        let now = status(&work).unwrap();
+        assert_eq!(now.branch, "docs");
+        assert_eq!(now.upstream.as_deref(), Some("origin/docs"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

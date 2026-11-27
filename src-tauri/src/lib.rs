@@ -1,6 +1,7 @@
 mod agent;
 mod command;
 mod git;
+mod github;
 mod gradle;
 mod gradle_settings;
 mod llm;
@@ -186,6 +187,188 @@ async fn git_status(state: State<'_, AppState>) -> Result<git::GitStatus, String
 }
 
 #[tauri::command]
+async fn git_fetch(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
+    with_root(&state, |root| {
+        git::fetch(root, &github::auth_for(root))?;
+        git::status(root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_pull(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
+    with_root(&state, |root| {
+        git::pull(root, &github::auth_for(root))?;
+        git::status(root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_push(state: State<'_, AppState>) -> Result<git::GitStatus, String> {
+    with_root(&state, |root| {
+        git::push(root, &github::auth_for(root))?;
+        git::status(root)
+    })
+    .await
+}
+
+// ── GitHub ──────────────────────────────────────────────────────────────────
+
+/// The signed-in GitHub account, or None when there is no saved token and
+/// the GitHub CLI is not signed in.
+#[tauri::command]
+async fn github_account() -> Result<Option<github::Account>, String> {
+    let Some(credentials) = blocking(|| Ok(github::credentials())).await? else {
+        return Ok(None);
+    };
+    github::account(github::API, &credentials.token, credentials.source)
+        .await
+        .map(Some)
+}
+
+/// Checks a token with GitHub, then saves it in the credential store.
+#[tauri::command]
+async fn github_sign_in(token: String) -> Result<github::Account, String> {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("Paste a GitHub token first.".into());
+    }
+    let account = github::account(github::API, &token, "token").await?;
+    blocking(move || secrets::set_github_token(&token)).await?;
+    Ok(account)
+}
+
+/// Forgets the saved token (a GitHub CLI login is left alone).
+#[tauri::command]
+async fn github_sign_out() -> Result<(), String> {
+    blocking(secrets::remove_github_token).await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishResult {
+    repo: github::CreatedRepo,
+    /// The current branch was pushed; false when there was nothing to push
+    /// yet (no commits) or the push failed (see `push_error`).
+    pushed: bool,
+    push_error: Option<String>,
+    status: git::GitStatus,
+}
+
+#[tauri::command]
+async fn github_open(url: String) -> Result<(), String> {
+    blocking(move || github::open_page(&url)).await
+}
+
+/// A name for the new repository, from the folder's name.
+#[tauri::command]
+fn github_suggest_name(state: State<'_, AppState>) -> String {
+    let folder = project_key(&state);
+    let name = std::path::Path::new(&folder)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    github::suggest_repo_name(&name)
+}
+
+/// Creates the repository on GitHub, makes it the folder's `origin`
+/// (starting a git repository first if needed) and pushes the current branch.
+#[tauri::command]
+async fn github_publish(
+    state: State<'_, AppState>,
+    owner: String,
+    name: String,
+    description: String,
+    private: bool,
+) -> Result<PublishResult, String> {
+    let root = current_root(&state)?;
+    let name = name.trim().to_string();
+    github::check_repo_name(&name)?;
+
+    let credentials = blocking(|| Ok(github::credentials()))
+        .await?
+        .ok_or("Sign in to GitHub first: add a token in Settings → Source control, or run `gh auth login`.")?;
+
+    let check = root.clone();
+    blocking(move || {
+        if git::is_repo(&check) {
+            if let Some(url) = git::remote_url(&check, "origin") {
+                return Err(format!("This repository already has an origin remote ({url}). Push to it instead."));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let account = github::account(github::API, &credentials.token, credentials.source).await?;
+    let repo = github::create_repo(
+        github::API,
+        &credentials.token,
+        &account.login,
+        owner.trim(),
+        &name,
+        &description,
+        private,
+    )
+    .await?;
+
+    let clone_url = repo.clone_url.clone();
+    let token = credentials.token.clone();
+    let (pushed, push_error, status) = blocking(move || {
+        if !git::is_repo(&root) {
+            git::init(&root)?;
+        }
+        git::add_origin(&root, &clone_url)?;
+
+        let (pushed, push_error) = if git::has_commits(&root) {
+            match git::push(&root, &github::git_env(&token)) {
+                Ok(()) => (true, None),
+                Err(error) => (false, Some(error)),
+            }
+        } else {
+            (false, None)
+        };
+
+        Ok((pushed, push_error, git::status(&root)?))
+    })
+    .await?;
+
+    Ok(PublishResult { repo, pushed, push_error, status })
+}
+
+#[tauri::command]
+async fn git_branches(state: State<'_, AppState>) -> Result<Vec<git::GitBranch>, String> {
+    with_root(&state, |root| git::branches(root)).await
+}
+
+#[tauri::command]
+async fn git_create_branch(
+    state: State<'_, AppState>,
+    name: String,
+    checkout: bool,
+) -> Result<git::GitStatus, String> {
+    with_root(&state, move |root| {
+        git::create_branch(root, &name, checkout)?;
+        git::status(root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_switch_branch(
+    state: State<'_, AppState>,
+    name: String,
+    remote: bool,
+) -> Result<git::GitStatus, String> {
+    with_root(&state, move |root| {
+        git::switch_branch(root, &name, remote)?;
+        git::status(root)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn git_file_diff(
     state: State<'_, AppState>,
     path: String,
@@ -257,7 +440,7 @@ async fn git_create_tag(
         git::create_tag(root, &name, &message)?;
 
         if push {
-            git::push_tag(root, name.trim()).map_err(|error| {
+            git::push_tag(root, name.trim(), &github::auth_for(root)).map_err(|error| {
                 format!("Created {}, but pushing it failed: {error}", name.trim())
             })?;
         }
@@ -273,7 +456,7 @@ async fn git_push_tag(
     name: String,
 ) -> Result<Vec<git::GitTag>, String> {
     with_root(&state, move |root| {
-        git::push_tag(root, &name)?;
+        git::push_tag(root, &name, &github::auth_for(root))?;
         git::tags(root)
     })
     .await
@@ -298,7 +481,7 @@ async fn git_commit_and_sync(
 ) -> Result<git::GitStatus, String> {
     with_root(&state, move |root| {
         git::commit(root, &message)?;
-        git::sync(root)
+        git::sync(root, &github::auth_for(root))
             .map_err(|error| format!("Committed, but the sync failed: {error}"))?;
         git::status(root)
     })
@@ -808,6 +991,18 @@ pub fn run() {
             git_unstage_all,
             git_commit,
             git_commit_and_sync,
+            git_fetch,
+            git_pull,
+            git_push,
+            git_branches,
+            git_create_branch,
+            git_switch_branch,
+            github_account,
+            github_sign_in,
+            github_sign_out,
+            github_suggest_name,
+            github_open,
+            github_publish,
             git_tags,
             git_create_tag,
             git_push_tag,

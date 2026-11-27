@@ -1,4 +1,4 @@
-import { Check, CloudUpload, LoaderCircle } from "lucide-react";
+import { Check, CloudUpload, ExternalLink, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import {
@@ -11,7 +11,150 @@ import {
   setCreditsNexium,
 } from "../lib/git";
 import type { CommitAction, GitIdentity } from "../lib/git";
+import {
+  TOKEN_PAGE,
+  openOnGitHub,
+  readGitHubAccount,
+  signInToGitHub,
+  signOutOfGitHub,
+} from "../lib/github";
+import type { GitHubAccount } from "../lib/github";
 import { toError } from "../lib/tauriBridge";
+
+/**
+ * The GitHub sign-in used to create repositories and to push and pull over
+ * HTTPS: a token kept in the OS credential store, or the GitHub CLI's login.
+ */
+function GitHubSection() {
+  const [account, setAccount] = useState<GitHubAccount | null | undefined>(undefined);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = () => {
+    setError(null);
+    void readGitHubAccount()
+      .then(setAccount)
+      .catch((cause) => {
+        setAccount(null);
+        setError(toError(cause, "GitHub could not be reached.").message);
+      });
+  };
+
+  useEffect(load, []);
+
+  const signIn = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setAccount(await signInToGitHub(token));
+      setToken("");
+    } catch (cause) {
+      setError(toError(cause, "The token could not be checked.").message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    setBusy(true);
+    try {
+      await signOutOfGitHub();
+      load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="mt-4 rounded-2xl border border-line bg-ink/[0.015] p-6">
+      <h2 className="text-[12.5px] font-semibold text-ink/80">GitHub</h2>
+      <p className="mt-1 max-w-[56ch] text-[10.5px] leading-relaxed text-ink/30">
+        Used to create repositories (Publish to GitHub) and to push, pull and
+        fetch github.com remotes over HTTPS. A token is kept in your system's
+        credential store and only ever sent to github.com. Without one, the
+        GitHub CLI's login (<code className="font-mono text-ink/45">gh auth login</code>) is used.
+      </p>
+
+      {account === undefined ? (
+        <p className="mt-4 flex items-center gap-2 text-[11px] text-ink/40">
+          <LoaderCircle className="size-3 animate-spin" />
+          Checking…
+        </p>
+      ) : account ? (
+        <div className="mt-4 flex items-center gap-3 rounded-xl border border-ink/[0.08] bg-app px-3 py-2.5">
+          {account.avatarUrl && (
+            <img src={account.avatarUrl} alt="" className="size-7 rounded-full" referrerPolicy="no-referrer" />
+          )}
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[12px] text-ink/85">
+              {account.name ? `${account.name} · ` : ""}@{account.login}
+            </p>
+            <p className="text-[10.5px] text-ink/35">
+              {account.source === "cli" ? "Signed in through the GitHub CLI" : "Signed in with a token"}
+              {account.owners.length > 1 ? ` · can publish to ${account.owners.length - 1} organisation${account.owners.length === 2 ? "" : "s"}` : ""}
+            </p>
+          </div>
+          {account.source === "token" && (
+            <button
+              type="button"
+              onClick={() => void signOut()}
+              disabled={busy}
+              className="h-7 rounded-md border border-ink/[0.12] px-2.5 text-[11px] text-ink/60 transition-colors duration-150 hover:border-ink/30 hover:text-ink disabled:opacity-40"
+            >
+              Sign out
+            </button>
+          )}
+        </div>
+      ) : null}
+
+      {account?.source !== "token" && account !== undefined && (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void signIn();
+          }}
+          className="mt-4"
+        >
+          <label className="block">
+            <span className="text-[10.5px] text-ink/45">
+              {account ? "Or use a token instead" : "Personal access token"}
+            </span>
+            <span className="mt-1.5 flex gap-2">
+              <input
+                type="password"
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+                placeholder="ghp_…"
+                autoComplete="off"
+                spellCheck={false}
+                className="h-8 min-w-0 flex-1 rounded-md border border-ink/[0.12] bg-app px-2 font-mono text-[12px] text-ink outline-none focus:border-ink/35"
+              />
+              <button
+                type="submit"
+                disabled={busy || !token.trim()}
+                className="flex h-8 items-center gap-1.5 rounded-md bg-ink px-3 text-[11px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/[0.08] disabled:text-ink/30"
+              >
+                {busy && <LoaderCircle className="size-3 animate-spin" />}
+                Sign in
+              </button>
+            </span>
+          </label>
+          <button
+            type="button"
+            onClick={() => void openOnGitHub(TOKEN_PAGE)}
+            className="mt-2 flex items-center gap-1 text-[10.5px] text-ink/45 underline decoration-ink/20 underline-offset-2 transition-colors duration-150 hover:text-ink"
+          >
+            Create a token on GitHub (classic, with the repo and read:org scopes)
+            <ExternalLink className="size-2.5" strokeWidth={2} />
+          </button>
+        </form>
+      )}
+
+      {error && <p role="alert" className="mt-3 text-[11px] leading-relaxed text-ink/70">{error}</p>}
+    </section>
+  );
+}
 
 export default function SourceControlSettings() {
   const [identity, setIdentity] = useState<GitIdentity | null>(null);
@@ -245,6 +388,8 @@ export default function SourceControlSettings() {
             />
           </label>
         </section>
+
+        <GitHubSection />
       </div>
     </div>
   );
