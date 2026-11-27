@@ -75,8 +75,9 @@ export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss(), lucideAmbientTypes()],
   server: {
     host: "127.0.0.1",
-    // tauri.conf.json points the window at this exact port, so Vite must fail
-    // loudly instead of drifting to 5174 when something already uses it.
+    // The browser-only `npm run dev` uses 5173. `npm run desktop` passes a
+    // free port the OS picked (scripts/desktop-dev.mjs) and points the window
+    // at it, so Vite must fail loudly rather than drift to a different port.
     port: 5173,
     strictPort: true,
     proxy: nimProxy,

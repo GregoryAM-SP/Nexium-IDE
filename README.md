@@ -1,4 +1,8 @@
-# Nexium Studio
+<p align="center">
+  <img src="public/nexium.svg" width="112" height="112" alt="Nexium Studio icon">
+</p>
+
+<h1 align="center">Nexium Studio</h1>
 
 A local desktop code editor built with **Tauri 2 + Rust** on the outside and **React 19 + TypeScript + Monaco** on the inside. It opens a folder from your disk, edits real files through a Monaco editor, and ships an AI assistant that runs on **any OpenAI-compatible provider** — NVIDIA NIM, Groq, Gemini, OpenRouter, Mistral, a local Ollama and about ninety more presets — the assistant reads, searches and writes the files in the folder you have open, streaming its answer token by token while it works.
 
@@ -99,7 +103,7 @@ The interface is built from three values per theme — a page colour, an ink and
 # 1. install the frontend dependencies (the repo ships a bun.lock; npm works too)
 bun install        # or: npm install
 
-# 2. run the app (Vite on 127.0.0.1:5173 + the Tauri window)
+# 2. run the app (Vite on a free random port + the Tauri window)
 npm run desktop
 ```
 
@@ -134,14 +138,14 @@ Keys are stored in Windows Credential Manager (service `com.nexium.studio`, one 
 | Command | What it does |
 | --- | --- |
 | `npm run dev` | Vite dev server only, at <http://127.0.0.1:5173>. Runs the UI in the browser against a demo workspace (see [Browser-only development](#browser-only-development)). |
-| `npm run desktop` | `tauri dev` — starts Vite, compiles the Rust crate and opens the real window. |
-| `npm run dev:desktop` | The Vite half of `tauri dev`, run in `desktop` mode: same proxy and port, **no HMR** — the shell can edit this project without a saved file reloading the window. |
+| `npm run desktop` | `scripts/desktop-dev.mjs` → `tauri dev`: asks the OS for a free port, starts Vite on it, compiles the Rust crate and opens the real window pointed at that port. Extra arguments go to `tauri dev`. |
+| `npm run dev:desktop` | The Vite half of `tauri dev`, run in `desktop` mode: same proxy, **no HMR** — the shell can edit this project without a saved file reloading the window. |
 | `npm run build` | `tsc --noEmit && vite build` — type-checks the whole frontend and writes `dist/`. |
 | `npm run desktop:build` | `tauri build` — release build, installers under `src-tauri/target/release/bundle/`. |
 | `npm run preview` | Serves the built `dist/` (still using the `/nim` proxy). |
 | `npm run tauri -- <args>` | Escape hatch to any Tauri CLI command. |
 
-The window is pinned to port 5173 (`strictPort: true`) because `tauri.conf.json` points its `devUrl` there — a second `npm run desktop` will fail with *"Port 5173 is already in use"* instead of quietly moving to another port.
+`npm run desktop` runs Vite on a port the operating system picks at random each time (`scripts/desktop-dev.mjs`) and points the window at it through a `tauri dev --config` override, so two dev windows, or another project on 5173, never collide; `tauri.conf.json` keeps 5173 only as the fallback for a plain `tauri dev`. Vite still uses `strictPort`, so it fails loudly instead of drifting away from the port the window expects. Release builds open no port at all.
 
 ---
 
@@ -252,7 +256,7 @@ Design decisions worth knowing before changing things:
 Nexium-IDE/
 ├── index.html                  # Vite entry
 ├── package.json                # scripts + frontend deps
-├── vite.config.ts              # 127.0.0.1:5173 (strict), /nim proxy, Monaco helpers
+├── vite.config.ts              # 127.0.0.1 (strict port), /nim proxy, Monaco helpers
 ├── tsconfig.json               # strict, noUnused*, isolatedModules
 ├── public/fonts/               # bundled Inter + JetBrains Mono (woff2)
 ├── src/
@@ -413,8 +417,8 @@ The frontend has no unit-test suite; `npm run build` runs the strict TypeScript 
 
 ## Troubleshooting
 
-**"Port 5173 is already in use."**
-Another `npm run desktop` (or a stray `vite`) is still running. Close the app window and stop the old process, then run again. The port is pinned on purpose so the Tauri window never points at a dead URL.
+**"Port … is already in use."**
+`npm run desktop` picks a free port at random on every run, so this should not happen; if something grabbed that port in the instant between it being picked and Vite starting, just run it again. `npm run dev` (browser only) still uses 5173 — close the other `vite` using it. The installed app never opens a port: release builds load their pages through Tauri's `tauri://` scheme.
 
 **The window is blank / white.**
 WebView2 is missing or broken. Install the Microsoft Edge WebView2 Evergreen runtime and relaunch.
