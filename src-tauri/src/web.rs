@@ -575,6 +575,11 @@ struct DevServer {
     dir: String,
     script: String,
     url: Option<String>,
+    expects_preview: bool,
+    /// A web page that refuses to be shown in a frame.
+    blocked_url: Option<String>,
+    /// Addresses already being checked, so each is checked once.
+    offered: Vec<String>,
 }
 
 struct LiveServer {
@@ -596,6 +601,11 @@ pub struct DevStatus {
     pub dir: String,
     pub script: String,
     pub url: Option<String>,
+    /// The command is known to start a web server. False for a custom
+    /// command that runs something else, which may never have a preview.
+    pub expects_preview: bool,
+    /// The server's page, which does not allow being shown in a frame.
+    pub blocked_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -614,6 +624,8 @@ pub fn status(state: &WebState) -> WebStatus {
             dir: server.dir.clone(),
             script: server.script.clone(),
             url: server.url.clone(),
+            expects_preview: server.expects_preview,
+            blocked_url: server.blocked_url.clone(),
         })
     });
     let live = state
@@ -879,7 +891,19 @@ fn log(app: &impl Events, logs: &Mutex<VecDeque<String>>, line: String) {
     app.send("web:log", LogEvent { line });
 }
 
-/// Starts a package.json `script` in `dir`, or the user's own `command` line
+/// The message for a package manager that is not installed, naming npm as
+/// the way that always works.
+fn missing_manager(name: &str, script: Option<&str>) -> String {
+    let instead = match script {
+        Some(script) if name != "npm" => format!(" Choose \"npm run {script}\" instead, or install {name}."),
+        _ if name != "npm" => format!(" Use npm instead, or install {name}."),
+        _ => " Install Node.js, which includes npm, and restart Nexium Studio.".into(),
+    };
+    format!("{name} is not installed, or not on your PATH.{instead}")
+}
+
+/// Starts a package.json `script` in `dir` with the project's package manager
+/// (or `manager`, when the user picked one), or the user's own `command` line
 /// when one is given, and follows its output for the address to preview.
 pub fn start_dev(
     app: &impl Events,
@@ -888,9 +912,16 @@ pub fn start_dev(
     dir: &str,
     script: &str,
     command: Option<&str>,
+    manager_choice: Option<&str>,
 ) -> Result<DevStatus, String> {
     let folder = safe_join(root, dir)?;
     let custom = command.map(str::trim).filter(|line| !line.is_empty());
+
+    if let Some(choice) = manager_choice {
+        if !["npm", "pnpm", "yarn", "bun"].contains(&choice) {
+            return Err(format!("{choice} is not a package manager."));
+        }
+    }
 
     if !folder.is_dir() {
         return Err("That folder no longer exists.".into());
@@ -900,12 +931,25 @@ pub fn start_dev(
     let mut port;
     let tool;
     let label;
+    let expects_preview;
 
     if let Some(line) = custom {
+        // A line that starts with a package manager names one to check for.
+        let program = line.split_whitespace().next().unwrap_or_default();
+        let owner = match program {
+            "npx" => Some("npm"),
+            "bunx" => Some("bun"),
+            "npm" | "pnpm" | "yarn" | "bun" => Some(program),
+            _ => None,
+        };
+        if let Some(owner) = owner.filter(|owner| locate_manager(owner).is_none()) {
+            return Err(missing_manager(owner, None));
+        }
         manager = String::new();
         port = expected_port(&folder, line);
         tool = None;
         label = line.to_string();
+        expects_preview = port.is_some();
     } else {
         let info = read_app(root, &folder).ok_or("That folder has no package.json with a dev server script.")?;
         let source = fs::read_to_string(folder.join("package.json")).unwrap_or_default();
@@ -917,10 +961,14 @@ pub fn start_dev(
             .ok_or_else(|| format!("package.json has no \"{script}\" script."))?
             .to_string();
 
-        manager = info.package_manager;
+        manager = manager_choice.map(str::to_string).unwrap_or(info.package_manager);
+        if locate_manager(&manager).is_none() {
+            return Err(missing_manager(&manager, Some(script)));
+        }
         port = expected_port(&folder, &script_command);
         tool = server_tool(&script_command).map(|(tool, _)| tool);
         label = script.to_string();
+        expects_preview = true;
 
         // A port fixed on the command line is the user's choice to keep.
         if port_flag(&script_command).is_some() {
@@ -1022,6 +1070,9 @@ pub fn start_dev(
             dir: dir.to_string(),
             script: label.clone(),
             url: None,
+            expects_preview,
+            blocked_url: None,
+            offered: Vec::new(),
         });
     }
 
@@ -1051,8 +1102,15 @@ pub fn start_dev(
                 let Ok(line) = line else { break };
                 let line = strip_ansi(&line);
 
+                // The shell's own words for a missing program are easy to miss.
+                if line.contains("is not recognized as an internal or external command") || line.ends_with(": command not found") || line.ends_with(": not found") {
+                    log(&app, &logs, line);
+                    log(&app, &logs, "[a program this command runs is not installed or not on your PATH]".into());
+                    continue;
+                }
+
                 if let Some(url) = local_url(&line) {
-                    set_url(&app, &dev, pid, url);
+                    offer_url(&app, &dev, &logs, pid, url);
                 }
 
                 log(&app, &logs, line);
@@ -1086,6 +1144,7 @@ pub fn start_dev(
     if let Some(port) = port {
         let app = app.clone();
         let dev = state.dev.clone();
+        let logs = state.logs.clone();
 
         std::thread::spawn(move || {
             let waiting = || {
@@ -1105,7 +1164,7 @@ pub fn start_dev(
                     // Give the server a moment to print its own address.
                     std::thread::sleep(Duration::from_millis(1500));
                     if let Some(url) = port_url(port).filter(|_| waiting()) {
-                        set_url(&app, &dev, pid, url);
+                        offer_url(&app, &dev, &logs, pid, url);
                     }
                     return;
                 }
@@ -1118,7 +1177,198 @@ pub fn start_dev(
         dir: dir.to_string(),
         script: label,
         url: None,
+        expects_preview,
+        blocked_url: None,
     })
+}
+
+/// What a local address answered with.
+#[derive(Debug, PartialEq)]
+enum Probe {
+    /// An HTML page (or a redirect to one) the preview can show.
+    Page,
+    /// A page that forbids frames, which would show as a blank preview.
+    Unframeable,
+    /// Something else: an API, a websocket endpoint, an error status.
+    NotPage(String),
+    /// Nothing listens yet, or it did not answer in time.
+    NoAnswer,
+}
+
+/// Loads `url` the way the preview frame would and says whether a web page
+/// came back. Plain HTTP only; an https address is taken on trust.
+fn probe(url: &str) -> Probe {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Probe::Page;
+    };
+    let (host, path) = match rest.find('/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, "/"),
+    };
+    let port: u16 = host
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(80);
+    let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    let addresses: Vec<std::net::SocketAddr> = match name {
+        "127.0.0.1" => vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))],
+        "[::1]" => vec![std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port))],
+        // `localhost` may be served on either loopback address.
+        _ => vec![
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+        ],
+    };
+    let timeout = Duration::from_millis(800);
+    let Some(mut stream) = addresses
+        .iter()
+        .find_map(|address| TcpStream::connect_timeout(address, timeout).ok())
+    else {
+        return Probe::NoAnswer;
+    };
+
+    // The first request to a framework dev server may compile the page first.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: text/html,*/*\r\nUser-Agent: Nexium-Studio-Preview\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Probe::NoAnswer;
+    }
+
+    let mut head = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < 32 * 1024 {
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => head.extend_from_slice(&buffer[..count]),
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+
+    page_kind(&String::from_utf8_lossy(&head))
+}
+
+/// Reads an HTTP response head: is it a page a frame can show?
+fn page_kind(head: &str) -> Probe {
+    let mut lines = head.split("\r\n");
+    let Some(status) = lines
+        .next()
+        .filter(|line| line.starts_with("HTTP/"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        return if head.is_empty() {
+            Probe::NoAnswer
+        } else {
+            Probe::NotPage("an answer that is not HTTP".into())
+        };
+    };
+
+    let headers: Vec<(String, String)> = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_ascii_lowercase()))
+        .collect();
+    let header = |name: &str| headers.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+
+    let redirect = (300..400).contains(&status) && header("location").is_some();
+    let html = header("content-type").is_some_and(|kind| kind.contains("html"));
+
+    if !redirect && !((200..300).contains(&status) && html) {
+        let what = match header("content-type") {
+            Some(kind) => format!("status {status} ({})", kind.split(';').next().unwrap_or(kind)),
+            None => format!("status {status}"),
+        };
+        return Probe::NotPage(what);
+    }
+
+    let frame_option = header("x-frame-options")
+        .is_some_and(|value| value.contains("deny") || value.contains("sameorigin"));
+    let frame_policy = header("content-security-policy").is_some_and(|policy| {
+        policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("frame-ancestors"))
+            .is_some_and(|sources| !sources.split_whitespace().any(|source| source == "*"))
+    });
+
+    if frame_option || frame_policy {
+        Probe::Unframeable
+    } else {
+        Probe::Page
+    }
+}
+
+/// Checks an address the server printed (or its port) in the background, and
+/// shows it only once it serves a web page. Addresses that never do, such as
+/// an API or a websocket port, are noted in the log and left out.
+fn offer_url(
+    app: &impl Events,
+    dev: &Arc<Mutex<Option<DevServer>>>,
+    logs: &Arc<Mutex<VecDeque<String>>>,
+    pid: Option<u32>,
+    url: String,
+) {
+    {
+        let Ok(mut guard) = dev.lock() else { return };
+        let Some(server) = guard.as_mut().filter(|server| Some(server.child.id()) == pid) else {
+            return;
+        };
+        if server.url.is_some() || server.offered.contains(&url) {
+            return;
+        }
+        server.offered.push(url.clone());
+    }
+
+    let app = app.clone();
+    let dev = dev.clone();
+    let logs = logs.clone();
+
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut last = Probe::NoAnswer;
+
+        while std::time::Instant::now() < deadline {
+            let waiting = dev.lock().ok().is_some_and(|guard| {
+                guard
+                    .as_ref()
+                    .is_some_and(|server| Some(server.child.id()) == pid && server.url.is_none())
+            });
+            if !waiting {
+                return;
+            }
+
+            match probe(&url) {
+                Probe::Page => {
+                    set_url(&app, &dev, pid, url);
+                    return;
+                }
+                Probe::Unframeable => {
+                    set_blocked(&app, &dev, pid, url);
+                    return;
+                }
+                other => last = other,
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        if let Probe::NotPage(what) = last {
+            log(&app, &logs, format!("[{url} answered with {what}, not a web page, so it is not previewed]"));
+        }
+    });
+}
+
+/// Records a page that cannot be shown in the panel, for "Open in browser".
+fn set_blocked(app: &impl Events, dev: &Mutex<Option<DevServer>>, pid: Option<u32>, url: String) {
+    if let Ok(mut guard) = dev.lock() {
+        if let Some(server) = guard.as_mut().filter(|server| Some(server.child.id()) == pid) {
+            if server.url.is_none() && server.blocked_url.is_none() {
+                server.blocked_url = Some(url.clone());
+                app.send("web:blocked", url);
+            }
+        }
+    }
 }
 
 /// Records the address to preview, the first one found for this server.
@@ -1598,6 +1848,61 @@ mod tests {
     }
 
     #[test]
+    fn previews_only_web_pages() {
+        let page = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n";
+        assert_eq!(page_kind(page), Probe::Page);
+        assert_eq!(page_kind("HTTP/1.1 302 Found\r\nLocation: /app\r\n\r\n"), Probe::Page);
+        assert_eq!(
+            page_kind("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"),
+            Probe::NotPage("status 200 (application/json)".into())
+        );
+        assert_eq!(page_kind("HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"), Probe::NotPage("status 404 (text/html)".into()));
+        assert_eq!(page_kind("HTTP/1.1 426 Upgrade Required\r\n\r\n"), Probe::NotPage("status 426".into()));
+        assert_eq!(page_kind(""), Probe::NoAnswer);
+        assert_eq!(page_kind("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Frame-Options: DENY\r\n\r\n"), Probe::Unframeable);
+        assert_eq!(
+            page_kind("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Security-Policy: default-src 'self'; frame-ancestors 'self'\r\n\r\n"),
+            Probe::Unframeable
+        );
+        assert_eq!(
+            page_kind("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Security-Policy: frame-ancestors *\r\n\r\n"),
+            Probe::Page
+        );
+
+        // A real socket: an API answering JSON is not previewed, a page is.
+        let serve = |body_type: &'static str| {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {body_type}\r\nContent-Length: 2\r\n\r\nok");
+                }
+            });
+            format!("http://localhost:{port}/")
+        };
+        assert_eq!(probe(&serve("text/html")), Probe::Page);
+        assert!(matches!(probe(&serve("application/json")), Probe::NotPage(_)));
+        let closed = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        assert_eq!(probe(&format!("http://127.0.0.1:{closed}/")), Probe::NoAnswer);
+    }
+
+    #[test]
+    fn custom_commands_that_are_not_servers_expect_no_preview() {
+        let root = std::env::temp_dir().join(format!("nexium-custom-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let state = WebState::default();
+
+        let started = start_dev(&Recorder::default(), &state, &root, "", "", Some("echo hello"), None).unwrap();
+        assert!(!started.expects_preview);
+        stop_dev(&state);
+
+        assert!(expected_port(&root, "npx vite --host").is_some(), "a known server expects a preview");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn moves_servers_off_a_taken_port() {
         assert_eq!(port_flag("vite --port 4000"), Some(4000));
         assert_eq!(port_flag("next dev -p=3000"), None);
@@ -1607,6 +1912,8 @@ mod tests {
         assert_eq!(script_args("npm", "dev", &["--port".into(), "5174".into()]), vec!["run", "dev", "--", "--port", "5174"]);
         assert_eq!(script_args("bun", "dev", &["--port".into(), "5174".into()]), vec!["run", "dev", "--port", "5174"]);
         assert_eq!(script_args("yarn", "dev", &[]), vec!["dev"]);
+        assert!(missing_manager("bun", Some("dev")).contains("\"npm run dev\""));
+        assert!(start_dev(&Recorder::default(), &WebState::default(), Path::new("."), "", "dev", None, Some("calc")).is_err());
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1646,7 +1953,7 @@ mod tests {
         fs::write(
             root.join("server.js"),
             format!(
-                "const http=require('http');http.createServer((q,s)=>s.end('ok')).listen({port},()=>console.log('\x1b[32m  Local:\x1b[0m   http://localhost:{port}/'));"
+                "const http=require('http');http.createServer((q,s)=>{{s.setHeader('Content-Type','text/html');s.end('<p>ok</p>')}}).listen({port},()=>console.log('\x1b[32m  Local:\x1b[0m   http://localhost:{port}/'));"
             ),
         )
         .unwrap();
@@ -1658,7 +1965,7 @@ mod tests {
 
         let events = Recorder::default();
         let state = WebState::default();
-        start_dev(&events, &state, &root, "", "dev", None).unwrap();
+        start_dev(&events, &state, &root, "", "dev", None, None).unwrap();
 
         let mut url = None;
         for _ in 0..100 {
@@ -1700,7 +2007,7 @@ mod tests {
 
         let events = Recorder::default();
         let state = WebState::default();
-        start_dev(&events, &state, &root, "", "dev", None).unwrap();
+        start_dev(&events, &state, &root, "", "dev", None, None).unwrap();
 
         let mut url = None;
         for _ in 0..300 {

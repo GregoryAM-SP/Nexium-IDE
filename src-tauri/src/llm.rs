@@ -254,7 +254,7 @@ async fn failure(name: &str, response: reqwest::Response) -> String {
 
 /// The provider's model catalogue (`GET /models`).
 #[tauri::command]
-pub async fn ai_models(endpoint: Endpoint) -> Result<Vec<String>, String> {
+pub async fn ai_models(endpoint: Endpoint) -> Result<Vec<ModelInfo>, String> {
     endpoint.validate()?;
     let client = client()?;
 
@@ -285,25 +285,68 @@ pub async fn ai_models(endpoint: Endpoint) -> Result<Vec<String>, String> {
         .cloned()
         .unwrap_or_default();
 
-    let mut ids: Vec<String> = items
-        .iter()
-        .filter_map(|item| {
-            item.get("id")
-                .or_else(|| item.get("name"))
-                .and_then(Value::as_str)
-                .or_else(|| item.as_str())
-        })
-        .map(|id| id.trim_start_matches("models/").to_string())
-        .collect();
+    let mut models: Vec<ModelInfo> = items.iter().filter_map(model_info).collect();
 
-    ids.sort();
-    ids.dedup();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
 
-    if ids.is_empty() {
+    if models.is_empty() {
         return Err(format!("{} listed no models.", endpoint.name));
     }
 
-    Ok(ids)
+    Ok(models)
+}
+
+/// A model from a provider's catalogue and, when the provider says, how many
+/// tokens of context it accepts.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+/// Providers name the context size differently: `context_length` (OpenRouter,
+/// Together, DeepInfra, Requesty), `context_window` (Groq), `max_model_len`
+/// (vLLM), `max_context_length`, `top_provider.context_length` (OpenRouter),
+/// `input_token_limit`/`inputTokenLimit` (Gemini).
+fn model_info(item: &Value) -> Option<ModelInfo> {
+    let id = item
+        .get("id")
+        .or_else(|| item.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| item.as_str())?
+        .trim_start_matches("models/")
+        .to_string();
+
+    if id.is_empty() {
+        return None;
+    }
+
+    let number = |value: Option<&Value>| {
+        value.and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_f64().map(|float| float as u64))
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        })
+    };
+
+    let context_window = [
+        "context_length",
+        "context_window",
+        "max_model_len",
+        "max_context_length",
+        "input_token_limit",
+        "inputTokenLimit",
+    ]
+    .iter()
+    .find_map(|key| number(item.get(*key)))
+    .or_else(|| number(item.get("top_provider").and_then(|top| top.get("context_length"))))
+    .filter(|tokens| (512..=100_000_000).contains(tokens));
+
+    Some(ModelInfo { id, context_window })
 }
 
 enum Probe {
@@ -702,6 +745,27 @@ mod tests {
     }
 
     #[test]
+    fn reads_context_windows_under_each_providers_name() {
+        let cases = [
+            (json!({ "id": "a", "context_length": 131072 }), Some(131072)),
+            (json!({ "id": "b", "context_window": 32768 }), Some(32768)),
+            (json!({ "id": "c", "max_model_len": "8192" }), Some(8192)),
+            (json!({ "id": "d", "top_provider": { "context_length": 200000 } }), Some(200000)),
+            (json!({ "id": "models/gemini", "inputTokenLimit": 1048576 }), Some(1048576)),
+            (json!({ "id": "e" }), None),
+            (json!({ "id": "f", "context_length": 0 }), None),
+        ];
+
+        for (item, expected) in cases {
+            let info = model_info(&item).unwrap();
+            assert_eq!(info.context_window, expected, "{item}");
+        }
+
+        assert_eq!(model_info(&json!({ "id": "models/gemini" })).unwrap().id, "gemini");
+        assert_eq!(model_info(&json!("plain-id")).unwrap().id, "plain-id");
+    }
+
+    #[test]
     fn describes_errors_with_the_provider_name() {
         assert!(describe("Groq", 429, None).starts_with("Groq rate limit"));
         assert!(describe("Groq", 401, None).contains("Groq rejected this API key"));
@@ -721,11 +785,12 @@ mod tests {
             .expect("Ollama should list its models");
         assert!(!models.is_empty());
 
-        let smallest = models
+        let ids: Vec<&String> = models.iter().map(|model| &model.id).collect();
+        let smallest = ids
             .iter()
             .find(|id| id.contains("4b") || id.contains("1b") || id.contains("mini"))
-            .unwrap_or(&models[0])
-            .clone();
+            .unwrap_or(&ids[0])
+            .to_string();
         let ping = tauri::async_runtime::block_on(ai_ping(local, smallest.clone()))
             .expect("the model should answer");
         println!("{smallest} answered {:?} in {} ms", ping.reply, ping.ms);

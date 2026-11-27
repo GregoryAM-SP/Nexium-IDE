@@ -37,6 +37,10 @@ export type DevStatus = {
   dir: string;
   script: string;
   url: string | null;
+  /** The command is known to start a web server, so a preview should come. */
+  expectsPreview: boolean;
+  /** The server's page, which refuses to be shown in a frame. */
+  blockedUrl: string | null;
 };
 
 export type WebStatus = {
@@ -96,14 +100,23 @@ export async function startDevServer(
   dir: string,
   script: string,
   command: string | null = null,
+  /** Runs the script with this manager instead of the project's own. */
+  manager: string | null = null,
 ): Promise<DevStatus> {
   if (!isTauri()) {
     // The page itself is a Vite dev server, so it can stand in for one.
-    return { running: true, dir, script: command ?? script, url: window.location.origin };
+    return {
+      running: true,
+      dir,
+      script: command ?? script,
+      url: window.location.origin,
+      expectsPreview: true,
+      blockedUrl: null,
+    };
   }
 
   try {
-    return await invoke<DevStatus>("web_start_dev", { dir, script, command });
+    return await invoke<DevStatus>("web_start_dev", { dir, script, command, manager });
   } catch (cause) {
     throw toError(cause, "The dev server could not start.");
   }
@@ -147,10 +160,12 @@ export async function openInBrowser(url: string): Promise<void> {
 }
 
 /** How a script is run, e.g. `bun run dev` or `yarn dev`. */
-export function scriptCommand(app: WebApp, script: string): string {
-  return app.packageManager === "yarn"
-    ? `yarn ${script}`
-    : `${app.packageManager} run ${script}`;
+export function scriptCommand(
+  app: WebApp,
+  script: string,
+  manager: string = app.packageManager,
+): string {
+  return manager === "yarn" ? `yarn ${script}` : `${manager} run ${script}`;
 }
 
 /** The command that installs an app's dependencies, for the terminal. */

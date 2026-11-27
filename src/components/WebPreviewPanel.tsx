@@ -42,6 +42,8 @@ type Viewport = DeviceId | "fit";
 const VIEW_KEY = "nexium.preview.device";
 const WIDTH_KEY = "nexium.preview.width";
 const MIN_WIDTH = 340;
+/** How long a known dev server may take to print its address. */
+const NO_PREVIEW_AFTER_MS = 30_000;
 
 const VIEWPORTS: { id: Viewport; label: string; icon: LucideIcon }[] = [
   { id: "desktop", label: `Desktop (${DEVICES.desktop.width}×${DEVICES.desktop.height})`, icon: Monitor },
@@ -65,6 +67,8 @@ const primaryButton =
 
 /** The script dropdown's entry for typing a command instead. */
 const CUSTOM = "\u0000custom";
+/** Prefix of the dropdown entries that run a script with npm instead. */
+const WITH_NPM = "npm\u0000";
 
 /** The script to preselect: the likeliest server, else a typed command. */
 function defaultScript(app: WebApp | null): string {
@@ -111,7 +115,9 @@ export default function WebPreviewPanel({
   const [script, setScript] = useState(() => defaultScript(app));
   const [customCommand, setCustomCommand] = useState(() => defaultCommand(app));
   const custom = script === CUSTOM;
-  const server = app?.servers.find((entry) => entry.name === script) ?? null;
+  const withNpm = script.startsWith(WITH_NPM);
+  const scriptName = withNpm ? script.slice(WITH_NPM.length) : script;
+  const server = app?.servers.find((entry) => entry.name === scriptName) ?? null;
   const [page, setPage] = useState("");
   const [address, setAddress] = useState("");
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
@@ -140,7 +146,7 @@ export default function WebPreviewPanel({
     }
     void (custom
       ? preview.startDev(app.dir, "", customCommand.trim())
-      : preview.startDev(app.dir, script));
+      : preview.startDev(app.dir, scriptName, null, withNpm ? "npm" : null));
   };
 
   const activeHtml = /\.html?$/i.test(activePath) ? activePath : "";
@@ -164,6 +170,28 @@ export default function WebPreviewPanel({
     setAddress(target ?? "");
   }, [target]);
 
+  // A server that has not answered after a while may not be a server at all
+  // (a custom command, a watcher): stop promising a preview and show what it
+  // printed instead. An address that comes later still opens the preview.
+  const [waitedLong, setWaitedLong] = useState(false);
+
+  useEffect(() => {
+    setWaitedLong(false);
+    if (mode !== "dev" || !dev || dev.url) {
+      return;
+    }
+    const timer = window.setTimeout(() => setWaitedLong(true), NO_PREVIEW_AFTER_MS);
+    return () => window.clearTimeout(timer);
+  }, [mode, dev?.script, dev?.url, dev !== null]);
+
+  const blockedUrl = mode === "dev" && !frameUrl ? (dev?.blockedUrl ?? null) : null;
+  const noPreview =
+    mode === "dev" &&
+    dev !== null &&
+    !frameUrl &&
+    !blockedUrl &&
+    (!dev.expectsPreview || waitedLong);
+
   // The log opens by itself while the server has not printed its address
   // yet, and when it stopped on its own, since that is where the reason is.
   useEffect(() => {
@@ -173,10 +201,10 @@ export default function WebPreviewPanel({
   }, [mode, dev?.url, dev !== null, exited]);
 
   useEffect(() => {
-    if (logsOpen) {
+    if (logsOpen || noPreview) {
       logEnd.current?.scrollIntoView({ block: "end" });
     }
-  }, [logs.length, logsOpen]);
+  }, [logs.length, logsOpen, noPreview]);
 
   const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -270,6 +298,15 @@ export default function WebPreviewPanel({
                       {scriptCommand(app, entry.name)}
                     </option>
                   ))}
+                  {app.packageManager !== "npm" && app.servers.length > 0 && (
+                    <optgroup label="With npm">
+                      {app.servers.map((entry) => (
+                        <option key={entry.name} value={`${WITH_NPM}${entry.name}`}>
+                          {scriptCommand(app, entry.name, "npm")}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                   <option value={CUSTOM}>Custom command…</option>
                 </select>
                 <button
@@ -384,9 +421,16 @@ export default function WebPreviewPanel({
         <div className="flex shrink-0 items-center gap-1.5 border-b border-line px-2 py-1.5">
           <span
             title={mode === "dev" ? `Dev server: ${dev?.script}` : "Live server"}
-            className={`size-1.5 shrink-0 rounded-full ${frameUrl ? "bg-emerald-400/80" : "animate-pulse bg-amber-300/80"}`}
+            className={`size-1.5 shrink-0 rounded-full ${frameUrl ? "bg-emerald-400/80" : noPreview ? "bg-ink/40" : "animate-pulse bg-amber-300/80"}`}
           />
-          {mode === "live" && pages.length > 0 ? (
+          {noPreview ? (
+            <span
+              title={dev?.script}
+              className="min-w-0 flex-1 truncate px-1 font-mono text-[10.5px] text-ink/60"
+            >
+              {dev?.script}
+            </span>
+          ) : mode === "live" && pages.length > 0 ? (
             <select
               value={page}
               onChange={(event) => setPage(event.target.value)}
@@ -423,7 +467,7 @@ export default function WebPreviewPanel({
               <FileCode className="size-3.5" strokeWidth={1.75} />
             </button>
           )}
-          {mode === "dev" && (
+          {mode === "dev" && !noPreview && (
             <button
               type="button"
               onClick={() => setLogsOpen((open) => !open)}
@@ -456,6 +500,40 @@ export default function WebPreviewPanel({
           </button>
         </div>
 
+        {blockedUrl ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+            <p className="text-[11.5px] text-ink/70">This page can't be shown here</p>
+            <p className="max-w-xs text-[10.5px] leading-relaxed text-ink/35">
+              The server is running, but its page asks browsers not to show it
+              inside another app.
+            </p>
+            <button
+              type="button"
+              onClick={() => openExternal(blockedUrl)}
+              className="flex h-7 items-center gap-1.5 rounded-md border border-ink/10 bg-ink/[0.03] px-3 text-[11.5px] text-ink/70 transition-colors duration-150 hover:border-ink/20 hover:bg-ink/[0.06] hover:text-ink"
+            >
+              <ExternalLink className="size-3" strokeWidth={1.75} />
+              Open {blockedUrl} in your browser
+            </button>
+          </div>
+        ) : noPreview ? (
+          <div className="flex min-h-0 flex-1 flex-col bg-app">
+            <div className="shrink-0 border-b border-line px-3 py-2.5">
+              <p className="text-[11.5px] text-ink/70">No preview for this command</p>
+              <p className="mt-1 text-[10.5px] leading-relaxed text-ink/35">
+                {dev?.expectsPreview
+                  ? "It is still running, but has not opened a local web address. "
+                  : "It is running, but is not a known web server. "}
+                Its output is below; the preview opens if it prints a local
+                address.
+              </p>
+            </div>
+            <pre className="min-h-0 flex-1 overflow-auto px-2.5 py-1.5 font-mono text-[10px] leading-relaxed whitespace-pre-wrap text-ink/55">
+              {logs.join("\n")}
+              <span ref={logEnd} />
+            </pre>
+          </div>
+        ) : (
         <div className="relative flex min-h-0 flex-1 flex-col">
           <div className="flex min-h-0 flex-1 flex-col bg-ink/[0.03]">
             {frameUrl && viewport !== "fit" ? (
@@ -481,8 +559,8 @@ export default function WebPreviewPanel({
               <div className="flex flex-col items-center justify-center gap-2 px-6 text-center">
                 <LoaderCircle className="size-4 animate-spin text-ink/30" />
                 <p className="text-[11px] text-ink/40">
-                  Starting {dev?.script}… the preview opens when the server
-                  prints its address.
+                  Starting {dev?.script}… the preview opens once the server
+                  loads a web page.
                 </p>
               </div>
             )}
@@ -500,6 +578,7 @@ export default function WebPreviewPanel({
             </div>
           )}
         </div>
+        )}
       </>
     );
   }

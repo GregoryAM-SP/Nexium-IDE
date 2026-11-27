@@ -26,7 +26,12 @@ export type WebPreview = {
   error: string | null;
   refresh: () => Promise<void>;
   /** Runs a script, or the `command` line typed instead of one. */
-  startDev: (dir: string, script: string, command?: string | null) => Promise<void>;
+  startDev: (
+    dir: string,
+    script: string,
+    command?: string | null,
+    manager?: string | null,
+  ) => Promise<void>;
   stopDev: () => Promise<void>;
   startLive: () => Promise<void>;
   stopLive: () => Promise<void>;
@@ -96,6 +101,10 @@ export function useWebPreview(
       );
     });
 
+    attach<string>("web:blocked", (blockedUrl) => {
+      setDev((current) => (current ? { ...current, blockedUrl } : current));
+    });
+
     attach<string>("web:url", (url) => {
       setDev((current) => (current ? { ...current, url } : current));
     });
@@ -125,11 +134,16 @@ export function useWebPreview(
   }, []);
 
   const startDev = useCallback(
-    (dir: string, script: string, command: string | null = null) =>
+    (
+      dir: string,
+      script: string,
+      command: string | null = null,
+      manager: string | null = null,
+    ) =>
       run(async () => {
         setLogs([]);
         setExited(null);
-        setDev(await startDevServer(dir, script, command));
+        setDev(await startDevServer(dir, script, command, manager));
       }),
     [run],
   );
