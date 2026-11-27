@@ -58,9 +58,14 @@ pub struct WebApp {
     pub name: String,
     /// "Vite", "Next.js", … or empty when nothing was recognised.
     pub framework: String,
+    /// Every script in package.json.
     pub scripts: Vec<String>,
+    /// The scripts that start a server, the likeliest first.
+    pub servers: Vec<ServerScript>,
     /// The script a preview should run, e.g. `dev`.
     pub preferred: Option<String>,
+    /// A command to offer when no script starts a server, e.g. `npx vite`.
+    pub fallback: Option<String>,
     pub package_manager: String,
     pub installed: bool,
 }
@@ -93,36 +98,342 @@ const FRAMEWORKS: [(&str, &str); 16] = [
     ("serve", "serve"),
 ];
 
-const PREFERRED_SCRIPTS: [&str; 5] = ["dev", "start", "serve", "develop", "preview"];
+/// A package.json script that starts a server the preview can show.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerScript {
+    pub name: String,
+    pub command: String,
+    /// The port it is expected to listen on, from its flags, the tool's
+    /// config file or the tool's default.
+    pub port: Option<u16>,
+}
 
+/// Script names (or parts of `a:b` names) that never start the site: builds,
+/// checks, packaging, and desktop or mobile shells that open their own window.
+const NOT_SERVER_NAMES: [&str; 22] = [
+    "build", "test", "lint", "format", "fmt", "typecheck", "type-check", "check", "clean",
+    "deploy", "release", "publish", "tauri", "electron", "desktop", "android", "ios", "mobile",
+    "e2e", "storybook", "prepare", "postinstall",
+];
+
+/// Tools that wrap the site in a native window: never the preview's job.
+const WRAPPER_COMMANDS: [&str; 5] = ["tauri", "electron", "electron-vite", "cap", "cargo"];
+
+/// Builds and checks. Blanked out before looking for a server, so
+/// `vite build && vite preview` still counts as a (production) server.
+const BUILD_COMMANDS: [&str; 14] = [
+    "vite build", "next build", "next lint", "astro build", "astro check", "nuxt build",
+    "nuxi build", "nuxt generate", "nuxi generate", "ng build", "gatsby build",
+    "react-scripts build", "vue-cli-service build", "parcel build",
+];
+
+/// Commands that start a dev or preview server, and the port each listens on
+/// when nothing says otherwise. Longer phrases come before their prefixes.
+const SERVER_COMMANDS: [(&str, u16); 24] = [
+    ("vite preview", 4173),
+    ("next dev", 3000),
+    ("next start", 3000),
+    ("next", 3000),
+    ("astro dev", 4321),
+    ("astro preview", 4321),
+    ("nuxt dev", 3000),
+    ("nuxi dev", 3000),
+    ("remix dev", 3000),
+    ("remix vite:dev", 5173),
+    ("vite dev", 5173),
+    ("vite serve", 5173),
+    ("vite", 5173),
+    ("webpack serve", 8080),
+    ("webpack-dev-server", 8080),
+    ("react-scripts start", 3000),
+    ("vue-cli-service serve", 8080),
+    ("ng serve", 4200),
+    ("gatsby develop", 8000),
+    ("parcel", 1234),
+    ("eleventy --serve", 8080),
+    ("live-server", 8080),
+    ("http-server", 8080),
+    ("serve", 3000),
+];
+
+/// Servers that need a build first: offered, but after the dev server.
+const PRODUCTION_SERVERS: [&str; 3] = ["vite preview", "next start", "astro preview"];
+
+fn word_boundary(ch: Option<char>) -> bool {
+    ch.map_or(true, |ch| {
+        ch.is_whitespace() || matches!(ch, '"' | '\'' | '&' | '|' | ';' | '(' | ')' | '/' | '=')
+    })
+}
+
+/// Where `needle` appears in `command` as whole words.
+fn find_words(command: &str, needle: &str) -> Option<usize> {
+    let mut from = 0;
+
+    while let Some(position) = command[from..].find(needle) {
+        let start = from + position;
+        let end = start + needle.len();
+
+        if word_boundary(command[..start].chars().next_back()) && word_boundary(command[end..].chars().next()) {
+            return Some(start);
+        }
+        from = end;
+    }
+
+    None
+}
+
+fn has_words(command: &str, needle: &str) -> bool {
+    find_words(command, needle).is_some()
+}
+
+/// The command with its build steps blanked out.
+fn without_builds(command: &str) -> String {
+    let mut command = command.to_ascii_lowercase();
+
+    for build in BUILD_COMMANDS {
+        while let Some(start) = find_words(&command, build) {
+            command.replace_range(start..start + build.len(), &" ".repeat(build.len()));
+        }
+    }
+
+    command
+}
+
+/// The server tool a command runs, with its default port.
+fn server_tool(command: &str) -> Option<(&'static str, u16)> {
+    let command = without_builds(command);
+
+    SERVER_COMMANDS
+        .iter()
+        .find(|(tool, _)| has_words(&command, tool))
+        .map(|(tool, port)| (*tool, *port))
+}
+
+/// A port given on the command line: `--port 3001`, `--port=3001`, `-p 3001`.
+fn port_flag(command: &str) -> Option<u16> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+
+    for (index, word) in words.iter().enumerate() {
+        if let Some(value) = word.strip_prefix("--port=") {
+            return value.trim_matches(['"', '\'']).parse().ok();
+        }
+        if matches!(*word, "--port" | "-p") {
+            return words.get(index + 1)?.trim_matches(['"', '\'']).parse().ok();
+        }
+    }
+
+    None
+}
+
+/// `server.port` from a Vite config. A plain text search: it is only a hint,
+/// and the address the server prints always wins.
+fn vite_config_port(dir: &Path) -> Option<u16> {
+    let text = ["ts", "mts", "js", "mjs", "cjs"]
+        .iter()
+        .find_map(|ext| fs::read_to_string(dir.join(format!("vite.config.{ext}"))).ok())?;
+    let server = &text[text.find("server:").or_else(|| text.find("server ="))?..];
+
+    // The first `port: <number>`, skipping comments that mention a port.
+    server.match_indices("port").find_map(|(start, _)| {
+        let before = server[..start].chars().next_back();
+        if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return None;
+        }
+        let after = server[start + 4..].trim_start().strip_prefix(':')?.trim_start();
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
+}
+
+/// The port a server command is expected to listen on.
+fn expected_port(dir: &Path, command: &str) -> Option<u16> {
+    port_flag(command).or_else(|| match server_tool(command)? {
+        ("vite" | "vite dev" | "vite serve" | "remix vite:dev", port) => vite_config_port(dir).or(Some(port)),
+        (_, port) => Some(port),
+    })
+}
+
+/// How likely a script is the one to preview, lower first, or `None` when it
+/// does not start a server.
+fn server_rank(name: &str, command: &str) -> Option<u8> {
+    let name = name.to_ascii_lowercase();
+    let lower = command.to_ascii_lowercase();
+    let mut parts = name.split([':', '-', '_']);
+    let base = parts.next().unwrap_or_default();
+
+    if NOT_SERVER_NAMES.contains(&base) || parts.any(|part| NOT_SERVER_NAMES.contains(&part)) {
+        return None;
+    }
+    if WRAPPER_COMMANDS.iter().any(|tool| has_words(&lower, tool)) {
+        return None;
+    }
+
+    let tool = server_tool(&lower).map(|(tool, _)| tool);
+    let builds_first = PRODUCTION_SERVERS.iter().any(|server| tool == Some(*server))
+        || BUILD_COMMANDS.iter().any(|build| has_words(&lower, build));
+    let dev_name = matches!(base, "dev" | "develop" | "start" | "serve" | "server" | "preview" | "watch");
+
+    if tool.is_none() {
+        // A builder or checker on its own is not a server; a script called
+        // `dev` or `start` that runs something unknown (a Node app) may be.
+        let checker = ["tsc", "eslint", "prettier", "vitest", "jest", "playwright", "biome"]
+            .iter()
+            .any(|tool| has_words(&lower, tool));
+        if builds_first || checker || !dev_name || base == "watch" || base == "preview" {
+            return None;
+        }
+    }
+
+    let rank = match (name.as_str(), builds_first) {
+        ("dev" | "develop", false) => 0,
+        ("start", false) => 1,
+        ("serve" | "server", false) => 2,
+        (_, false) if dev_name => 3,
+        (_, false) => 4,
+        ("preview" | "start" | "serve", true) => 6,
+        (_, true) => 7,
+    };
+
+    Some(rank)
+}
+
+/// The scripts that start a server, the likeliest first.
+fn server_scripts(dir: &Path, scripts: &serde_json::Map<String, serde_json::Value>) -> Vec<ServerScript> {
+    let mut ranked: Vec<(u8, usize, ServerScript)> = scripts
+        .iter()
+        .enumerate()
+        .filter_map(|(order, (name, command))| {
+            let command = command.as_str().unwrap_or_default().to_string();
+            let rank = server_rank(name, &command)?;
+            let port = expected_port(dir, &command);
+
+            Some((rank, order, ServerScript { name: name.clone(), command, port }))
+        })
+        .collect();
+
+    ranked.sort_by_key(|(rank, order, _)| (*rank, *order));
+    ranked.into_iter().map(|(_, _, script)| script).collect()
+}
+
+/// The manager a `packageManager` field names, e.g. `pnpm@9.1.0`.
+fn declared_manager(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let field = json.get("packageManager")?.as_str()?;
+    let name = field.split('@').next()?.trim();
+
+    ["npm", "pnpm", "yarn", "bun"]
+        .contains(&name)
+        .then(|| name.to_string())
+}
+
+/// Where a package manager's program lives: a PATH folder, or the folder its
+/// own installer uses, which an app started from the desktop may not have on
+/// its PATH.
+fn locate_manager(name: &str) -> Option<PathBuf> {
+    let names: Vec<String> = if cfg!(windows) {
+        ["exe", "cmd", "bat"].iter().map(|ext| format!("{name}.{ext}")).collect()
+    } else {
+        vec![name.to_string()]
+    };
+
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    if let Some(home) = &home {
+        dirs.push(home.join(".bun").join("bin"));
+    }
+    if cfg!(windows) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            dirs.push(local.join("pnpm"));
+        }
+        if let Some(roaming) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            dirs.push(roaming.join("npm"));
+        }
+    } else if let Some(home) = &home {
+        dirs.push(home.join(".local/share/pnpm"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+
+    dirs.into_iter()
+        .find(|dir| names.iter().any(|file| dir.join(file).is_file()))
+}
+
+/// The manager to run scripts with: the project's own, or npm when that one
+/// is not installed (npm runs any package.json script, whoever installed the
+/// dependencies).
+fn usable_manager(wanted: String) -> String {
+    if wanted != "npm" && locate_manager(&wanted).is_none() && locate_manager("npm").is_some() {
+        "npm".into()
+    } else {
+        wanted
+    }
+}
+
+/// The package manager the project uses, from `packageManager` or its lock file.
 fn package_manager(dir: &Path, root: &Path) -> String {
-    // Workspaces keep a single lock file at the top.
+    const LOCKS: [(&str, &str); 6] = [
+        ("bun.lock", "bun"),
+        ("bun.lockb", "bun"),
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("package-lock.json", "npm"),
+        ("npm-shrinkwrap.json", "npm"),
+    ];
+
+    // The app's own folder first; workspaces keep a single lock file at the top.
     for folder in [dir, root] {
-        if folder.join("pnpm-lock.yaml").is_file() {
-            return "pnpm".into();
+        if let Some(manager) = declared_manager(folder) {
+            return manager;
         }
-        if folder.join("yarn.lock").is_file() {
-            return "yarn".into();
-        }
-        if folder.join("bun.lockb").is_file() || folder.join("bun.lock").is_file() {
-            return "bun".into();
-        }
-        if folder.join("package-lock.json").is_file() {
-            return "npm".into();
+        if let Some((_, manager)) = LOCKS.iter().find(|(lock, _)| folder.join(lock).is_file()) {
+            return manager.to_string();
         }
     }
 
     "npm".into()
 }
 
+/// The command to offer when package.json has no script that starts the
+/// server, e.g. `npx vite` in a project that only lists the dependency.
+fn fallback_command(framework: &str, manager: &str) -> Option<String> {
+    let tool = match framework {
+        "Vite" | "SvelteKit" => "vite",
+        "Next.js" => "next dev",
+        "Astro" => "astro dev",
+        "Nuxt" => "nuxt dev",
+        "Gatsby" => "gatsby develop",
+        "Angular" => "ng serve",
+        "Parcel" => "parcel index.html",
+        "Create React App" => "react-scripts start",
+        "Vue CLI" => "vue-cli-service serve",
+        "Eleventy" => "eleventy --serve",
+        "webpack" => "webpack serve",
+        "live-server" => "live-server",
+        "http-server" => "http-server",
+        "serve" => "serve",
+        _ => return None,
+    };
+    let exec = match manager {
+        "bun" => "bunx",
+        "pnpm" => "pnpm exec",
+        "yarn" => "yarn",
+        _ => "npx",
+    };
+
+    Some(format!("{exec} {tool}"))
+}
+
 fn read_app(root: &Path, dir: &Path) -> Option<WebApp> {
     let text = fs::read_to_string(dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
 
-    let scripts_map = json.get("scripts").and_then(|value| value.as_object());
-    let scripts: Vec<String> = scripts_map
-        .map(|map| map.keys().cloned().collect())
-        .unwrap_or_default();
+    let empty = serde_json::Map::new();
+    let scripts_map = json.get("scripts").and_then(|value| value.as_object()).unwrap_or(&empty);
+    let scripts: Vec<String> = scripts_map.keys().cloned().collect();
 
     let has_dependency = |name: &str| {
         ["dependencies", "devDependencies"].iter().any(|field| {
@@ -138,14 +449,11 @@ fn read_app(root: &Path, dir: &Path) -> Option<WebApp> {
         .map(|(_, label)| label.to_string())
         .unwrap_or_default();
 
-    // A package with no runnable script and no web tooling is a library or a
-    // tool config, not something to preview.
-    let preferred = PREFERRED_SCRIPTS
-        .iter()
-        .find(|name| scripts.iter().any(|script| script == *name))
-        .map(|name| name.to_string());
+    let servers = server_scripts(dir, scripts_map);
 
-    if preferred.is_none() && framework.is_empty() {
+    // A package with no server script and no web tooling is a library, a
+    // tool config or a CLI, not something to preview.
+    if servers.is_empty() && framework.is_empty() {
         return None;
     }
 
@@ -153,6 +461,7 @@ fn read_app(root: &Path, dir: &Path) -> Option<WebApp> {
         .strip_prefix(root)
         .map(|path| path.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
+    let manager = usable_manager(package_manager(dir, root));
 
     Some(WebApp {
         name: json
@@ -165,10 +474,12 @@ fn read_app(root: &Path, dir: &Path) -> Option<WebApp> {
                     .unwrap_or_else(|| "app".into())
             }),
         dir: relative,
+        fallback: if servers.is_empty() { fallback_command(&framework, &manager) } else { None },
         framework,
         scripts,
-        preferred,
-        package_manager: package_manager(dir, root),
+        preferred: servers.first().map(|script| script.name.clone()),
+        servers,
+        package_manager: manager,
         installed: dir.join("node_modules").is_dir() || root.join("node_modules").is_dir(),
     })
 }
@@ -441,13 +752,37 @@ pub fn stop_dev(state: &WebState) {
     }
 }
 
-fn run_command(manager: &str, script: &str) -> Command {
-    let args: Vec<&str> = if manager == "yarn" {
-        vec![script]
-    } else {
-        vec!["run", script]
+/// `bun run dev --port 5174`, as it is shown in the log.
+fn script_line(manager: &str, script: &str, extra: &[String]) -> String {
+    script_args(manager, script, extra)
+        .iter()
+        .fold(manager.to_string(), |line, arg| format!("{line} {arg}"))
+}
+
+/// The arguments that run a package.json script, passing `extra` on to it.
+fn script_args(manager: &str, script: &str, extra: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = match manager {
+        "yarn" => vec![script.to_string()],
+        _ => vec!["run".into(), script.to_string()],
     };
 
+    if !extra.is_empty() {
+        // npm keeps flags before `--` for itself; the others pass them on.
+        if manager == "npm" {
+            args.push("--".into());
+        }
+        args.extend(extra.iter().cloned());
+    }
+
+    args
+}
+
+enum Launch<'a> {
+    Script { manager: &'a str, script: &'a str, extra: Vec<String> },
+    Shell(&'a str),
+}
+
+fn launch_command(launch: &Launch) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -455,7 +790,16 @@ fn run_command(manager: &str, script: &str) -> Command {
 
         // npm, pnpm and yarn are .cmd shims, which only cmd can start.
         let mut command = Command::new("cmd");
-        command.arg("/C").arg(manager).args(&args);
+        command.arg("/C");
+        match launch {
+            Launch::Script { manager, script, extra } => {
+                command.arg(manager).args(script_args(manager, script, extra));
+            }
+            // Typed by the user for their shell: handed over untouched.
+            Launch::Shell(line) => {
+                command.raw_arg(line);
+            }
+        }
         command.creation_flags(CREATE_NO_WINDOW);
         command
     }
@@ -464,25 +808,128 @@ fn run_command(manager: &str, script: &str) -> Command {
     {
         use std::os::unix::process::CommandExt;
 
-        let mut command = Command::new(manager);
-        command.args(&args);
+        let mut command = match launch {
+            Launch::Script { manager, script, extra } => {
+                let mut command = Command::new(manager);
+                command.args(script_args(manager, script, extra));
+                command
+            }
+            Launch::Shell(line) => {
+                let mut command = Command::new("sh");
+                command.arg("-c").arg(line);
+                command
+            }
+        };
         command.process_group(0);
         command
     }
 }
 
+/// Something already listens on the port, on either loopback address.
+fn port_taken(port: u16) -> bool {
+    let timeout = Duration::from_millis(250);
+    let v4 = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let v6 = std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
+
+    TcpStream::connect_timeout(&v4, timeout).is_ok()
+        || TcpStream::connect_timeout(&v6, timeout).is_ok()
+        || TcpListener::bind(v4).is_err()
+}
+
+/// The nearest free port above `port`, or any the OS hands out.
+fn free_port_after(port: u16) -> Option<u16> {
+    (port.saturating_add(1)..port.saturating_add(50))
+        .find(|candidate| !port_taken(*candidate))
+        .or_else(|| {
+            TcpListener::bind(("127.0.0.1", 0))
+                .ok()
+                .and_then(|listener| listener.local_addr().ok())
+                .map(|address| address.port())
+        })
+}
+
+/// The flags that move a server tool to another port. Empty for tools that
+/// only read the `PORT` variable, which is always set too.
+fn port_args(tool: Option<&str>, port: u16) -> Vec<String> {
+    match tool {
+        None | Some("react-scripts start") => Vec::new(),
+        Some("serve") => vec!["-l".into(), port.to_string()],
+        Some("live-server") => vec![format!("--port={port}")],
+        Some("http-server") => vec!["-p".into(), port.to_string()],
+        Some(_) => vec!["--port".into(), port.to_string()],
+    }
+}
+
+/// The address to show once the expected port answers but the server has
+/// not printed one: 127.0.0.1 when it listens there, otherwise localhost.
+fn port_url(port: u16) -> Option<String> {
+    let timeout = Duration::from_millis(250);
+
+    if TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), timeout).is_ok() {
+        Some(format!("http://127.0.0.1:{port}/"))
+    } else if TcpStream::connect_timeout(&std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)), timeout).is_ok() {
+        Some(format!("http://localhost:{port}/"))
+    } else {
+        None
+    }
+}
+
+fn log(app: &impl Events, logs: &Mutex<VecDeque<String>>, line: String) {
+    push_log(logs, line.clone());
+    app.send("web:log", LogEvent { line });
+}
+
+/// Starts a package.json `script` in `dir`, or the user's own `command` line
+/// when one is given, and follows its output for the address to preview.
 pub fn start_dev(
     app: &impl Events,
     state: &WebState,
     root: &Path,
     dir: &str,
     script: &str,
+    command: Option<&str>,
 ) -> Result<DevStatus, String> {
     let folder = safe_join(root, dir)?;
-    let info = read_app(root, &folder).ok_or("That folder has no package.json with scripts.")?;
+    let custom = command.map(str::trim).filter(|line| !line.is_empty());
 
-    if !info.scripts.iter().any(|name| name == script) {
-        return Err(format!("package.json has no \"{script}\" script."));
+    if !folder.is_dir() {
+        return Err("That folder no longer exists.".into());
+    }
+
+    let manager;
+    let mut port;
+    let tool;
+    let label;
+
+    if let Some(line) = custom {
+        manager = String::new();
+        port = expected_port(&folder, line);
+        tool = None;
+        label = line.to_string();
+    } else {
+        let info = read_app(root, &folder).ok_or("That folder has no package.json with a dev server script.")?;
+        let source = fs::read_to_string(folder.join("package.json")).unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_str(&source).unwrap_or_default();
+        let script_command = json
+            .get("scripts")
+            .and_then(|scripts| scripts.get(script))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("package.json has no \"{script}\" script."))?
+            .to_string();
+
+        manager = info.package_manager;
+        port = expected_port(&folder, &script_command);
+        tool = server_tool(&script_command).map(|(tool, _)| tool);
+        label = script.to_string();
+
+        // A port fixed on the command line is the user's choice to keep.
+        if port_flag(&script_command).is_some() {
+            if let Some(fixed) = port.filter(|fixed| port_taken(*fixed)) {
+                return Err(format!(
+                    "Port {fixed} is already in use, and the \"{script}\" script asks for it with --port. Stop what is using it, or run a custom command with another port."
+                ));
+            }
+        }
     }
 
     stop_dev(state);
@@ -491,8 +938,34 @@ pub fn start_dev(
         logs.clear();
     }
 
-    let mut command = run_command(&info.package_manager, script);
-    command
+    // Servers such as Vite with `strictPort` stop at once when their port is
+    // taken (often by the same app running in a terminal), so move them.
+    let mut extra = Vec::new();
+    let mut note = None;
+
+    if custom.is_none() {
+        if let Some(wanted) = port.filter(|wanted| port_taken(*wanted)) {
+            if let Some(free) = free_port_after(wanted) {
+                extra = port_args(tool, free);
+                note = Some(format!("[port {wanted} is in use, so the server starts on {free}]"));
+                port = Some(free);
+            } else {
+                port = None;
+            }
+        }
+    } else if port.is_some_and(port_taken) {
+        // Without knowing the tool, the port the line names cannot be moved;
+        // the printed address is all there is to go on.
+        port = None;
+    }
+
+    let launch = match custom {
+        Some(line) => Launch::Shell(line),
+        None => Launch::Script { manager: &manager, script, extra: extra.clone() },
+    };
+
+    let mut process = launch_command(&launch);
+    process
         .current_dir(&folder)
         // Dev servers that open a browser tab on start would leave the IDE.
         .env("BROWSER", "none")
@@ -501,9 +974,27 @@ pub fn start_dev(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|error| {
+    if custom.is_none() {
+        if let Some(port) = port {
+            process.env("PORT", port.to_string());
+        }
+
+        // A manager found in its installer's folder rather than on PATH.
+        if let Some(found) = locate_manager(&manager) {
+            let mut paths = vec![found];
+            if let Some(path) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&path));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                process.env("PATH", joined);
+            }
+        }
+    }
+
+    let mut child = process.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            format!("{} was not found. Install Node.js and make sure it is on your PATH.", info.package_manager)
+            let program = if manager.is_empty() { "The shell" } else { manager.as_str() };
+            format!("{program} was not found. Install it and make sure it is on your PATH.")
         } else {
             format!("The dev server could not start: {error}")
         }
@@ -512,10 +1003,14 @@ pub fn start_dev(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let launched = format!("> {} {} {}", info.package_manager, if info.package_manager == "yarn" { "" } else { "run" }, script)
-        .replace("  ", " ");
-    push_log(&state.logs, launched.clone());
-    app.send("web:log", LogEvent { line: launched });
+    if let Some(note) = note {
+        log(app, &state.logs, note);
+    }
+    let launched = match custom {
+        Some(line) => format!("> {line}"),
+        None => format!("> {}", script_line(&manager, script, &extra)),
+    };
+    log(app, &state.logs, launched);
 
     {
         let mut guard = state
@@ -525,7 +1020,7 @@ pub fn start_dev(
         *guard = Some(DevServer {
             child,
             dir: dir.to_string(),
-            script: script.to_string(),
+            script: label.clone(),
             url: None,
         });
     }
@@ -557,18 +1052,10 @@ pub fn start_dev(
                 let line = strip_ansi(&line);
 
                 if let Some(url) = local_url(&line) {
-                    if let Ok(mut guard) = dev.lock() {
-                        if let Some(server) = guard.as_mut().filter(|server| Some(server.child.id()) == pid) {
-                            if server.url.is_none() {
-                                server.url = Some(url.clone());
-                                app.send("web:url", url);
-                            }
-                        }
-                    }
+                    set_url(&app, &dev, pid, url);
                 }
 
-                push_log(&logs, line.clone());
-                app.send("web:log", LogEvent { line });
+                log(&app, &logs, line);
             }
 
             // The last stream to close means the process is gone.
@@ -588,10 +1075,40 @@ pub fn start_dev(
                     }
                 }
 
-                let line = format!("[dev server exited{}]", code.map(|code| format!(" with code {code}")).unwrap_or_default());
-                push_log(&logs, line.clone());
-                app.send("web:log", LogEvent { line });
+                log(&app, &logs, format!("[dev server exited{}]", code.map(|code| format!(" with code {code}")).unwrap_or_default()));
                 app.send("web:exit", ExitEvent { code });
+            }
+        });
+    }
+
+    // Some servers print no address (or print it in a way not recognised):
+    // once the expected port answers, show it anyway.
+    if let Some(port) = port {
+        let app = app.clone();
+        let dev = state.dev.clone();
+
+        std::thread::spawn(move || {
+            let waiting = || {
+                dev.lock().ok().is_some_and(|guard| {
+                    guard
+                        .as_ref()
+                        .is_some_and(|server| Some(server.child.id()) == pid && server.url.is_none())
+                })
+            };
+
+            for _ in 0..360 {
+                std::thread::sleep(Duration::from_millis(500));
+                if !waiting() {
+                    return;
+                }
+                if port_url(port).is_some() {
+                    // Give the server a moment to print its own address.
+                    std::thread::sleep(Duration::from_millis(1500));
+                    if let Some(url) = port_url(port).filter(|_| waiting()) {
+                        set_url(&app, &dev, pid, url);
+                    }
+                    return;
+                }
             }
         });
     }
@@ -599,9 +1116,21 @@ pub fn start_dev(
     Ok(DevStatus {
         running: true,
         dir: dir.to_string(),
-        script: script.to_string(),
+        script: label,
         url: None,
     })
+}
+
+/// Records the address to preview, the first one found for this server.
+fn set_url(app: &impl Events, dev: &Mutex<Option<DevServer>>, pid: Option<u32>, url: String) {
+    if let Ok(mut guard) = dev.lock() {
+        if let Some(server) = guard.as_mut().filter(|server| Some(server.child.id()) == pid) {
+            if server.url.is_none() {
+                server.url = Some(url.clone());
+                app.send("web:url", url);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -951,8 +1480,140 @@ mod tests {
         assert_eq!(info.apps[0].dir, "frontend");
         assert_eq!(info.apps[0].framework, "Vite");
         assert_eq!(info.apps[0].preferred.as_deref(), Some("dev"));
-        assert_eq!(info.apps[0].package_manager, "pnpm");
+        assert_eq!(info.apps[0].package_manager, usable_manager("pnpm".into()));
         assert_eq!(info.pages, vec!["site/index.html", "site/about/index.html"]);
+    }
+
+    fn app_with(name: &str, package: &str, files: &[(&str, &str)]) -> Option<WebApp> {
+        let root = std::env::temp_dir().join(format!("nexium-app-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("package.json"), package).unwrap();
+        for (file, text) in files {
+            fs::write(root.join(file), text).unwrap();
+        }
+
+        let app = read_app(&root, &root);
+        let _ = fs::remove_dir_all(&root);
+        app
+    }
+
+    fn server_names(app: &WebApp) -> Vec<&str> {
+        app.servers.iter().map(|script| script.name.as_str()).collect()
+    }
+
+    /// The scripts of this very repository: only the Vite servers are
+    /// offered, `dev` first, with the port from vite.config.ts.
+    #[test]
+    fn offers_only_server_scripts_for_nexium_itself() {
+        let app = app_with(
+            "nexium",
+            r#"{"name":"nexium-ide","scripts":{
+                "dev":"vite","dev:desktop":"vite --mode desktop",
+                "build":"tsc --noEmit && vite build","preview":"vite preview",
+                "tauri":"tauri","desktop":"node scripts/desktop-dev.mjs","desktop:build":"tauri build"},
+              "devDependencies":{"vite":"^8"}}"#,
+            &[
+                ("bun.lock", ""),
+                (
+                    "vite.config.ts",
+                    "export default defineConfig({ server: {\n  host: \"127.0.0.1\",\n  // a free port the OS picked\n  port: 5180,\n  strictPort: true,\n} });",
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(server_names(&app), vec!["dev", "preview"]);
+        assert_eq!(app.preferred.as_deref(), Some("dev"));
+        assert_eq!(app.package_manager, usable_manager("bun".into()));
+        assert_eq!(app.servers[0].port, Some(5180));
+        assert_eq!(app.servers[1].port, Some(4173));
+        assert_eq!(app.fallback, None);
+    }
+
+    #[test]
+    fn ranks_servers_across_project_shapes() {
+        let next = app_with(
+            "next",
+            r#"{"scripts":{"build":"next build","start":"next start","lint":"next lint","dev":"next dev -p 3001"},"dependencies":{"next":"15"}}"#,
+            &[("pnpm-lock.yaml", ""), ("package-lock.json", "")],
+        )
+        .unwrap();
+        assert_eq!(server_names(&next), vec!["dev", "start"]);
+        assert_eq!(next.servers[0].port, Some(3001));
+        assert_eq!(next.package_manager, usable_manager("pnpm".into()));
+
+        let express = app_with(
+            "express",
+            r#"{"packageManager":"yarn@4.1.0","scripts":{"start":"node server.js","test":"jest"}}"#,
+            &[("package-lock.json", "")],
+        )
+        .unwrap();
+        assert_eq!(server_names(&express), vec!["start"]);
+        assert_eq!(express.package_manager, usable_manager("yarn".into()));
+
+        let bare_vite = app_with("bare", r#"{"devDependencies":{"vite":"5"}}"#, &[]).unwrap();
+        assert!(bare_vite.servers.is_empty());
+        assert_eq!(bare_vite.fallback.as_deref(), Some("npx vite"));
+        assert_eq!(bare_vite.package_manager, "npm");
+
+        let wrapper = app_with(
+            "wrapper",
+            r#"{"scripts":{"dev":"tauri dev","build":"tsc","watch":"tsc -w","check":"svelte-check"}}"#,
+            &[],
+        );
+        assert!(wrapper.is_none(), "a Tauri wrapper and builders are not web servers");
+
+        let combined = app_with(
+            "combined",
+            r#"{"scripts":{"serve:prod":"vite build && vite preview","dev":"vitest"}}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(server_names(&combined), vec!["serve:prod"]);
+    }
+
+    #[test]
+    fn reads_the_package_manager_from_the_lock_file() {
+        let root = std::env::temp_dir().join(format!("nexium-locks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("web")).unwrap();
+        let web = root.join("web");
+        fs::write(web.join("package.json"), "{}").unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+
+        let mut found = vec![package_manager(&web, &root)];
+        fs::write(root.join("yarn.lock"), "").unwrap();
+        found.push(package_manager(&web, &root));
+        fs::write(web.join("bun.lock"), "").unwrap();
+        fs::write(web.join("package-lock.json"), "").unwrap();
+        found.push(package_manager(&web, &root));
+        fs::write(web.join("package.json"), r#"{"packageManager":"pnpm@9.0.0"}"#).unwrap();
+        found.push(package_manager(&web, &root));
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(found, vec!["npm", "yarn", "bun", "pnpm"]);
+        assert_eq!(usable_manager("npm".into()), "npm");
+        assert_eq!(usable_manager("not-a-manager".into()), if locate_manager("npm").is_some() { "npm" } else { "not-a-manager" });
+    }
+
+    #[test]
+    fn moves_servers_off_a_taken_port() {
+        assert_eq!(port_flag("vite --port 4000"), Some(4000));
+        assert_eq!(port_flag("next dev -p=3000"), None);
+        assert_eq!(port_flag("astro dev --port=4322"), Some(4322));
+        assert_eq!(port_args(Some("vite"), 5174), vec!["--port", "5174"]);
+        assert!(port_args(Some("react-scripts start"), 3001).is_empty());
+        assert_eq!(script_args("npm", "dev", &["--port".into(), "5174".into()]), vec!["run", "dev", "--", "--port", "5174"]);
+        assert_eq!(script_args("bun", "dev", &["--port".into(), "5174".into()]), vec!["run", "dev", "--port", "5174"]);
+        assert_eq!(script_args("yarn", "dev", &[]), vec!["dev"]);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_taken(port));
+        let free = free_port_after(port).unwrap();
+        assert_ne!(free, port);
+        assert!(!port_taken(free));
     }
 
     #[derive(Clone, Default)]
@@ -997,7 +1658,7 @@ mod tests {
 
         let events = Recorder::default();
         let state = WebState::default();
-        start_dev(&events, &state, &root, "", "dev").unwrap();
+        start_dev(&events, &state, &root, "", "dev", None).unwrap();
 
         let mut url = None;
         for _ in 0..100 {
@@ -1023,6 +1684,48 @@ mod tests {
             !events.0.lock().unwrap().iter().any(|(event, _)| event == "web:exit"),
             "a deliberate stop is not reported as a crash"
         );
+    }
+
+    /// Starts this repository's own `dev` script (Vite with strictPort on
+    /// 5173) while something else holds 5173, as a second copy would.
+    #[test]
+    #[ignore = "needs this repo's node_modules and its package manager on PATH"]
+    fn previews_this_repo_with_its_port_taken() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let app = read_app(&root, &root).unwrap();
+        assert_eq!(app.preferred.as_deref(), Some("dev"));
+
+        let blocker = TcpListener::bind(("127.0.0.1", 5173)).ok();
+        assert!(port_taken(5173));
+
+        let events = Recorder::default();
+        let state = WebState::default();
+        start_dev(&events, &state, &root, "", "dev", None).unwrap();
+
+        let mut url = None;
+        for _ in 0..300 {
+            std::thread::sleep(Duration::from_millis(100));
+            url = status(&state).dev.and_then(|dev| dev.url);
+            if url.is_some() {
+                break;
+            }
+        }
+        let logs = status(&state).logs;
+        let url = url.unwrap_or_else(|| panic!("no address; logs: {logs:?}"));
+        assert!(!url.contains(":5173"), "{url}");
+
+        let address = url.trim_start_matches("http://").trim_end_matches('/');
+        let mut stream = TcpStream::connect(address).unwrap();
+        write!(stream, "GET / HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").unwrap();
+        let mut page = String::new();
+        let _ = stream.read_to_string(&mut page);
+
+        stop_dev(&state);
+        drop(blocker);
+
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("<div id=\"root\">") || page.contains("id=\"root\""), "{page}");
+        eprintln!("logs: {logs:#?}");
     }
 
     #[test]

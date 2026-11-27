@@ -23,7 +23,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 
 import DeviceFrame, { DEVICES } from "./DeviceFrame";
 import type { DeviceId } from "./DeviceFrame";
-import { openInBrowser, pageUrl } from "../lib/web";
+import { openInBrowser, pageUrl, scriptCommand } from "../lib/web";
 import type { WebApp } from "../lib/web";
 import type { WebPreview } from "../lib/useWebPreview";
 
@@ -63,6 +63,25 @@ const selectClass =
 const primaryButton =
   "flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md bg-ink px-3 text-[11.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/[0.08] disabled:text-ink/30";
 
+/** The script dropdown's entry for typing a command instead. */
+const CUSTOM = "\u0000custom";
+
+/** The script to preselect: the likeliest server, else a typed command. */
+function defaultScript(app: WebApp | null): string {
+  return app?.preferred ?? (app ? CUSTOM : "");
+}
+
+/** What the custom command field starts with. */
+function defaultCommand(app: WebApp | null): string {
+  if (!app) {
+    return "";
+  }
+  if (app.fallback) {
+    return app.fallback;
+  }
+  return scriptCommand(app, app.preferred ?? "dev");
+}
+
 function appLabel(app: WebApp): string {
   const where = app.dir ? app.dir : "root";
   return app.framework ? `${app.name} · ${app.framework} (${where})` : `${app.name} (${where})`;
@@ -89,9 +108,10 @@ export default function WebPreviewPanel({
   const [externalError, setExternalError] = useState<string | null>(null);
   const [appIndex, setAppIndex] = useState(0);
   const app = apps[Math.min(appIndex, apps.length - 1)] ?? null;
-  const [script, setScript] = useState(
-    () => app?.preferred ?? app?.scripts[0] ?? "",
-  );
+  const [script, setScript] = useState(() => defaultScript(app));
+  const [customCommand, setCustomCommand] = useState(() => defaultCommand(app));
+  const custom = script === CUSTOM;
+  const server = app?.servers.find((entry) => entry.name === script) ?? null;
   const [page, setPage] = useState("");
   const [address, setAddress] = useState("");
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
@@ -109,8 +129,19 @@ export default function WebPreviewPanel({
   const logEnd = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
-    setScript(app?.preferred ?? app?.scripts[0] ?? "");
-  }, [app?.dir]);
+    setScript(defaultScript(app));
+    setCustomCommand(defaultCommand(app));
+  }, [app?.dir, app?.preferred]);
+
+  const canStart = custom ? customCommand.trim() !== "" : script !== "";
+  const start = () => {
+    if (!app || !canStart) {
+      return;
+    }
+    void (custom
+      ? preview.startDev(app.dir, "", customCommand.trim())
+      : preview.startDev(app.dir, script));
+  };
 
   const activeHtml = /\.html?$/i.test(activePath) ? activePath : "";
 
@@ -234,22 +265,54 @@ export default function WebPreviewPanel({
                   className={selectClass}
                   aria-label="Script"
                 >
-                  {app.scripts.map((name) => (
-                    <option key={name} value={name}>
-                      {`${app.packageManager} ${app.packageManager === "yarn" ? "" : "run "}${name}`}
+                  {app.servers.map((entry) => (
+                    <option key={entry.name} value={entry.name}>
+                      {scriptCommand(app, entry.name)}
                     </option>
                   ))}
+                  <option value={CUSTOM}>Custom command…</option>
                 </select>
                 <button
                   type="button"
-                  onClick={() => void preview.startDev(app.dir, script)}
-                  disabled={busy || !script}
+                  onClick={start}
+                  disabled={busy || !canStart}
                   className={primaryButton}
                 >
                   {busy ? <LoaderCircle className="size-3 animate-spin" /> : <Play className="size-3" strokeWidth={2} />}
                   Start
                 </button>
               </div>
+              {custom ? (
+                <input
+                  value={customCommand}
+                  onChange={(event) => setCustomCommand(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      start();
+                    }
+                  }}
+                  placeholder="e.g. npx vite --port 3000"
+                  spellCheck={false}
+                  aria-label="Custom command"
+                  className="h-7 w-full min-w-0 rounded-md border border-line bg-app px-2 font-mono text-[11px] text-ink/80 placeholder:text-ink/25 focus:border-ink/25 focus:outline-none"
+                />
+              ) : (
+                server && (
+                  <p
+                    title={server.command}
+                    className="truncate font-mono text-[10px] text-ink/30"
+                  >
+                    {server.command}
+                    {server.port ? ` · port ${server.port}` : ""}
+                  </p>
+                )
+              )}
+              {custom && (
+                <p className="text-[10px] leading-relaxed text-ink/30">
+                  Runs in {app.dir || "the project folder"}. The preview opens
+                  at the first local address the command prints.
+                </p>
+              )}
             </div>
 
             {!app.installed && (

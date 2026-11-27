@@ -1,12 +1,25 @@
 import { invoke, isTauri, toError } from "./tauriBridge";
 
+/** A package.json script that starts a server the preview can show. */
+export type ServerScript = {
+  name: string;
+  command: string;
+  /** The port it should listen on, when that can be told in advance. */
+  port: number | null;
+};
+
 export type WebApp = {
   /** Folder relative to the workspace root, empty for the root. */
   dir: string;
   name: string;
   framework: string;
+  /** Every script in package.json. */
   scripts: string[];
+  /** The scripts that start a server, the likeliest first. */
+  servers: ServerScript[];
   preferred: string | null;
+  /** A command to offer when no script starts a server, e.g. `npx vite`. */
+  fallback: string | null;
   packageManager: string;
   /** node_modules exists, so the dev server can start. */
   installed: boolean;
@@ -42,7 +55,12 @@ const demoInfo: WebInfo = {
       name: "nexium-studio",
       framework: "Vite",
       scripts: ["dev", "build", "preview"],
+      servers: [
+        { name: "dev", command: "vite", port: 5173 },
+        { name: "preview", command: "vite preview", port: 4173 },
+      ],
       preferred: "dev",
+      fallback: null,
       packageManager: "npm",
       installed: true,
     },
@@ -70,17 +88,22 @@ export async function webStatus(): Promise<WebStatus> {
   return invoke<WebStatus>("web_status");
 }
 
+/**
+ * Starts a package.json `script` in `dir`, or the user's own `command` line
+ * in that folder when one is given.
+ */
 export async function startDevServer(
   dir: string,
   script: string,
+  command: string | null = null,
 ): Promise<DevStatus> {
   if (!isTauri()) {
     // The page itself is a Vite dev server, so it can stand in for one.
-    return { running: true, dir, script, url: window.location.origin };
+    return { running: true, dir, script: command ?? script, url: window.location.origin };
   }
 
   try {
-    return await invoke<DevStatus>("web_start_dev", { dir, script });
+    return await invoke<DevStatus>("web_start_dev", { dir, script, command });
   } catch (cause) {
     throw toError(cause, "The dev server could not start.");
   }
@@ -121,6 +144,13 @@ export async function openInBrowser(url: string): Promise<void> {
   } catch (cause) {
     throw toError(cause, "The browser could not be opened.");
   }
+}
+
+/** How a script is run, e.g. `bun run dev` or `yarn dev`. */
+export function scriptCommand(app: WebApp, script: string): string {
+  return app.packageManager === "yarn"
+    ? `yarn ${script}`
+    : `${app.packageManager} run ${script}`;
 }
 
 /** The command that installs an app's dependencies, for the terminal. */

@@ -25,7 +25,8 @@ export type WebPreview = {
   busy: boolean;
   error: string | null;
   refresh: () => Promise<void>;
-  startDev: (dir: string, script: string) => Promise<void>;
+  /** Runs a script, or the `command` line typed instead of one. */
+  startDev: (dir: string, script: string, command?: string | null) => Promise<void>;
   stopDev: () => Promise<void>;
   startLive: () => Promise<void>;
   stopLive: () => Promise<void>;
@@ -124,11 +125,11 @@ export function useWebPreview(
   }, []);
 
   const startDev = useCallback(
-    (dir: string, script: string) =>
+    (dir: string, script: string, command: string | null = null) =>
       run(async () => {
         setLogs([]);
         setExited(null);
-        setDev(await startDevServer(dir, script));
+        setDev(await startDevServer(dir, script, command));
       }),
     [run],
   );

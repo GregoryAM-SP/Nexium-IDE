@@ -402,9 +402,10 @@ fn web_start_dev(
     state: State<'_, AppState>,
     dir: String,
     script: String,
+    command: Option<String>,
 ) -> Result<web::DevStatus, String> {
     let root = current_root(&state)?;
-    web::start_dev(&app, &state.web, &root, &dir, &script)
+    web::start_dev(&app, &state.web, &root, &dir, &script, command.as_deref())
 }
 
 #[tauri::command]
