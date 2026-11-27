@@ -196,9 +196,14 @@ pub fn status(root: &Path) -> Result<GitStatus, String> {
 
     let branch = match run(root, &["branch", "--show-current"]) {
         Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
-        _ => run(root, &["rev-parse", "--short", "HEAD"])
-            .map(|sha| format!("HEAD {}", sha.trim()))
-            .unwrap_or_else(|_| "no commits yet".to_string()),
+        // Detached: name the tag it sits on, if any, else the commit.
+        _ => match run(root, &["rev-parse", "--short", "HEAD"]) {
+            Ok(sha) => match run(root, &["describe", "--tags", "--exact-match", "HEAD"]) {
+                Ok(tag) if !tag.trim().is_empty() => format!("{} (detached)", tag.trim()),
+                _ => format!("HEAD {}", sha.trim()),
+            },
+            Err(_) => "no commits yet".to_string(),
+        },
     };
 
     // Without `--untracked-files=all` git collapses a new folder into a single
@@ -644,6 +649,19 @@ pub fn push_tag(root: &Path, name: &str, auth: &Auth) -> Result<(), String> {
     execute_with(root, &["push", "origin", &refspec], false, auth).map(|_| ())
 }
 
+/// Checks out the commit a tag points at. That leaves HEAD detached (on no
+/// branch): to commit there, create a branch from it.
+pub fn checkout_tag(root: &Path, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    check_tag_name(root, name)?;
+
+    if !tag_exists(root, name) {
+        return Err(format!("There is no tag named \"{name}\"."));
+    }
+
+    run(root, &["switch", "--detach", &format!("refs/tags/{name}")]).map(|_| ())
+}
+
 /// Deletes a tag from this repository only; a tag already pushed stays on
 /// the remote.
 pub fn delete_tag(root: &Path, name: &str) -> Result<(), String> {
@@ -961,6 +979,21 @@ mod tests {
         let now = status(&work).unwrap();
         assert_eq!(now.branch, "docs");
         assert_eq!(now.upstream.as_deref(), Some("origin/docs"));
+
+        // Checking out a tag detaches HEAD on its commit, named after the tag;
+        // a branch can then be made from there.
+        std::fs::remove_file(work.join("draft.txt")).unwrap();
+        create_tag(&work, "v1.0.0", "First release").unwrap();
+        std::fs::write(work.join("b.txt"), "b").unwrap();
+        run(&work, &["add", "b.txt"]).unwrap();
+        run(&work, &["commit", "-q", "-m", "After the release"]).unwrap();
+        checkout_tag(&work, "v1.0.0").unwrap();
+        let detached = status(&work).unwrap();
+        assert_eq!(detached.branch, "v1.0.0 (detached)");
+        assert!(!work.join("b.txt").exists(), "back at the tagged commit");
+        assert!(checkout_tag(&work, "v9.9.9").unwrap_err().contains("no tag"));
+        create_branch(&work, "hotfix/1.0.1", true).unwrap();
+        assert_eq!(status(&work).unwrap().branch, "hotfix/1.0.1");
 
         let _ = std::fs::remove_dir_all(&base);
     }

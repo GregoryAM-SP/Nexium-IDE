@@ -1,14 +1,17 @@
-import { Check, Cloud, GitBranch, GitBranchPlus, LoaderCircle, Search } from "lucide-react";
+import { Check, Cloud, GitBranch, GitBranchPlus, LoaderCircle, Search, Tag } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { GitBranch as Branch } from "../lib/git";
+import type { GitBranch as Branch, GitTag } from "../lib/git";
 
 type BranchMenuProps = {
   current: string;
   /** Loads the list each time the menu opens. */
   load: () => Promise<Branch[]>;
+  /** Loads the tags each time the menu opens. */
+  loadTags: () => Promise<GitTag[]>;
   /** Resolve to an error message, or null when it worked (the menu closes). */
   onSwitch: (branch: Branch) => Promise<string | null>;
+  onCheckoutTag: (tag: GitTag) => Promise<string | null>;
   onCreate: (name: string) => Promise<string | null>;
   onClose: () => void;
 };
@@ -27,8 +30,17 @@ function ago(seconds: number): string {
  * it (a remote one becomes a local branch that tracks it), or create a new
  * branch from the current commit with the typed name.
  */
-export default function BranchMenu({ current, load, onSwitch, onCreate, onClose }: BranchMenuProps) {
+export default function BranchMenu({
+  current,
+  load,
+  loadTags,
+  onSwitch,
+  onCheckoutTag,
+  onCreate,
+  onClose,
+}: BranchMenuProps) {
   const [branches, setBranches] = useState<Branch[] | null>(null);
+  const [tags, setTags] = useState<GitTag[]>([]);
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -44,10 +56,14 @@ export default function BranchMenu({ current, load, onSwitch, onCreate, onClose 
           setError(cause instanceof Error ? cause.message : "The branches could not be listed.");
         }
       });
+    // A repository without tags is fine; the section just stays away.
+    loadTags()
+      .then((list) => !cancelled && setTags(list))
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [load]);
+  }, [load, loadTags]);
 
   useEffect(() => {
     const close = (event: MouseEvent) => {
@@ -75,6 +91,12 @@ export default function BranchMenu({ current, load, onSwitch, onCreate, onClose 
   }, [branches, name]);
   const local = filtered.filter((branch) => !branch.remote);
   const remote = filtered.filter((branch) => branch.remote);
+  const matchingTags = useMemo(() => {
+    const needle = name.toLowerCase();
+    return tags.filter((tag) => tag.name.toLowerCase().includes(needle));
+  }, [tags, name]);
+  // The status reads "v1.0.0 (detached)" while a tag is checked out.
+  const currentTag = current.endsWith(" (detached)") ? current.slice(0, -" (detached)".length) : null;
   const exists = (branches ?? []).some((branch) => !branch.remote && branch.name === name);
   const canCreate = name.length > 0 && !exists;
 
@@ -94,6 +116,43 @@ export default function BranchMenu({ current, load, onSwitch, onCreate, onClose 
     if (canCreate && !busy) {
       void run(`create:${name}`, () => onCreate(name));
     }
+  };
+
+  const tagRow = (tag: GitTag) => {
+    const key = `tag:${tag.name}`;
+    const isCurrent = tag.name === currentTag;
+    const when = Date.parse(tag.date);
+    return (
+      <li key={key}>
+        <button
+          type="button"
+          disabled={isCurrent || busy !== null}
+          onClick={() => void run(key, () => onCheckoutTag(tag))}
+          title={`Check out ${tag.name} (${tag.commit}). You will be on that commit, not on a branch: create a branch there to commit.`}
+          className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors duration-150 disabled:cursor-default ${
+            isCurrent ? "bg-ink/[0.07]" : "hover:bg-ink/[0.05]"
+          }`}
+        >
+          {busy === key ? (
+            <LoaderCircle className="size-3 shrink-0 animate-spin text-ink/60" />
+          ) : isCurrent ? (
+            <Check className="size-3 shrink-0 text-ink/70" strokeWidth={2.25} />
+          ) : (
+            <Tag className="size-3 shrink-0 text-ink/35" strokeWidth={1.75} />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className={`block truncate font-mono text-[11px] ${isCurrent ? "text-ink/90" : "text-ink/70"}`}>
+              {tag.name}
+            </span>
+            <span className="block truncate text-[10px] text-ink/30">
+              {Number.isNaN(when) ? "" : ago(Math.floor(when / 1000))}
+              {tag.subject ? ` · ${tag.subject}` : ""}
+            </span>
+          </span>
+          <span className="shrink-0 font-mono text-[9.5px] text-ink/25">{tag.commit}</span>
+        </button>
+      </li>
+    );
   };
 
   const row = (branch: Branch) => {
@@ -161,7 +220,7 @@ export default function BranchMenu({ current, load, onSwitch, onCreate, onClose 
           autoFocus
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="Find a branch, or name a new one"
+          placeholder="Find a branch or tag, or name a new branch"
           aria-label="Find or name a branch"
           spellCheck={false}
           className="h-7 min-w-0 flex-1 bg-transparent font-mono text-[11px] text-ink outline-none placeholder:font-sans placeholder:text-ink/30"
@@ -199,9 +258,9 @@ export default function BranchMenu({ current, load, onSwitch, onCreate, onClose 
             <LoaderCircle className="size-3 animate-spin" />
             Loading branches…
           </p>
-        ) : local.length + remote.length === 0 ? (
+        ) : local.length + remote.length + matchingTags.length === 0 ? (
           <p className="px-2 py-2 text-[11px] text-ink/40">
-            {name ? "No branch matches." : "No branches yet."}
+            {name ? "No branch or tag matches." : "No branches yet."}
           </p>
         ) : (
           <>
@@ -217,12 +276,18 @@ export default function BranchMenu({ current, load, onSwitch, onCreate, onClose 
                 <ul className="space-y-0.5">{remote.map(row)}</ul>
               </>
             )}
+            {matchingTags.length > 0 && (
+              <>
+                <p className="px-2 pb-1 pt-2 text-[9.5px] uppercase tracking-[0.16em] text-ink/30">Tags</p>
+                <ul className="space-y-0.5">{matchingTags.map(tagRow)}</ul>
+              </>
+            )}
           </>
         )}
       </div>
 
       <p className="mt-1 border-t border-ink/[0.07] px-2 pb-0.5 pt-1.5 text-[10px] leading-relaxed text-ink/30">
-        Uncommitted changes come along when you switch; Git stops if they would be overwritten.
+        Uncommitted changes come along when you switch; Git stops if they would be overwritten. A tag opens its commit on no branch: create a branch there to commit.
       </p>
     </div>
   );

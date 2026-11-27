@@ -338,6 +338,15 @@ async fn github_publish(
 }
 
 #[tauri::command]
+async fn git_checkout_tag(state: State<'_, AppState>, name: String) -> Result<git::GitStatus, String> {
+    with_root(&state, move |root| {
+        git::checkout_tag(root, &name)?;
+        git::status(root)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn git_branches(state: State<'_, AppState>) -> Result<Vec<git::GitBranch>, String> {
     with_root(&state, |root| git::branches(root)).await
 }
@@ -997,6 +1006,7 @@ pub fn run() {
             git_branches,
             git_create_branch,
             git_switch_branch,
+            git_checkout_tag,
             github_account,
             github_sign_in,
             github_sign_out,

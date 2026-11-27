@@ -78,6 +78,7 @@ import {
   pullBranch,
   pushBranch,
   switchBranch,
+  checkoutTag,
 } from "./lib/git";
 import type { GitBranch as Branch, GitStatus, GitTag } from "./lib/git";
 import { pathPrompt, selectionPrompt } from "./lib/assistantPrompt";
@@ -1970,6 +1971,20 @@ export default function App() {
     [reloadFromDisk],
   );
 
+  const handleCheckoutTag = useCallback(
+    async (tag: GitTag): Promise<string | null> => {
+      try {
+        setGit(await checkoutTag(tag.name));
+        setNotice(`Checked out ${tag.name}. You are not on a branch; create one from here to commit.`);
+        await reloadFromDisk();
+        return null;
+      } catch (cause) {
+        return cause instanceof Error ? cause.message : "Could not check out the tag.";
+      }
+    },
+    [reloadFromDisk],
+  );
+
   const handleCreateBranch = useCallback(async (name: string): Promise<string | null> => {
     try {
       const next = await createBranch(name);
@@ -2735,7 +2750,9 @@ export default function App() {
             <BranchMenu
               current={git.branch}
               load={listBranches}
+              loadTags={readGitTags}
               onSwitch={handleSwitchBranch}
+              onCheckoutTag={handleCheckoutTag}
               onCreate={handleCreateBranch}
               onClose={() => setBranchMenuOpen(false)}
             />
@@ -2774,7 +2791,11 @@ export default function App() {
           />
         )}
 
-        {git?.isRepo && git.hasRemote && (
+        {/* On a tag or a bare commit there is no branch to pull into or push. */}
+        {git?.isRepo &&
+          git.hasRemote &&
+          !git.branch.endsWith(" (detached)") &&
+          !git.branch.startsWith("HEAD ") && (
           <span className="flex items-stretch border-l border-line">
             {git.upstream ? (
               <>

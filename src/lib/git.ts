@@ -534,3 +534,14 @@ export async function switchBranch(name: string, remote: boolean): Promise<GitSt
   demo = { ...demo, branch: local, upstream: remote ? name : demoBranches.find((b) => b.name === local)?.upstream ?? null, ahead: 0, behind: 0 };
   return demoStatus();
 }
+
+/** Checks out a tag's commit (on no branch; create a branch to commit there). */
+export async function checkoutTag(name: string): Promise<GitStatus> {
+  if (isTauri()) {
+    return call("git_checkout_tag", { name });
+  }
+
+  demoBranches = demoBranches.map((branch) => ({ ...branch, current: false }));
+  demo = { ...demo, branch: `${name} (detached)`, upstream: null, ahead: 0, behind: 0 };
+  return demoStatus();
+}
