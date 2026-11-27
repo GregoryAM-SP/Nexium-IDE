@@ -12,6 +12,10 @@
 # Needs the repository secret TAURI_SIGNING_PRIVATE_KEY (and
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD if the key has a password).
 #
+# Each installer type updates from its own kind of file: an MSI install from the
+# .msi, an NSIS install from the .exe, a .deb from the .deb and so on. The app
+# refuses anything else, and the publish job checks latest.json for it.
+#
 # The release is created as a draft, every platform uploads into it, and it is
 # only published once all builds have succeeded — a failed build never leaves a
 # half-filled public release behind. Tags with a pre-release part
@@ -205,7 +209,9 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: --bundles ${{ steps.bundles.outputs.list }}
           includeUpdaterJson: true
-          # The in-app updater on Windows installs the .exe (NSIS) build.
+          # latest.json gets one entry per installer type (windows-x86_64-msi,
+          # linux-x86_64-deb, …). This picks the .exe for the generic
+          # windows-x86_64 entry, used only by copies of unknown install type.
           updaterJsonPreferNsis: true
 
   publish:
@@ -239,6 +245,20 @@ jobs:
             echo "::error::The release stays a draft. Re-run the failed build, or run this workflow by hand for $TAG."
             exit 1
           fi
+
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      # Every installer type must find an update of its own kind, signed with
+      # the signature of that exact file. Otherwise an MSI install would be
+      # handed the .exe, or a .deb install the AppImage, and end up with two
+      # copies of the app.
+      - name: Check latest.json sends each installer its own update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-update-manifest.mjs "$TAG"
 
       - name: Publish the draft
         env:

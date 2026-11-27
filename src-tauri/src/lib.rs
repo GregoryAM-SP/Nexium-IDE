@@ -1,8 +1,11 @@
 mod agent;
 mod git;
+mod gradle;
+mod gradle_settings;
 mod llm;
 mod secrets;
 mod terminal;
+mod web;
 mod workspace;
 
 use std::collections::HashMap;
@@ -17,6 +20,7 @@ struct AppState {
     cancel: Arc<AtomicBool>,
     approvals: Arc<agent::Approvals>,
     terminals: Mutex<HashMap<String, terminal::Session>>,
+    web: web::WebState,
 }
 
 fn current_root(state: &State<'_, AppState>) -> Result<PathBuf, String> {
@@ -53,6 +57,9 @@ async fn open_workspace(
     path: String,
 ) -> Result<workspace::WorkspaceSnapshot, String> {
     let snapshot = blocking(move || workspace::open(&PathBuf::from(&path))).await?;
+
+    // Servers belong to the folder they were started in.
+    web::stop_all(&state.web);
 
     let mut guard = state
         .root
@@ -306,6 +313,124 @@ async fn secret_set_key(provider: String, key: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn gradle_detect(state: State<'_, AppState>) -> Result<gradle::GradleInfo, String> {
+    with_root(&state, |root| Ok(gradle::detect(root))).await
+}
+
+/// Runs Gradle itself, which can take a while when the daemon is cold.
+#[tauri::command]
+async fn gradle_tasks(
+    state: State<'_, AppState>,
+    java_home: Option<String>,
+) -> Result<Vec<gradle::GradleTask>, String> {
+    with_root(&state, move |root| gradle::query_tasks(root, java_home.as_deref())).await
+}
+
+/// Also scans the machine for installed JDKs and Android SDKs.
+#[tauri::command]
+async fn gradle_settings(
+    state: State<'_, AppState>,
+) -> Result<gradle_settings::GradleSettings, String> {
+    with_root(&state, |root| gradle_settings::read(root)).await
+}
+
+/// Writes the changed settings and tells the editor which files moved under it.
+#[tauri::command]
+async fn gradle_settings_apply(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    edits: Vec<gradle_settings::SettingEdit>,
+) -> Result<Vec<String>, String> {
+    use tauri::Emitter;
+
+    let changed = with_root(&state, move |root| gradle_settings::apply(root, &edits)).await?;
+
+    for file in &changed {
+        let _ = app.emit("workspace:file-changed", file.clone());
+    }
+
+    Ok(changed)
+}
+
+/// How this copy was installed, so updates are only ever taken from the
+/// matching installer: an MSI install must never be updated with the NSIS
+/// .exe (it would install a second copy), nor a .deb with the AppImage.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallKind {
+    /// The updater's platform key, e.g. `windows-x86_64`.
+    target: Option<String>,
+    /// `nsis`, `msi`, `appimage`, `deb`, `rpm` or `app`; None for a copy that
+    /// did not come from an installer (a dev or hand-copied build).
+    installer: Option<&'static str>,
+}
+
+#[tauri::command]
+fn install_kind() -> InstallKind {
+    use tauri::utils::config::BundleType;
+
+    // The bundler stamps the bundle type into each installer's binary.
+    let installer = match tauri::utils::platform::bundle_type() {
+        Some(BundleType::Nsis) => Some("nsis"),
+        Some(BundleType::Msi) => Some("msi"),
+        Some(BundleType::AppImage) => Some("appimage"),
+        Some(BundleType::Deb) => Some("deb"),
+        Some(BundleType::Rpm) => Some("rpm"),
+        Some(BundleType::App) => Some("app"),
+        _ => None,
+    };
+
+    InstallKind {
+        target: tauri_plugin_updater::target(),
+        installer,
+    }
+}
+
+#[tauri::command]
+async fn web_detect(state: State<'_, AppState>) -> Result<web::WebInfo, String> {
+    with_root(&state, |root| Ok(web::detect(root))).await
+}
+
+#[tauri::command]
+fn web_status(state: State<'_, AppState>) -> web::WebStatus {
+    web::status(&state.web)
+}
+
+#[tauri::command]
+fn web_start_dev(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    dir: String,
+    script: String,
+) -> Result<web::DevStatus, String> {
+    let root = current_root(&state)?;
+    web::start_dev(&app, &state.web, &root, &dir, &script)
+}
+
+#[tauri::command]
+async fn web_stop_dev(state: State<'_, AppState>) -> Result<(), String> {
+    // Async so the wait on taskkill never runs on the window's main thread.
+    web::stop_dev(&state.web);
+    Ok(())
+}
+
+#[tauri::command]
+fn web_start_live(state: State<'_, AppState>) -> Result<String, String> {
+    let root = current_root(&state)?;
+    web::start_live(&state.web, &root)
+}
+
+#[tauri::command]
+fn web_stop_live(state: State<'_, AppState>) {
+    web::stop_live(&state.web);
+}
+
+#[tauri::command]
+async fn web_open_external(url: String) -> Result<(), String> {
+    blocking(move || web::open_external(&url)).await
+}
+
+#[tauri::command]
 fn terminal_start(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -450,6 +575,7 @@ pub fn run() {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 if let Some(state) = window.try_state::<AppState>() {
                     terminal::kill_all(&state.terminals);
+                    web::stop_all(&state.web);
                 }
             }
         })
@@ -458,6 +584,7 @@ pub fn run() {
             cancel: Arc::new(AtomicBool::new(false)),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             terminals: Mutex::new(HashMap::new()),
+            web: web::WebState::default(),
         })
         .invoke_handler(tauri::generate_handler![
             open_workspace,
@@ -485,6 +612,18 @@ pub fn run() {
             git_delete_tag,
             secret_get_keys,
             secret_set_key,
+            gradle_detect,
+            gradle_tasks,
+            gradle_settings,
+            gradle_settings_apply,
+            install_kind,
+            web_detect,
+            web_status,
+            web_start_dev,
+            web_stop_dev,
+            web_start_live,
+            web_stop_live,
+            web_open_external,
             terminal_start,
             terminal_write,
             terminal_resize,

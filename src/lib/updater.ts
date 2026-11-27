@@ -3,13 +3,16 @@
 // version quietly in the background, and installs it when the window closes —
 // or straight away from "Restart now". Every download is checked against the
 // public key in tauri.conf.json, so only builds signed by the release workflow
-// install.
+// install, and only from the same kind of installer this copy came from (see
+// updateTarget.ts).
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import type { Update } from "@tauri-apps/plugin-updater";
 
-import { isTauri } from "./tauriBridge";
+import { invoke, isTauri } from "./tauriBridge";
+import { updateTargetProblem } from "./updateTarget";
+import type { InstallKind } from "./updateTarget";
 
 export type UpdateState =
   | { phase: "idle" }
@@ -78,6 +81,24 @@ export async function checkForUpdates(): Promise<UpdateState> {
   }
 
   const version = update.version;
+
+  // Checked before a single byte is downloaded: the wrong installer type would
+  // install a second copy instead of updating this one.
+  let problem: string | null;
+
+  try {
+    const kind = await invoke<InstallKind>("install_kind");
+    problem = updateTargetProblem(update.rawJson, version, kind);
+  } catch (cause) {
+    problem = describe(cause, "Could not tell how this copy was installed.");
+  }
+
+  if (problem) {
+    void update.close();
+    set({ phase: "error", message: problem });
+    return state;
+  }
+
   let received = 0;
   let total: number | null = null;
   set({ phase: "downloading", version, received, total });

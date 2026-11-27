@@ -3,6 +3,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  FolderCog,
   GitBranch,
   Info,
   MessageSquare,
@@ -39,6 +40,9 @@ type TitleBarMenuProps = {
   onNewProject: () => void;
   onOpenProject: () => void;
   onRevealExplorer: () => void;
+  /** Project settings need an open folder. */
+  projectSettingsDisabled: boolean;
+  onProjectSettings: () => void;
   onAbout: () => void;
   onCheckUpdates: () => void;
   onUndo: () => void;
@@ -70,6 +74,8 @@ export default function TitleBarMenu({
   onNewProject,
   onOpenProject,
   onRevealExplorer,
+  projectSettingsDisabled,
+  onProjectSettings,
   onAbout,
   onCheckUpdates,
   onUndo,
@@ -120,6 +126,13 @@ export default function TitleBarMenu({
   const fileItems: ContextMenuItem[] = [
     { label: "New Project…", icon: FolderPlus, onSelect: onNewProject },
     { label: "Open Project…", icon: FolderOpen, onSelect: onOpenProject },
+    {
+      label: "Project Settings…",
+      icon: FolderCog,
+      onSelect: onProjectSettings,
+      disabled: projectSettingsDisabled,
+      separatorBefore: true,
+    },
     {
       label: "Reveal in Explorer",
       icon: Folder,

@@ -28,6 +28,8 @@ import DiffView from "./components/DiffView";
 import Explorer from "./components/Explorer";
 import FontPreview from "./components/FontPreview";
 import FontsSettings from "./components/FontsSettings";
+import GradlePanel from "./components/GradlePanel";
+import ProjectSettingsDialog from "./components/ProjectSettingsDialog";
 import ImagePreview from "./components/ImagePreview";
 import MarkdownPreview from "./components/MarkdownPreview";
 import type { MarkdownPreviewHandle } from "./components/MarkdownPreview";
@@ -38,6 +40,7 @@ import ProvidersSettings from "./components/ProvidersSettings";
 import SourceControlSettings from "./components/SourceControlSettings";
 import SvgPreview from "./components/SvgPreview";
 import TerminalPanel from "./components/TerminalPanel";
+import WebPreviewPanel from "./components/WebPreviewPanel";
 import TitleBarMenu from "./components/TitleBarMenu";
 import WindowControls from "./components/WindowControls";
 import type { AssistantSettings, ModelRef } from "./lib/assistantSettings";
@@ -76,6 +79,17 @@ import type {
   AssistantMessage,
   MessageBlock,
 } from "./lib/assistantMessages";
+import {
+  detectGradle,
+  gradleCommand,
+  isGradleScript,
+  queryGradleTasks,
+} from "./lib/gradle";
+import type { GradleInfo, GradleProject, GradleTask } from "./lib/gradle";
+import { loadGradleJvm, saveGradleJvm } from "./lib/gradleSettings";
+import { useWebPreview } from "./lib/useWebPreview";
+import { affectsWebDetection, installCommand } from "./lib/web";
+import type { WebApp } from "./lib/web";
 import { setInlineCompletionModel } from "./lib/inlineCompletion";
 import { languageForPath } from "./lib/languages";
 import { isFontPath, isImagePath } from "./lib/media";
@@ -132,6 +146,57 @@ const AUTO_APPROVE_KEY = "nexium.assistant.autoApprove";
 /** The Rust client reports a dead connection when a provider stays silent. */
 function stalled(message: string): boolean {
   return /no data for \d+s|stopped responding \(no data/i.test(message);
+}
+
+/**
+ * Folds the task list Gradle reported into the statically detected projects.
+ * Gradle is authoritative for which tasks exist; the detected kind is kept
+ * where Gradle only files a task under "other".
+ */
+function mergeGradleTasks(
+  info: GradleInfo,
+  reported: GradleTask[],
+): GradleInfo {
+  const projects = new Map<string, GradleProject>(
+    info.projects.map((project) => [
+      project.path,
+      { ...project, tasks: project.tasks.map((task) => ({ ...task })) },
+    ]),
+  );
+
+  for (const task of reported) {
+    const cut = task.path.lastIndexOf(":");
+    const projectPath =
+      cut <= 0 ? ":" : `:${task.path.slice(0, cut).replace(/^:/, "")}`;
+    let project = projects.get(projectPath);
+
+    if (!project) {
+      project = {
+        path: projectPath,
+        name: projectPath.split(":").pop() || projectPath,
+        dir: projectPath.slice(1).replace(/:/g, "/"),
+        buildFile: null,
+        plugins: [],
+        tasks: [],
+      };
+      projects.set(projectPath, project);
+    }
+
+    const existing = project.tasks.find((known) => known.name === task.name);
+
+    if (existing) {
+      if (task.kind !== "other") {
+        existing.kind = task.kind;
+      }
+      if (task.description) {
+        existing.description = task.description;
+      }
+    } else {
+      project.tasks.push(task);
+    }
+  }
+
+  return { ...info, projects: [...projects.values()] };
 }
 
 function speedHint(id: string): number {
@@ -193,6 +258,27 @@ export default function App() {
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [terminalUsed, setTerminalUsed] = useState(false);
   const [assistantOpen, setAssistantOpen] = useState(true);
+  // The Gradle panel shares the right-hand slot with the assistant.
+  // Gradle and the website preview share the right-hand slot with the
+  // assistant; at most one of the three is open.
+  const [sidePanel, setSidePanel] = useState<"gradle" | "preview" | null>(
+    null,
+  );
+  const gradleOpen = sidePanel === "gradle" && !assistantOpen;
+  const previewPanelOpen = sidePanel === "preview" && !assistantOpen;
+  const [gradle, setGradle] = useState<GradleInfo | null>(null);
+  const [gradleBusy, setGradleBusy] = useState(false);
+  const [gradleQuerying, setGradleQuerying] = useState(false);
+  const [gradleQueried, setGradleQueried] = useState(false);
+  const [gradleError, setGradleError] = useState<string | null>(null);
+  const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
+  // The JDK that runs Gradle, chosen per project folder on this machine.
+  const [gradleJvm, setGradleJvm] = useState("");
+  // The next line for the terminal to type, e.g. a Gradle task to run.
+  const [terminalCommand, setTerminalCommand] = useState<{
+    id: number;
+    text: string;
+  } | null>(null);
   const [assistantFull, setAssistantFull] = useState(false);
   const [assistantMessages, setAssistantMessages] = useState<
     AssistantMessage[]
@@ -580,6 +666,149 @@ export default function App() {
   const refreshGitRef = useRef(refreshGit);
   refreshGitRef.current = refreshGit;
 
+  const hasTree = tree !== null;
+
+  /** Re-reads the build scripts; a full Gradle listing has to be redone. */
+  const refreshGradle = useCallback(async () => {
+    if (!hasTree || (isTauri() && !rootPath)) {
+      setGradle(null);
+      return;
+    }
+
+    setGradleBusy(true);
+
+    try {
+      setGradle(await detectGradle());
+      setGradleQueried(false);
+      setGradleError(null);
+    } catch (cause) {
+      setGradle(null);
+      setGradleError(
+        toError(cause, "The Gradle build could not be read.").message,
+      );
+    } finally {
+      setGradleBusy(false);
+    }
+  }, [hasTree, rootPath]);
+
+  const refreshGradleRef = useRef(refreshGradle);
+  refreshGradleRef.current = refreshGradle;
+
+  // Every opened folder gets a fresh look at its build.
+  useEffect(() => {
+    void refreshGradle();
+  }, [refreshGradle, workspaceKey]);
+
+  useEffect(() => {
+    setGradleJvm(rootPath ? loadGradleJvm(rootPath) : "");
+  }, [rootPath]);
+
+  // A folder that is not a Gradle build has nothing to show in the panel.
+  useEffect(() => {
+    if (!gradle?.detected) {
+      setSidePanel((current) => (current === "gradle" ? null : current));
+    }
+  }, [gradle]);
+
+  // Opening the assistant hands it the right-hand slot.
+  useEffect(() => {
+    if (assistantOpen) {
+      setSidePanel(null);
+    }
+  }, [assistantOpen]);
+
+  const web = useWebPreview(
+    tree !== null && (!isTauri() || rootPath !== ""),
+    workspaceKey,
+  );
+  const refreshWebRef = useRef(web.refresh);
+  refreshWebRef.current = web.refresh;
+
+  // New, renamed or deleted pages and package.json files change what can be
+  // previewed; the listing is cheap, so any change to the tree re-checks it.
+  useEffect(() => {
+    if (tree) {
+      void refreshWebRef.current();
+    }
+  }, [tree]);
+
+  useEffect(() => {
+    if (web.info && !web.info.detected) {
+      setSidePanel((current) => (current === "preview" ? null : current));
+    }
+  }, [web.info]);
+
+  const toggleSidePanel = useCallback(
+    (panel: "gradle" | "preview") => {
+      if (sidePanel === panel && !assistantOpen) {
+        setSidePanel(null);
+        return;
+      }
+
+      setAssistantOpen(false);
+      setSidePanel(panel);
+    },
+    [sidePanel, assistantOpen],
+  );
+
+  const handleInstallWeb = useCallback((app: WebApp) => {
+    setTerminalCommand({
+      id: nextCommandId.current++,
+      text: installCommand(app, navigator.userAgent.includes("Windows")),
+    });
+    setView("editor");
+    setTerminalUsed(true);
+    setTerminalOpen(true);
+  }, []);
+
+  const handleQueryGradle = useCallback(async () => {
+    setGradleQuerying(true);
+
+    try {
+      const reported = await queryGradleTasks(gradleJvm);
+      setGradle((current) =>
+        current ? mergeGradleTasks(current, reported) : current,
+      );
+      setGradleQueried(true);
+      setGradleError(null);
+    } catch (cause) {
+      setGradleError(
+        toError(cause, "Gradle could not list the tasks.").message,
+      );
+    } finally {
+      setGradleQuerying(false);
+    }
+  }, [gradleJvm]);
+
+  const nextCommandId = useRef(1);
+  const handleRunGradleTask = useCallback(
+    (task: GradleTask) => {
+      if (!gradle) {
+        return;
+      }
+
+      if (!isTauri()) {
+        setNotice("Running Gradle tasks needs the desktop app.");
+        return;
+      }
+
+      // The terminal starts on first use and types the line once it is up.
+      setTerminalCommand({
+        id: nextCommandId.current++,
+        text: gradleCommand(gradle, task, gradleJvm),
+      });
+      setView("editor");
+      setTerminalUsed(true);
+      setTerminalOpen(true);
+      setNotice(`Running ${task.path} in the terminal.`);
+    },
+    [gradle, gradleJvm],
+  );
+
+  const handleCommandSent = useCallback((id: number) => {
+    setTerminalCommand((current) => (current?.id === id ? null : current));
+  }, []);
+
   const handleOpenDiff = useCallback(async (path: string, staged: boolean) => {
     try {
       const fileDiff = await readGitFileDiff(path, staged);
@@ -662,6 +891,14 @@ export default function App() {
 
       if (scmOpen) {
         refreshGitRef.current();
+      }
+
+      if (isGradleScript(activePath)) {
+        void refreshGradleRef.current();
+      }
+
+      if (affectsWebDetection(activePath)) {
+        void refreshWebRef.current();
       }
     } catch (cause) {
       setNotice(cause instanceof Error ? cause.message : "Could not save.");
@@ -1140,6 +1377,14 @@ export default function App() {
       // A written file is a source-control change as well.
       refreshGitRef.current();
 
+      if (isGradleScript(path)) {
+        void refreshGradleRef.current();
+      }
+
+      if (affectsWebDetection(path)) {
+        void refreshWebRef.current();
+      }
+
       if (contentsRef.current[path] === undefined) {
         return;
       }
@@ -1347,6 +1592,8 @@ export default function App() {
               setScmOpen(false);
               setExplorerOpen(true);
             }}
+            projectSettingsDisabled={!tree}
+            onProjectSettings={() => setProjectSettingsOpen(true)}
             onAbout={() => setAboutOpen(true)}
             onCheckUpdates={() => void handleCheckUpdates()}
             onUndo={() => editorRef.current?.runAction("undo")}
@@ -1714,6 +1961,8 @@ export default function App() {
               key={workspaceKey}
               active={terminalOpen && view !== "settings"}
               themeId={themeId}
+              command={terminalCommand}
+              onCommandSent={handleCommandSent}
               onHide={() => setTerminalOpen(false)}
             />
           )}
@@ -1746,10 +1995,49 @@ export default function App() {
               />
             )}
 
+        {gradleOpen && view !== "settings" && (
+          <GradlePanel
+            info={gradle}
+            busy={gradleBusy}
+            querying={gradleQuerying}
+            queried={gradleQueried}
+            error={gradleError}
+            onRefresh={() => void refreshGradle()}
+            onQueryAll={() => void handleQueryGradle()}
+            onRun={handleRunGradleTask}
+            onOpenFile={(path) => void handleSelect(path)}
+            onHide={() => setSidePanel(null)}
+          />
+        )}
+
+        {previewPanelOpen && view !== "settings" && (
+          <WebPreviewPanel
+            preview={web}
+            activePath={activePath}
+            onInstall={handleInstallWeb}
+            onHide={() => setSidePanel(null)}
+          />
+        )}
+
         {view !== "settings" && (
           <AssistantRail
             assistantOpen={assistantOpen}
             onToggleAssistant={() => setAssistantOpen((open) => !open)}
+            gradleAvailable={Boolean(gradle?.detected)}
+            gradleOpen={gradleOpen}
+            gradleRunnable={
+              gradle?.projects.reduce(
+                (count, project) =>
+                  count +
+                  project.tasks.filter((task) => task.kind === "run").length,
+                0,
+              ) ?? 0
+            }
+            onToggleGradle={() => toggleSidePanel("gradle")}
+            previewAvailable={Boolean(web.info?.detected)}
+            previewOpen={previewPanelOpen}
+            previewRunning={web.dev !== null || web.live !== null}
+            onTogglePreview={() => toggleSidePanel("preview")}
           />
         )}
           </>
@@ -1872,6 +2160,25 @@ export default function App() {
       )}
 
       {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
+
+      {projectSettingsOpen && tree && (
+        <ProjectSettingsDialog
+          projectName={tree.name}
+          gradleDetected={Boolean(gradle?.detected)}
+          gradleJvm={gradleJvm}
+          onSaved={(changed, jvm) => {
+            saveGradleJvm(rootPath, jvm);
+            setGradleJvm(jvm);
+            void refreshGradle();
+            setNotice(
+              changed.length > 0
+                ? `Project settings saved to ${changed.join(", ")}.`
+                : "Gradle JDK saved for this machine.",
+            );
+          }}
+          onClose={() => setProjectSettingsOpen(false)}
+        />
+      )}
 
       {deleteTarget && (
         <ConfirmDialog

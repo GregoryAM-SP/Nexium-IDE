@@ -20,6 +20,12 @@ type TerminalPanelProps = {
   active: boolean;
   /** Re-themes the buffer when the app's theme changes. */
   themeId: string;
+  /**
+   * A line to type into the shell, e.g. a Gradle task. It is sent once the
+   * shell is ready, and `onCommandSent` is called with its id afterwards.
+   */
+  command?: { id: number; text: string } | null;
+  onCommandSent?: (id: number) => void;
   onHide: () => void;
 };
 
@@ -58,6 +64,8 @@ function terminalTheme() {
 export default function TerminalPanel({
   active,
   themeId,
+  command = null,
+  onCommandSent,
   onHide,
 }: TerminalPanelProps) {
   const host = useRef<HTMLDivElement>(null);
@@ -65,6 +73,11 @@ export default function TerminalPanel({
   const fit = useRef<FitAddon | null>(null);
   const [shell, setShell] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Set once the shell has started, so queued commands know where to go.
+  const [session, setSession] = useState<string | null>(null);
+  const sentCommand = useRef(0);
+  const onCommandSentRef = useRef(onCommandSent);
+  onCommandSentRef.current = onCommandSent;
 
   // The shell starts once, when the panel is first opened, and then belongs to
   // the panel for as long as it stays mounted: hiding it keeps scrollback.
@@ -170,6 +183,7 @@ export default function TerminalPanel({
         }
 
         setShell(name);
+        setSession(id);
         instance.focus();
       } catch (cause) {
         if (!disposed) {
@@ -199,6 +213,29 @@ export default function TerminalPanel({
       terminal.current.options.theme = terminalTheme();
     }
   }, [themeId]);
+
+  // Each command is typed exactly once, however often the panel re-renders.
+  useEffect(() => {
+    if (!session || !command || sentCommand.current === command.id) {
+      return;
+    }
+
+    sentCommand.current = command.id;
+    const { id, text } = command;
+
+    void writeTerminal(session, `${text}`)
+      .then(() => {
+        terminal.current?.focus();
+        onCommandSentRef.current?.(id);
+      })
+      .catch((cause) => {
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "The command could not be sent to the terminal.",
+        );
+      });
+  }, [session, command]);
 
   // A hidden panel has no dimensions, so the grid is fitted when it comes back.
   useEffect(() => {
