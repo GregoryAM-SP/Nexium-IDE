@@ -1,14 +1,16 @@
-import { LoaderCircle } from "lucide-react";
+import { Check, CloudUpload, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import {
   NEXIUM_CO_AUTHOR,
   creditsNexium,
+  defaultCommitAction,
+  setDefaultCommitAction,
   readGitIdentity,
   saveGitIdentity,
   setCreditsNexium,
 } from "../lib/git";
-import type { GitIdentity } from "../lib/git";
+import type { CommitAction, GitIdentity } from "../lib/git";
 import { toError } from "../lib/tauriBridge";
 
 export default function SourceControlSettings() {
@@ -19,6 +21,8 @@ export default function SourceControlSettings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [credit, setCredit] = useState(creditsNexium);
+  const [commitAction, setCommitAction] =
+    useState<CommitAction>(defaultCommitAction);
 
   useEffect(() => {
     let active = true;
@@ -144,6 +148,73 @@ export default function SourceControlSettings() {
             {error && (
               <span className="text-[11px] text-red-300/70">{error}</span>
             )}
+          </div>
+        </section>
+
+        <section className="mt-4 rounded-2xl border border-line bg-ink/[0.015] p-6">
+          <h2 className="text-[12.5px] font-semibold text-ink/80">
+            Default commit action
+          </h2>
+          <p className="mt-1 max-w-[52ch] text-[10.5px] leading-relaxed text-ink/30">
+            What the Commit button and Ctrl+Enter do in the Source Control
+            panel. The arrow beside the button still offers both.
+          </p>
+          <div
+            role="radiogroup"
+            aria-label="Default commit action"
+            className="mt-4 grid gap-2 sm:grid-cols-2"
+          >
+            {(
+              [
+                {
+                  id: "commit",
+                  title: "Commit",
+                  icon: Check,
+                  body: "Records the commit on this machine only. Push later with Commit & Sync.",
+                },
+                {
+                  id: "sync",
+                  title: "Commit & Sync",
+                  icon: CloudUpload,
+                  body: "Commits, then pushes the branch to origin (setting origin as its upstream if needed). Nothing is pulled.",
+                },
+              ] as const
+            ).map((option) => {
+              const selected = commitAction === option.id;
+              const Icon = option.icon;
+
+              return (
+                <label
+                  key={option.id}
+                  className={`flex cursor-pointer items-start gap-3 rounded-xl border px-3.5 py-3 transition-colors duration-150 focus-within:border-ink/40 ${
+                    selected
+                      ? "border-ink/30 bg-ink/[0.06]"
+                      : "border-ink/[0.08] hover:border-ink/20 hover:bg-ink/[0.03]"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="default-commit-action"
+                    value={option.id}
+                    checked={selected}
+                    onChange={() => {
+                      setCommitAction(option.id);
+                      setDefaultCommitAction(option.id);
+                    }}
+                    className="mt-0.5 size-3.5 shrink-0 accent-ink"
+                  />
+                  <span className="min-w-0">
+                    <span className="flex items-center gap-1.5 text-[12px] font-medium text-ink/85">
+                      <Icon className="size-3.5" strokeWidth={2} />
+                      {option.title}
+                    </span>
+                    <span className="mt-1 block text-[10.5px] leading-relaxed text-ink/40">
+                      {option.body}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
           </div>
         </section>
 

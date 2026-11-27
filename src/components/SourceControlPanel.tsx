@@ -12,10 +12,11 @@ import {
   RotateCw,
   Sparkles,
 } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import type { GitChange, GitStatus, GitTag } from "../lib/git";
+import { DEFAULT_COMMIT_EVENT, defaultCommitAction } from "../lib/git";
+import type { CommitAction, GitChange, GitStatus, GitTag } from "../lib/git";
 import ExplorerContextMenu from "./ExplorerContextMenu";
 import TagsSection from "./TagsSection";
 
@@ -285,6 +286,15 @@ export default function SourceControlPanel({
     null,
   );
   const commitGroup = useRef<HTMLSpanElement>(null);
+  // The button's main action is a setting (Settings → Source control).
+  const [defaultAction, setDefaultAction] =
+    useState<CommitAction>(defaultCommitAction);
+  useEffect(() => {
+    const follow = () => setDefaultAction(defaultCommitAction());
+    window.addEventListener(DEFAULT_COMMIT_EVENT, follow);
+    return () => window.removeEventListener(DEFAULT_COMMIT_EVENT, follow);
+  }, []);
+  const syncByDefault = defaultAction === "sync";
 
   const staged = status?.changes.filter((change) => change.staged) ?? [];
   const unstaged = status?.changes.filter((change) => !change.staged) ?? [];
@@ -463,7 +473,7 @@ export default function SourceControlPanel({
                 onKeyDown={(event) => {
                   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
                     event.preventDefault();
-                    void commit();
+                    void commit(syncByDefault);
                   }
                 }}
                 placeholder={
@@ -492,12 +502,17 @@ export default function SourceControlPanel({
                 >
                   <button
                     type="button"
-                    onClick={() => void commit()}
+                    onClick={() => void commit(syncByDefault)}
                     disabled={!canCommit}
+                    title={`${syncByDefault ? "Commit and push" : "Commit"} (Ctrl+Enter) · change the default in Settings → Source control`}
                     className="flex h-6 items-center gap-1 rounded-l-md bg-ink px-2.5 text-[11px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/[0.07] disabled:text-ink/25"
                   >
-                    <Check className="size-3" strokeWidth={2.4} />
-                    Commit
+                    {syncByDefault ? (
+                      <CloudUpload className="size-3" strokeWidth={2.4} />
+                    ) : (
+                      <Check className="size-3" strokeWidth={2.4} />
+                    )}
+                    {syncByDefault ? "Commit & Sync" : "Commit"}
                   </button>
                   <button
                     type="button"

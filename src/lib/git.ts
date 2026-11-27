@@ -240,6 +240,31 @@ export function withNexiumCredit(message: string): string {
   return endsWithTrailers ? `${text}\n${trailer}` : `${text}\n\n${trailer}`;
 }
 
+/** What the commit button (and Ctrl+Enter) does: commit, or commit and push. */
+export type CommitAction = "commit" | "sync";
+
+const DEFAULT_COMMIT_KEY = "nexium.git.defaultCommit";
+/** Fired on `window` when the default changes, so an open panel follows. */
+export const DEFAULT_COMMIT_EVENT = "nexium:default-commit";
+
+export function defaultCommitAction(): CommitAction {
+  try {
+    return localStorage.getItem(DEFAULT_COMMIT_KEY) === "sync" ? "sync" : "commit";
+  } catch {
+    return "commit";
+  }
+}
+
+export function setDefaultCommitAction(action: CommitAction): void {
+  try {
+    localStorage.setItem(DEFAULT_COMMIT_KEY, action);
+  } catch {
+    // Without storage the choice lasts until the window reloads.
+  }
+
+  window.dispatchEvent(new CustomEvent(DEFAULT_COMMIT_EVENT, { detail: action }));
+}
+
 function creditedMessage(message: string): string {
   return creditsNexium() ? withNexiumCredit(message) : message;
 }
