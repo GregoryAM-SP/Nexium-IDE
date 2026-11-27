@@ -1493,6 +1493,8 @@ pub async fn run(
     let mut prepared = tool_schema();
     // Text of a reply that was cut off and is being continued.
     let mut answer_so_far = String::new();
+    // Its thinking, kept too: some models put the whole answer there.
+    let mut reasoning_so_far = String::new();
     let mut continuations = 0usize;
     let mut nudges = 0usize;
     let mut turns_without_progress = 0usize;
@@ -1609,6 +1611,7 @@ pub async fn run(
             if turn.cut_off() && continuations < MAX_CONTINUATIONS {
                 continuations += 1;
                 answer_so_far.push_str(&turn.content);
+                reasoning_so_far.push_str(&turn.reasoning);
                 conversation.push(json!({ "role": "assistant", "content": turn.content }));
                 conversation.push(json!({ "role": "user", "content": continuation_prompt(&turn) }));
                 continue;
@@ -1621,6 +1624,7 @@ pub async fn run(
             {
                 nudges += 1;
                 answer_so_far.clear();
+                reasoning_so_far.clear();
                 conversation.push(json!({ "role": "assistant", "content": turn.content }));
                 conversation.push(json!({ "role": "user", "content": objectives_nudge(&objectives) }));
 
@@ -1641,6 +1645,7 @@ pub async fn run(
             if tools_enabled && unchecked_code && !verify_asked {
                 verify_asked = true;
                 answer_so_far.clear();
+                reasoning_so_far.clear();
                 conversation.push(json!({ "role": "assistant", "content": turn.content }));
                 conversation.push(json!({ "role": "user", "content": VERIFY_PROMPT }));
 
@@ -1658,8 +1663,9 @@ pub async fn run(
             }
 
             let content = format!("{answer_so_far}{}", turn.content).trim().to_string();
-            let text = if content.is_empty() && !turn.reasoning.trim().is_empty() {
-                turn.reasoning.trim().to_string()
+            let reasoning = format!("{reasoning_so_far}{}", turn.reasoning).trim().to_string();
+            let text = if content.is_empty() && !reasoning.is_empty() {
+                reasoning.clone()
             } else if content.is_empty() {
                 "The model returned an empty reply.".to_string()
             } else {
@@ -1668,11 +1674,7 @@ pub async fn run(
 
             return Ok(AgentReply {
                 text,
-                reasoning: if turn.reasoning.trim().is_empty() {
-                    None
-                } else {
-                    Some(turn.reasoning.trim().to_string())
-                },
+                reasoning: (!reasoning.is_empty()).then_some(reasoning),
                 steps,
                 tools_enabled,
                 out_of_steps: false,
@@ -1681,6 +1683,7 @@ pub async fn run(
 
         // Text before these calls was narration, not the answer.
         answer_so_far.clear();
+        reasoning_so_far.clear();
         continuations = 0;
 
         let calls: Value = turn

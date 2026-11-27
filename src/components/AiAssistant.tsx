@@ -874,7 +874,13 @@ function groupBlocks(blocks: MessageBlock[]): Group[] {
         groups.push({ type: "steps", steps: [block.step] });
       }
     } else if (block.text.trim().length > 0) {
-      groups.push({ type: block.type, text: block.text });
+      // Neighbouring text (or thinking) is one stream, even in messages saved
+      // before streams were joined: never show it as two blocks.
+      if (last && last.type === block.type) {
+        last.text += block.text;
+      } else {
+        groups.push({ type: block.type, text: block.text });
+      }
     }
   }
 

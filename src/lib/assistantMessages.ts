@@ -22,7 +22,14 @@ export type AssistantMessage = {
   outOfSteps?: boolean;
 };
 
-/** Streamed text joins the block before it when that block is the same kind. */
+/**
+ * Streamed text joins the block before it when that block is the same kind.
+ * A whitespace-only piece of the other kind (some providers send a stray
+ * "
+
+" of answer in the middle of thinking) joins the current block instead
+ * of starting a new one, so one reply never splits into several.
+ */
 export function appendDelta(
   blocks: MessageBlock[],
   delta: AgentDelta,
@@ -30,12 +37,39 @@ export function appendDelta(
   const type = delta.kind === "reasoning" ? "reasoning" : "text";
   const last = blocks[blocks.length - 1];
 
-  if (last && last.type === type) {
-    return [...blocks.slice(0, -1), { type, text: last.text + delta.text }];
+  if (last && last.type !== "step" && (last.type === type || delta.text.trim() === "")) {
+    return [...blocks.slice(0, -1), { type: last.type, text: last.text + delta.text }];
   }
 
   return [...blocks, { type, text: delta.text }];
 }
+
+/**
+ * Drops whitespace-only text and thinking, then joins neighbours of the same
+ * kind: what was one stream reads as one block, also for messages saved
+ * before streaming was joined this way.
+ */
+export function mergeBlocks(blocks: MessageBlock[]): MessageBlock[] {
+  const merged: MessageBlock[] = [];
+
+  for (const block of blocks) {
+    if (block.type !== "step" && block.text.trim() === "") {
+      continue;
+    }
+
+    const last = merged[merged.length - 1];
+
+    if (block.type !== "step" && last && last.type === block.type) {
+      merged[merged.length - 1] = { type: block.type, text: last.text + block.text };
+    } else {
+      merged.push(block);
+    }
+  }
+
+  return merged;
+}
+
+const squash = (text: string) => text.replace(/\s+/g, " ").trim();
 
 /** A step event either updates the step it belongs to or starts a new one. */
 export function upsertStep(
@@ -72,21 +106,25 @@ export function finishBlocks(
     blocks = upsertStep(blocks, step);
   }
 
+  blocks = mergeBlocks(blocks);
+
   if (hasText(blocks)) {
     return blocks;
   }
 
   // Some models put the whole answer in the reasoning channel; the reply
-  // already promotes it to text, so drop the duplicate thinking block.
+  // already promotes it to text, so drop the thinking that repeats it (in
+  // whole or in pieces) and show it once, as the answer.
+  const answer = squash(reply.text);
   const withoutEcho = blocks.filter(
     (block) =>
-      !(block.type === "reasoning" && block.text.trim() === reply.text.trim()),
+      !(block.type === "reasoning" && answer.includes(squash(block.text))),
   );
 
   return [
     ...withoutEcho,
     ...(reply.reasoning &&
-    reply.reasoning.trim() !== reply.text.trim() &&
+    !answer.includes(squash(reply.reasoning)) &&
     !withoutEcho.some((block) => block.type === "reasoning")
       ? [{ type: "reasoning" as const, text: reply.reasoning }]
       : []),
