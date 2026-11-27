@@ -43,15 +43,31 @@ export type AgentStep = {
   tool?: string;
   /** The workspace file the step is about. */
   path?: string;
+  /** The checklist, on a step of kind "objectives" (one per run, kept current). */
+  objectives?: Objective[];
 };
 
-/** A file change the agent proposes; nothing is written until it is accepted. */
+/** One goal on the checklist the agent keeps for a multi-step task. */
+export type Objective = {
+  title: string;
+  status: "pending" | "in_progress" | "done";
+};
+
+/**
+ * A file change (shown as a diff) or a command the agent proposes; nothing is
+ * written or run until it is accepted.
+ */
 export type ApprovalRequest = {
+  kind?: "change" | "command";
   stepId: number;
   path: string;
   before: string;
   after: string;
   created: boolean;
+  /** The command line, for kind "command". */
+  command?: string;
+  /** The session whose run asked. */
+  session?: string;
 };
 
 export type AgentDelta = {
@@ -372,12 +388,17 @@ export async function chat(
 /**
  * Runs the tool-calling loop in Rust (files are read and written there) and
  * forwards each step as it happens. The browser build has no filesystem, so it
- * falls back to a plain completion.
+ * falls back to a plain completion. Note: browser mode does not support
+ * streaming deltas or tool calls - it returns the full response at once.
  */
 export async function runAgent(
   target: ModelTarget,
   messages: ChatMessage[],
   autoApprove = false,
+  /** The model's context window in tokens; old tool output is trimmed to fit. */
+  contextWindow?: number,
+  /** The session the run belongs to; its events carry this id. */
+  sessionId?: string,
 ): Promise<AgentReply> {
   if (isTauri()) {
     try {
@@ -386,12 +407,16 @@ export async function runAgent(
         model: target.model,
         messages,
         autoApprove,
+        contextWindow: contextWindow ?? null,
+        sessionId: sessionId ?? null,
       });
     } catch (cause) {
       throw toError(cause, "The assistant request failed.");
     }
   }
 
+  // Browser fallback: single completion without tools or streaming.
+  // The caller should treat this as a complete response with no intermediate steps.
   const text = await chat(target, messages);
 
   return { text, reasoning: null, steps: [], tools_enabled: false };
@@ -399,6 +424,7 @@ export async function runAgent(
 
 /** Accepts or rejects a change the running agent proposed. */
 export async function decideChange(
+  sessionId: string,
   stepId: number,
   accept: boolean,
 ): Promise<void> {
@@ -407,20 +433,21 @@ export async function decideChange(
   }
 
   try {
-    await invoke<void>("agent_decide", { stepId, accept });
+    await invoke<void>("agent_decide", { sessionId, stepId, accept });
   } catch (cause) {
     throw toError(cause, "The decision could not be sent.");
   }
 }
 
 /** Asks the running agent loop to stop; it returns "Stopped.". */
-export async function cancelAgent(): Promise<void> {
+/** Stops one session's run (or every run, without an id). */
+export async function cancelAgent(sessionId?: string): Promise<void> {
   if (!isTauri()) {
     return;
   }
 
   try {
-    await invoke<void>("ai_cancel");
+    await invoke<void>("ai_cancel", { sessionId: sessionId ?? null });
   } catch {
     // Nothing to report: the run is already finishing or finished.
   }

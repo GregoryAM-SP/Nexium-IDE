@@ -75,11 +75,13 @@ fn first_existing(dir: &Path, names: &[&str]) -> Option<String> {
 }
 
 /// Drops `//` line comments and `/* */` blocks so commented-out plugins and
-/// includes are not detected. String contents are left alone.
+/// includes are not detected. String contents are left alone. Handles nested
+/// block comments: `/* outer /* inner */ outer */`.
 fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut chars = source.chars().peekable();
     let mut quote: Option<char> = None;
+    let mut comment_depth = 0;
 
     while let Some(ch) = chars.next() {
         if let Some(open) = quote {
@@ -93,6 +95,19 @@ fn strip_comments(source: &str) -> String {
                 quote = None;
             }
 
+            continue;
+        }
+
+        if comment_depth > 0 {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                comment_depth -= 1;
+            } else if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                comment_depth += 1;
+            } else if ch == '\n' {
+                out.push('\n');
+            }
             continue;
         }
 
@@ -111,17 +126,7 @@ fn strip_comments(source: &str) -> String {
             }
             '/' if chars.peek() == Some(&'*') => {
                 chars.next();
-                let mut previous = '\0';
-
-                for next in chars.by_ref() {
-                    if previous == '*' && next == '/' {
-                        break;
-                    }
-                    if next == '\n' {
-                        out.push('\n');
-                    }
-                    previous = next;
-                }
+                comment_depth = 1;
             }
             _ => out.push(ch),
         }

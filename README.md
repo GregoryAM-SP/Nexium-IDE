@@ -60,7 +60,17 @@ The interface is built from three values per theme — a page colour, an ink and
 - **Tool calling on your real files**: `list_files`, `read_file`, `search_text`, `edit_file` (replaces one exact, unique piece of text, and matches LF text against CRLF files) and `write_file` (new files or full rewrites). Each call appears as a step with its own icon and a clickable file path. Accepted writes are saved to disk and pushed to the open editor through the `workspace:file-changed` event.
 - **Review before writing**: every edit the assistant proposes appears in the chat as a compact diff with **Accept** and **Reject** (and a button to open it in the full diff view). Nothing reaches the disk until you accept it. A rejected edit is reported back to the model, which is told not to repeat it. The composer's **Review edits / Auto-apply edits** toggle (remembered in `localStorage`) skips the review when you trust the run.
 - **One timeline per turn**: text, thinking and tool steps appear in the order they happened, and consecutive steps are grouped. Earlier turns go back to the model with a short note of the files they read or changed, so it does not start from scratch each turn. The open file is added to the assistant's single system prompt instead of being sent as a second one.
-- **Message actions**: Retry re-asks the last question in place of the failed or unwanted answer, Copy copies an answer as Markdown, and code blocks have **Copy** and **Insert** (at the editor cursor, as one undoable edit). **New chat** clears the conversation. A run that uses all 25 tool steps offers **Continue**.
+- **Message actions**: Retry re-asks the last question in place of the failed or unwanted answer, Copy copies an answer as Markdown, and code blocks have **Copy** and **Insert** (at the editor cursor, as one undoable edit). **New session** (the pen icon) starts a fresh conversation; the previous one is saved and keeps running if it was working. A run that ends with work left (see **Runs to completion**) offers **Continue**.
+- **Objectives**: for a request that needs more than one change or touches several files, the assistant first writes a short checklist of objectives (2–6 items) and ticks them off as it works. The **Objectives** card closes the turn, below its text, with an `n/m` count and a progress bar. It shows one objective at a time: the one being worked on (spinning while the run works), else the next one, or "All n objectives done". Click it to list every objective as pending, in progress or done, and click again to go back to one. While the run works the card stays in view at the bottom of the chat. Questions and single small edits get no checklist. The list goes back to the model with the turn, so **Continue** or "keep going" picks up the unfinished items.
+- **Sessions**: every conversation is a session, saved in a SQLite database (see [Where data lives](#where-data-lives)) per project folder, so it is still there after a restart; opening a folder reopens its latest session. The session name in the assistant's header opens the list of the project's sessions: switch between them, **rename**, **archive** (hidden until **Show archived**, and reversible) or **delete** (asks first; removes the session and its messages for good). A session's name comes from its first message.
+- **Sessions working side by side**: several sessions can run at the same time, each with its own Stop, approvals and progress; the header shows how many others are working. They coordinate so one does not undo or refactor another's work:
+  - A file a session edits is **locked** to it while it runs. Another session that tries to edit it is told who holds it and works around it (other files first, or a note asking for what it needs); the lock is released when the run ends.
+  - Each session starts with a picture of the others: what they are working on (their open objectives), which files they hold, and their recent changes and notes. While it works, changes and notes from the others arrive with its tool results, with a warning when they touched a file it had read.
+  - A whole-file rewrite is refused if the file changed since the session read it (or it never read it), so a stale copy can never overwrite someone else's change.
+  - `session_status` lets the model check on the others at any time, and `message_sessions` leaves them a note (for example "renamed `login()` to `signIn()`").
+- **Commands**: the assistant can run the project's tests, type-check, build or lint with `run_command` to check its own work. Each command is shown for **Run** / **Reject** like an edit (or runs straight away with Auto-approve), in the project folder, non-interactive (`CI=1`, no input), and is stopped after 120 s by default (600 s at most) or when you press Stop, along with anything it started. The output (its start and, mostly, its end) and exit code go back to the model.
+- **Works like an engineer**: the system prompt sets a workflow (understand the code first, plan with objectives, make focused changes in the project's own style, verify with the project's checks, then summarise what changed and how it was checked). If a run changed code but never ran anything, it is asked once to check its work before it finishes. `read_file` can read a line range of a long file.
+- **Runs to completion**: a run keeps going until the task is done instead of stopping to ask. While objectives are open, a model that stops is sent back to the next objective (twice at most in a row), and the run may go past the usual 30 turns up to 120 as long as tools keep succeeding. A reply cut off by the length limit, or by a dropped connection after text arrived, is continued where it stopped, so the answer reads as one. A request that fails before anything arrives (network error, timeout, rate limit, 5xx) is retried twice with a short wait, shown as a note. In long runs the oldest tool output is trimmed so the conversation stays within the model's context window.
 - **Context meter and condensing**: a small ring in the composer shows how full the model's context window will be with the next message (≈ tokens, estimated at about 3.5 characters per token). It counts the conversation, the open file, the assistant's tools and policy, and room for the reply; click it for the numbers. When a send, or a reply that just arrived, takes the chat past **80%**, the older turns are summarised by the model (asked to answer without reasoning, so it takes seconds) and the latest two exchanges, or just the last one if two would still be too big, stay word for word. The summary replaces those turns in what the model sees; in the chat they stay visible but dimmed, under an **Earlier messages condensed** divider that expands to show the summary. **Condense now** in the meter does it on demand. If the summary request fails, the oldest turns are dropped instead so the next request still fits. The window size comes from the provider's model list (`context_length`, `context_window`, `max_model_len`, …); where a provider does not report it, it is assumed (32k, or 8k for local servers) and can be set under **Settings → AI providers → Context window**.
 - **AI inline completions**: typing pauses for a moment and the selected model is asked for the next few tokens of the file — its answer appears as grey ghost text at the caret, `Tab` accepts it and `Escape` dismisses it, and nothing is inserted on its own. The provider (`src/lib/inlineCompletion.ts`) sends only the ~2.6 KB before the cursor and ~600 bytes after it, debounces keystrokes by 700 ms, drops any answer that newer typing has already superseded, caches answers per cursor position, and silently gives up when the model is slow, errors or the free tier rate-limits. It is driven by the key and model verified in Settings and never runs without both.
 - **Ask AI from the right-click menu**: right-clicking inside the editor offers **Ask AI about this file**, and highlighting code turns the menu selection-aware: **Explain this selection**, **Refactor this selection**, **Find bugs in this selection** and **Document this selection** each seed the composer with that question plus the highlighted lines; the explorer's menu offers the same for the file or folder under the pointer. Each one opens the assistant if it was hidden and pre-fills the composer with a ready prompt — the highlighted lines travel inside the message with their path and line range, while file and folder prompts name the path for the assistant's own tools — caret at the end, nothing sent until you press Enter.
@@ -156,14 +166,21 @@ Nothing about the assistant happens in the webview except rendering. The HTTP cl
 
 1. The UI sends the conversation and the provider endpoint to the `ai_agent` command.
 2. Rust calls `POST {base URL}/chat/completions` with the tool schema, streams deltas back as `agent-delta` events, and shows reasoning separately from the answer.
-3. When the model calls a tool, Rust executes it against the open folder, emits the result as an `agent-step` note (and `workspace:file-changed` for writes), then loops back to the model with the tool output.
-4. When the model stops calling tools, the final message is returned and the UI settles on it. If it spends every step on tools, the loop asks once more with the tools removed — "answer with what you have already read" — so a long exploration still ends in prose instead of an error note.
+3. When the model calls a tool, Rust executes it against the open folder, emits the result as an `agent-step` note (and `workspace:file-changed` for writes), then loops back to the model with the tool output. Every event carries the session id, so the UI routes it to the right session; Stop (`ai_cancel`) and approvals (`agent_decide`) are per session too.
+4. For multi-step work the model calls `set_objectives` first, then again with the whole list whenever an objective starts or finishes. Rust checks the list (up to 12 items, statuses `pending` / `in_progress` / `done`) and sends it to the UI as a single `objectives` step that updates in place. While items are open, a file change, or three tool calls without an update, adds a one-line reminder of the checklist to the tool result, because smaller models otherwise keep working without ticking anything off.
+5. When the model stops calling tools, the final message is returned and the UI settles on it, unless the reply was cut off (`finish_reason: length`, or the stream dropped mid-reply), in which case the loop asks for the rest, or objectives are still open, in which case it sends the model back to them. Failed requests are retried twice (3 s, 6 s; 10 s, 20 s for 429) when nothing had arrived yet. Before each turn, tool results and large write arguments older than the last 8 messages are shortened until the conversation fits the model's context window (passed from the UI). If it spends every step on tools, the loop asks once more with the tools removed — "answer with what you have already read" — so a long exploration still ends in prose instead of an error note.
+
+Sessions coordinate through the database (`src-tauri/src/store.rs`, `run.rs`): a run claims each file before changing it (a claim held by another *running* session refuses the edit; claims are dropped when the run ends and on startup), logs `start`, `change`, `note` and `finish` entries to a per-project activity table, saves its objectives on the session, and before each tool result reads the activity other sessions added since its last look. Commands run through `src-tauri/src/command.rs` (`cmd /D /S /C` on Windows, `sh -c` in its own process group elsewhere; a timeout or Stop ends the whole process tree).
 
 Hard limits, chosen so a confused model can never spin forever or rewrite a huge file:
 
 | Limit | Value |
 | --- | --- |
-| Agent loop steps per request | 25 (then one tool-free answer, and a **Continue** button) |
+| Agent loop steps per request | 30; up to 120 while objectives are open and tools keep succeeding (then one tool-free answer, and a **Continue** button) |
+| Continuations of a cut-off reply | 4 |
+| Command time limit | 120 s by default, 600 s at most |
+| Command output kept | first 2 000 and last 12 000 characters |
+| Retries of a failed request | 2 |
 | Characters of context sent per request | 24 000 |
 | Tool output kept per call | 40 000 chars |
 | Characters a single `write_file` may write | 200 000 |
@@ -240,6 +257,9 @@ Every action returns the fresh status, so the panel never shows a stale tree. Sa
 │  workspace.rs  safe path joining, tree, read/write/search │
 │  llm.rs        any OpenAI-compatible provider, probes      │
 │  agent.rs      tool loop, system prompt, event emission   │
+│  run.rs        per-session run context, session overview  │
+│  store.rs      SQLite: sessions, messages, activity, locks│
+│  command.rs    run_command: shell, timeout, process tree  │
 └───────────────────────────┬───────────────────────────────┘
                             │ HTTPS (key never reaches JS)
                  integrate.api.nvidia.com
@@ -309,7 +329,10 @@ Nexium-IDE/
         ├── workspace.rs        # safe_join, tree snapshot, read/write/search, tests
         ├── git.rs              # porcelain parser, diff sides, stage/unstage, commit
         ├── llm.rs              # OpenAI-compatible client for every provider, probes
-        └── agent.rs            # tool schema, tool loop, step notes, write events
+        ├── agent.rs            # tool schema, tool loop, step notes, write events
+        ├── run.rs              # a run's session id, events, view of the other sessions
+        ├── store.rs            # SQLite database: sessions, messages, activity, file locks
+        └── command.rs          # run_command: shell, time limit, stopping the process tree
 ```
 
 ---
@@ -322,6 +345,7 @@ Nexium-IDE/
 - Every filesystem command is confined to the folder you opened (`safe_join`); `delete_workspace_entry` and `rename_workspace_entry` refuse anything that resolves outside it.
 - Tauri capabilities are minimal: `core:default`, `dialog:default`, and only the five window permissions the custom title bar needs (`minimize`, `toggle-maximize`, `is-maximized`, `close`, `start-dragging`).
 - Assistant output is rendered as Markdown without HTML, so a model cannot inject markup or script into the window.
+- Commands the assistant proposes run only after you press **Run** (unless Auto-approve is on), in the open folder, with no input, a time limit, and your own permissions; they are not sandboxed, so read them before running.
 - Writes performed by the assistant go through the same path checks as your own edits, and the UI is told which file changed so the editor never shows stale content. Deleting asks for confirmation first and is the only destructive action in the app.
 - The terminal is a real shell behind a pseudo-terminal. It is only available once a project is open and always starts in that project's folder (opening another project restarts it there); commands typed into it run with your own permissions and are not sandboxed.
 - Source control shells out to `git` inside the open folder, only ever with `status --untracked-files=all`, `show` (read-only, for the diff sides), `add`, `restore`, `reset`, `rm --cached`, `commit -m`, `tag` (create or delete one local tag; names are checked with `check-ref-format`), `for-each-ref refs/tags` and `push` (the current branch, or one `refs/tags/<name>`) (with `GIT_TERMINAL_PROMPT=0`, so a credential prompt fails instead of blocking the window); paths are passed after `--` so they cannot be read as options.
@@ -334,10 +358,10 @@ Nexium-IDE/
 | --- | --- |
 | Provider API keys | OS credential store (Windows Credential Manager), service `com.nexium.studio`, account `api-key:<provider id>` |
 | Chosen models, turned-on models per provider, base-URL overrides, custom providers, latencies | WebView `localStorage`, key `nexium.assistant.providers` (settings from older builds under `nexium.assistant.nim` are migrated) |
-| Conversation | In memory for the session (cleared when the window closes) |
+| Sessions and their messages, the sessions' shared activity log, file locks | SQLite database `nexium.db` in the app data folder (on Windows `%APPDATA%\com.nexium.studio\nexium.db`), grouped by project folder; deleting a session removes its messages and activity. The browser-only dev mode keeps sessions in `localStorage` (`nexium.sessions`) |
 | Your project files | Untouched on disk until you or the assistant saves |
 
-Reset the assistant with **Remove key** in Settings (or by deleting the credential and clearing that `localStorage` key). Nothing else is written outside your project folder.
+Reset the assistant with **Remove key** in Settings (or by deleting the credential and clearing that `localStorage` key); delete `nexium.db` to forget every session. Nothing else is written outside your project folder.
 
 ---
 

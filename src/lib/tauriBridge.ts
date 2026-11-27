@@ -1,11 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri as isTauriApi } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
 export { invoke };
 
 /** True only inside the Tauri shell, where local filesystem access exists. */
 export function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  return isTauriApi();
 }
 
 /**

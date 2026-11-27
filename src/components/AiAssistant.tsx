@@ -5,6 +5,9 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Circle,
+  CircleCheck,
+  CircleDot,
   Clock,
   Copy,
   Cpu,
@@ -14,6 +17,7 @@ import {
   FileText,
   FolderTree,
   Info,
+  ListChecks,
   LoaderCircle,
   Maximize2,
   Minimize2,
@@ -32,18 +36,29 @@ import {
   X,
   Zap,
   Layers,
+  Archive,
+  ArchiveRestore,
+  History,
+  Pencil,
+  Send,
+  SquareTerminal,
+  Trash2,
+  Users,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
+import { objectivesOf } from "../lib/assistantMessages";
 import type { AssistantMessage, MessageBlock } from "../lib/assistantMessages";
 import { sameModel } from "../lib/assistantSettings";
 import type { ModelOption, ModelRef } from "../lib/assistantSettings";
 import { estimateTokens, formatTokens } from "../lib/contextBudget";
 import type { CondensedHistory } from "../lib/contextBudget";
 import { lineDiff } from "../lib/lineDiff";
-import type { AgentStep, ApprovalRequest } from "../lib/llm";
+import type { AgentStep, ApprovalRequest, Objective } from "../lib/llm";
 import MarkdownMessage from "./MarkdownMessage";
+import { UNTITLED } from "../lib/sessions";
+import type { SessionSummary } from "../lib/sessions";
 
 export type { AssistantMessage } from "../lib/assistantMessages";
 
@@ -100,6 +115,18 @@ type AiAssistantProps = {
   condensing: boolean;
   canCondense: boolean;
   onCondense: () => void;
+  /** Saved sessions of this project, most recent first. */
+  sessions: SessionSummary[];
+  /** The session shown; null for a new one not yet started. */
+  activeSessionId: string | null;
+  /** Sessions with a run in progress. */
+  runningSessionIds: string[];
+  showArchived: boolean;
+  onToggleArchived: () => void;
+  onSelectSession: (id: string) => void;
+  onArchiveSession: (id: string, archived: boolean) => void;
+  onDeleteSession: (id: string) => void;
+  onRenameSession: (id: string, title: string) => void;
 };
 
 const iconButton =
@@ -139,6 +166,15 @@ export default function AiAssistant({
   condensing,
   canCondense,
   onCondense,
+  sessions,
+  activeSessionId,
+  runningSessionIds,
+  showArchived,
+  onToggleArchived,
+  onSelectSession,
+  onArchiveSession,
+  onDeleteSession,
+  onRenameSession,
 }: AiAssistantProps) {
   const full = fullscreen;
   const [prompt, setPrompt] = useState("");
@@ -286,20 +322,25 @@ export default function AiAssistant({
       <div
         className={`flex shrink-0 items-center justify-between gap-2 border-b border-line bg-gradient-to-b from-ink/[0.02] to-transparent ${full ? "h-11 px-4" : "h-9 px-3"}`}
       >
-        <span className="flex min-w-0 items-center gap-2 text-[10px] font-medium uppercase tracking-[0.18em] text-ink/45">
-          <Sparkles
-            className="size-3.5 shrink-0 text-ink/55"
-            strokeWidth={1.75}
-          />
-          Assistant
-        </span>
+        <SessionMenu
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          runningSessionIds={runningSessionIds}
+          showArchived={showArchived}
+          onToggleArchived={onToggleArchived}
+          onSelect={onSelectSession}
+          onArchive={onArchiveSession}
+          onDelete={onDeleteSession}
+          onRename={onRenameSession}
+          full={full}
+        />
         <span className="flex items-center gap-0.5">
           <button
             type="button"
             onClick={onNewChat}
-            disabled={pending || messages.length === 0}
-            aria-label="New chat"
-            title="New chat"
+            disabled={activeSessionId === null && messages.length === 0}
+            aria-label="New session"
+            title="New session (the current one keeps running)"
             className={iconButton}
           >
             <SquarePen className="size-3.5" strokeWidth={1.75} />
@@ -823,6 +864,10 @@ function groupBlocks(blocks: MessageBlock[]): Group[] {
     const last = groups[groups.length - 1];
 
     if (block.type === "step") {
+      if (block.step.kind === "objectives") {
+        continue;
+      }
+
       if (last?.type === "steps") {
         last.steps.push(block.step);
       } else {
@@ -847,6 +892,7 @@ function Timeline({
   live = false,
 }: TimelineProps) {
   const groups = useMemo(() => groupBlocks(blocks), [blocks]);
+  const objectives = useMemo(() => objectivesOf(blocks), [blocks]);
 
   return (
     <div className="space-y-2.5">
@@ -894,8 +940,145 @@ function Timeline({
           />
         );
       })}
+      {objectives && <Objectives objectives={objectives} live={live} />}
     </div>
   );
+}
+
+/**
+ * The agent's checklist for a multi-step task, with progress. It closes the
+ * turn, below the text, and shows one objective: the one being worked on (or
+ * the next one, or a summary once all are done). Clicking it lists them all.
+ * While the run works it stays in view at the bottom of the chat.
+ */
+function Objectives({
+  objectives,
+  live,
+}: {
+  objectives: Objective[];
+  live: boolean;
+}) {
+  const done = objectives.filter((objective) => objective.status === "done").length;
+  const total = objectives.length;
+  const finished = done === total;
+  const [expanded, setExpanded] = useState(false);
+  const current =
+    objectives.find((objective) => objective.status === "in_progress") ??
+    objectives.find((objective) => objective.status === "pending");
+
+  return (
+    <section
+      aria-label="Objectives"
+      className={`rounded-lg border border-ink/[0.08] bg-app ${
+        live ? "sticky bottom-0 z-10 shadow-[0_-10px_24px_-14px_rgba(0,0,0,0.9)]" : ""
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        title={expanded ? "Show only the current objective" : "Show all objectives"}
+        className="flex w-full items-center gap-2 rounded-lg px-3 pb-2 pt-2.5 text-left transition-colors duration-150 hover:bg-ink/[0.025]"
+      >
+        {expanded ? (
+          <>
+            <ListChecks className="size-3.5 shrink-0 text-ink/55" strokeWidth={1.9} />
+            <span className="text-[11px] font-medium text-ink/75">Objectives</span>
+          </>
+        ) : current ? (
+          <>
+            <ObjectiveIcon status={current.status} live={live} />
+            <span
+              className={`min-w-0 truncate text-[11px] ${
+                current.status === "in_progress"
+                  ? "font-medium text-ink/85"
+                  : "text-ink/55"
+              }`}
+            >
+              {current.title}
+            </span>
+          </>
+        ) : (
+          <>
+            <ObjectiveIcon status="done" live={live} />
+            <span className="min-w-0 truncate text-[11px] text-ink/55">
+              {total === 1 ? "Objective done" : `All ${total} objectives done`}
+            </span>
+          </>
+        )}
+        <span className="ml-auto shrink-0 pl-2 font-mono text-[10px] tabular-nums text-ink/40">
+          {done}/{total}
+        </span>
+        <ChevronDown
+          className={`size-3 shrink-0 text-ink/30 transition-transform duration-150 ${
+            expanded ? "" : "-rotate-90"
+          }`}
+          strokeWidth={2}
+        />
+      </button>
+
+      <div
+        role="progressbar"
+        aria-label="Objectives completed"
+        aria-valuemin={0}
+        aria-valuemax={total}
+        aria-valuenow={done}
+        className="mx-3 mb-2.5 h-[3px] overflow-hidden rounded-full bg-ink/[0.07]"
+      >
+        <div
+          className={`h-full rounded-full transition-[width] duration-500 ease-out ${
+            finished ? "bg-ink/70" : "bg-ink/45"
+          }`}
+          style={{ width: `${(done / Math.max(1, total)) * 100}%` }}
+        />
+      </div>
+
+      {expanded && (
+        <ol className="space-y-1.5 px-3 pb-2.5">
+          {objectives.map((objective, index) => (
+            <li key={`${index}-${objective.title}`} className="flex items-start gap-2">
+              <ObjectiveIcon status={objective.status} live={live} />
+              <span
+                className={`min-w-0 text-[11px] leading-snug ${
+                  objective.status === "done"
+                    ? "text-ink/35 line-through decoration-ink/20"
+                    : objective.status === "in_progress"
+                      ? "font-medium text-ink/85"
+                      : "text-ink/55"
+                }`}
+              >
+                {objective.title}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
+function ObjectiveIcon({
+  status,
+  live,
+}: {
+  status: Objective["status"];
+  live: boolean;
+}) {
+  const base = "mt-px size-3.5 shrink-0";
+
+  if (status === "done") {
+    return <CircleCheck className={`${base} text-ink/45`} strokeWidth={2} aria-label="Done" />;
+  }
+
+  if (status === "in_progress") {
+    return live ? (
+      <LoaderCircle className={`${base} animate-spin text-ink/70`} strokeWidth={2} aria-label="In progress" />
+    ) : (
+      <CircleDot className={`${base} text-ink/70`} strokeWidth={2} aria-label="In progress" />
+    );
+  }
+
+  return <Circle className={`${base} text-ink/25`} strokeWidth={2} aria-label="Pending" />;
 }
 
 function Reasoning({ text, open }: { text: string; open: boolean }) {
@@ -941,6 +1124,12 @@ function toolIcon(step: AgentStep) {
       return FilePen;
     case "write_file":
       return FilePlus;
+    case "run_command":
+      return SquareTerminal;
+    case "session_status":
+      return Users;
+    case "message_sessions":
+      return Send;
     default:
       return step.kind === "notice" ? Info : Wrench;
   }
@@ -1040,7 +1229,13 @@ function StepRow({
         </span>
       </div>
 
-      {step.status === "awaiting" && approval && (
+      {step.status === "awaiting" && approval && approval.kind === "command" && (
+        <CommandApproval
+          command={approval.command ?? ""}
+          onDecide={(accept) => onDecide(step.id, accept)}
+        />
+      )}
+      {step.status === "awaiting" && approval && approval.kind !== "command" && (
         <ApprovalCard
           request={approval}
           onDecide={(accept) => onDecide(step.id, accept)}
@@ -1048,6 +1243,330 @@ function StepRow({
         />
       )}
     </li>
+  );
+}
+
+/** A command the agent wants to run, for the user to allow or refuse. */
+function CommandApproval({
+  command,
+  onDecide,
+}: {
+  command: string;
+  onDecide: (accept: boolean) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const decide = (accept: boolean) => {
+    setBusy(true);
+    onDecide(accept);
+  };
+
+  return (
+    <div className="mt-1.5 overflow-hidden rounded-lg border border-ink/15 bg-app">
+      <div className="flex items-center gap-2 border-b border-ink/[0.08] px-2.5 py-1.5 text-[10.5px] text-ink/55">
+        <SquareTerminal className="size-3 shrink-0" strokeWidth={1.75} />
+        Run this command in the project folder?
+      </div>
+      <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all px-2.5 py-2 font-mono text-[11px] leading-relaxed text-ink/85">
+        <span className="select-none text-ink/30">$ </span>
+        {command}
+      </pre>
+      <div className="flex items-center justify-end gap-1.5 border-t border-ink/[0.08] px-2 py-1.5">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => decide(false)}
+          className="flex h-6 items-center gap-1 rounded-md border border-ink/[0.1] px-2 text-[10.5px] text-ink/55 transition-colors duration-150 hover:border-ink/25 hover:text-ink disabled:opacity-40"
+        >
+          <X className="size-3" strokeWidth={2} />
+          Reject
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => decide(true)}
+          className="flex h-6 items-center gap-1 rounded-md bg-ink px-2 text-[10.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:opacity-40"
+        >
+          <Check className="size-3" strokeWidth={2.5} />
+          Run
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function relativeTime(millis: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - millis) / 1000));
+  if (seconds < 60) return "just now";
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3_600)} h ago`;
+  if (seconds < 7 * 86_400) return `${Math.floor(seconds / 86_400)} d ago`;
+  return new Date(millis).toLocaleDateString();
+}
+
+/**
+ * The header's session switcher: the current session's name, and a menu of
+ * the project's sessions to switch to, rename, archive or delete. Running
+ * sessions spin; they keep working while another one is shown.
+ */
+function SessionMenu({
+  sessions,
+  activeSessionId,
+  runningSessionIds,
+  showArchived,
+  onToggleArchived,
+  onSelect,
+  onArchive,
+  onDelete,
+  onRename,
+  full,
+}: {
+  sessions: SessionSummary[];
+  activeSessionId: string | null;
+  runningSessionIds: string[];
+  showArchived: boolean;
+  onToggleArchived: () => void;
+  onSelect: (id: string) => void;
+  onArchive: (id: string, archived: boolean) => void;
+  onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  full: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  const running = new Set(runningSessionIds);
+  const current = sessions.find((session) => session.id === activeSessionId);
+  const othersRunning = runningSessionIds.filter((id) => id !== activeSessionId).length;
+  const live = sessions.filter((session) => !session.archived);
+  const archived = sessions.filter((session) => session.archived);
+
+  useEffect(() => {
+    if (!open) {
+      setConfirmDelete(null);
+      setRenaming(null);
+      return;
+    }
+
+    const close = (event: MouseEvent) => {
+      if (!menu.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+
+  const row = (session: SessionSummary) => {
+    const isActive = session.id === activeSessionId;
+    const isRunning = running.has(session.id);
+
+    if (confirmDelete === session.id) {
+      return (
+        <li key={session.id} className="rounded-md bg-ink/[0.05] px-2.5 py-2">
+          <p className="text-[11px] text-ink/80">
+            Delete “{session.title}”? This can’t be undone.
+          </p>
+          <div className="mt-2 flex justify-end gap-1.5">
+            <button
+              type="button"
+              onClick={() => setConfirmDelete(null)}
+              className="h-6 rounded-md border border-ink/[0.1] px-2 text-[10.5px] text-ink/55 hover:border-ink/25 hover:text-ink"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmDelete(null);
+                onDelete(session.id);
+              }}
+              className="h-6 rounded-md bg-ink px-2 text-[10.5px] font-medium text-app hover:bg-ink/90"
+            >
+              Delete
+            </button>
+          </div>
+        </li>
+      );
+    }
+
+    if (renaming?.id === session.id) {
+      return (
+        <li key={session.id} className="px-1.5 py-1">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              const title = renaming.title.trim();
+              if (title) {
+                onRename(session.id, title);
+              }
+              setRenaming(null);
+            }}
+          >
+            <input
+              autoFocus
+              value={renaming.title}
+              onChange={(event) => setRenaming({ id: session.id, title: event.target.value })}
+              onBlur={() => setRenaming(null)}
+              aria-label="Session name"
+              className="h-7 w-full rounded-md border border-ink/20 bg-app px-2 text-[11px] text-ink outline-none focus:border-ink/40"
+            />
+          </form>
+        </li>
+      );
+    }
+
+    return (
+      <li key={session.id} className="group relative">
+        <button
+          type="button"
+          onClick={() => {
+            onSelect(session.id);
+            setOpen(false);
+          }}
+          className={`flex w-full items-center gap-2 rounded-md py-1.5 pl-2 pr-[4.5rem] text-left transition-colors duration-150 ${
+            isActive ? "bg-ink/[0.07]" : "hover:bg-ink/[0.04]"
+          }`}
+        >
+          {isRunning ? (
+            <LoaderCircle className="size-3 shrink-0 animate-spin text-ink/60" aria-label="Working" />
+          ) : (
+            <span className={`ml-1 mr-0.5 size-1.5 shrink-0 rounded-full ${isActive ? "bg-ink/60" : "bg-ink/15"}`} />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className={`block truncate text-[11.5px] ${isActive ? "text-ink/90" : "text-ink/70"}`}>
+              {session.title}
+            </span>
+            <span className="block text-[10px] text-ink/30">
+              {isRunning ? "Working…" : relativeTime(session.updatedAt)}
+              {session.messageCount > 0 ? ` · ${session.messageCount} messages` : ""}
+            </span>
+          </span>
+        </button>
+        <span className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center opacity-0 transition-opacity duration-150 focus-within:opacity-100 group-hover:opacity-100">
+          <button
+            type="button"
+            onClick={() => setRenaming({ id: session.id, title: session.title })}
+            aria-label={`Rename ${session.title}`}
+            title="Rename"
+            className={iconButton}
+          >
+            <Pencil className="size-3" strokeWidth={1.75} />
+          </button>
+          <button
+            type="button"
+            onClick={() => onArchive(session.id, !session.archived)}
+            disabled={isRunning}
+            aria-label={session.archived ? `Unarchive ${session.title}` : `Archive ${session.title}`}
+            title={isRunning ? "Stop it before archiving" : session.archived ? "Unarchive" : "Archive"}
+            className={iconButton}
+          >
+            {session.archived ? (
+              <ArchiveRestore className="size-3" strokeWidth={1.75} />
+            ) : (
+              <Archive className="size-3" strokeWidth={1.75} />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(session.id)}
+            disabled={isRunning}
+            aria-label={`Delete ${session.title}`}
+            title={isRunning ? "Stop it before deleting" : "Delete"}
+            className={iconButton}
+          >
+            <Trash2 className="size-3" strokeWidth={1.75} />
+          </button>
+        </span>
+      </li>
+    );
+  };
+
+  return (
+    <div ref={menu} className="relative min-w-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title="Sessions"
+        className="flex min-w-0 max-w-full items-center gap-2 rounded-md py-1 pl-1 pr-1.5 transition-colors duration-150 hover:bg-ink/[0.05]"
+      >
+        <Sparkles className="size-3.5 shrink-0 text-ink/55" strokeWidth={1.75} />
+        <span className={`min-w-0 truncate text-[11px] font-medium text-ink/70 ${full ? "max-w-[420px]" : "max-w-[170px]"}`}>
+          {current?.title ?? UNTITLED}
+        </span>
+        {othersRunning > 0 && (
+          <span
+            className="flex shrink-0 items-center gap-1 rounded-full bg-ink/[0.07] px-1.5 py-px text-[9.5px] text-ink/55"
+            title={`${othersRunning} other session${othersRunning === 1 ? "" : "s"} working`}
+          >
+            <LoaderCircle className="size-2.5 animate-spin" />
+            {othersRunning}
+          </span>
+        )}
+        <ChevronDown
+          className={`size-3 shrink-0 text-ink/35 transition-transform duration-150 ${open ? "rotate-180" : ""}`}
+          strokeWidth={2}
+        />
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute left-0 top-full z-30 mt-1.5 w-[300px] max-w-[calc(100vw-2rem)] rounded-xl border border-ink/[0.09] bg-raised/95 p-1.5 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.95)] backdrop-blur-xl"
+        >
+          <div className="flex items-center justify-between px-2 pb-1.5 pt-1">
+            <span className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.16em] text-ink/40">
+              <History className="size-3" strokeWidth={1.75} />
+              Sessions
+            </span>
+            <button
+              type="button"
+              onClick={onToggleArchived}
+              aria-pressed={showArchived}
+              className={`rounded px-1.5 py-0.5 text-[10px] transition-colors duration-150 hover:text-ink ${
+                showArchived ? "bg-ink/[0.07] text-ink/70" : "text-ink/40"
+              }`}
+            >
+              {showArchived ? "Hide archived" : "Show archived"}
+            </button>
+          </div>
+
+          {live.length === 0 && archived.length === 0 ? (
+            <p className="px-2 py-3 text-[11px] leading-relaxed text-ink/40">
+              No saved sessions yet. Your first message starts one.
+            </p>
+          ) : (
+            <ul className="max-h-[340px] space-y-0.5 overflow-y-auto">
+              {live.map(row)}
+              {showArchived && archived.length > 0 && (
+                <>
+                  <li className="px-2 pb-1 pt-2.5 text-[9.5px] uppercase tracking-[0.16em] text-ink/30">
+                    Archived
+                  </li>
+                  {archived.map(row)}
+                </>
+              )}
+            </ul>
+          )}
+
+          <p className="mt-1 border-t border-ink/[0.07] px-2 pb-1 pt-2 text-[10px] leading-relaxed text-ink/30">
+            Sessions can work at the same time. A file one session is editing is
+            locked for the others, and each sees what the others changed.
+          </p>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1195,7 +1714,7 @@ function LiveRun({ live, model, ...timeline }: LiveRunProps) {
 
       {waitingOnUser && (
         <p className="text-[10.5px] text-ink/45">
-          Waiting for you to accept or reject the change…
+          Waiting for you to accept or reject…
         </p>
       )}
 

@@ -45,6 +45,8 @@ pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let mut path = root.to_path_buf();
     let trimmed = relative.trim().trim_matches(['/', '\\']);
 
+    // An empty path is the folder itself: listing and searching the root use
+    // it. Callers that must not touch the root (delete) check for it.
     if trimmed.is_empty() {
         return Ok(path);
     }
@@ -681,14 +683,16 @@ pub fn delete(root: &Path, relative: &str) -> Result<(), String> {
         return Err("Open another folder instead of deleting the whole workspace.".into());
     }
 
-    if !path.exists() {
-        return Err("That file no longer exists.".into());
-    }
+    // Use symlink_metadata to avoid following symlinks - this prevents
+    // deleting files outside the workspace if a symlink points outside.
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| "That file no longer exists.".to_string())?;
 
-    if path.is_dir() {
-        fs::remove_dir_all(&path)
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(&path).map_err(|error| format!("Could not delete: {error}"))
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(&path).map_err(|error| format!("Could not delete: {error}"))
     } else {
-        fs::remove_file(&path)
+        fs::remove_file(&path).map_err(|error| format!("Could not delete: {error}"))
     }
-    .map_err(|error| format!("Could not delete: {error}"))
 }

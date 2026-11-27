@@ -109,6 +109,17 @@ import { isFontPath, isImagePath } from "./lib/media";
 import { applyTheme, loadThemeId, saveThemeId } from "./lib/themes";
 import { monaco } from "./lib/monacoSetup";
 import { cancelAgent, chat, decideChange, runAgent } from "./lib/llm";
+import {
+  archiveSession,
+  createSession,
+  deleteSession,
+  listSessions,
+  loadSession,
+  renameSession,
+  saveSession,
+  titleFrom,
+} from "./lib/sessions";
+import type { SessionSummary } from "./lib/sessions";
 import type {
   AgentDelta,
   AgentStep,
@@ -155,6 +166,25 @@ import {
 
 const MAX_CONTEXT_CHARS = 24_000;
 const AUTO_APPROVE_KEY = "nexium.assistant.autoApprove";
+
+/** One assistant session's conversation and run, held while the app is open. */
+type SessionRuntime = {
+  messages: AssistantMessage[];
+  condensed: CondensedHistory | null;
+  live: { blocks: MessageBlock[] } | null;
+  pending: boolean;
+  condensing: boolean;
+  approvals: Record<number, ApprovalRequest>;
+};
+
+const EMPTY_RUNTIME: SessionRuntime = {
+  messages: [],
+  condensed: null,
+  live: null,
+  pending: false,
+  condensing: false,
+  approvals: {},
+};
 
 /** The Rust client reports a dead connection when a provider stays silent. */
 function stalled(message: string): boolean {
@@ -293,38 +323,70 @@ export default function App() {
     text: string;
   } | null>(null);
   const [assistantFull, setAssistantFull] = useState(false);
-  const [assistantMessages, setAssistantMessages] = useState<
-    AssistantMessage[]
-  >([]);
-  const [assistantPending, setAssistantPending] = useState(false);
-  // A prompt from a right-click action; the assistant composer takes it once.
-  const [assistantSeed, setAssistantSeed] = useState<string | null>(null);
-  // The running turn as a timeline. The ref is the source of truth so the
-  // finished message can be built from it the moment the run resolves.
-  const [live, setLive] = useState<{ blocks: MessageBlock[] } | null>(null);
-  const liveBlocks = useRef<MessageBlock[] | null>(null);
-  const updateLive = useCallback(
-    (update: (blocks: MessageBlock[]) => MessageBlock[]) => {
-      if (!liveBlocks.current) {
-        return;
-      }
-
-      liveBlocks.current = update(liveBlocks.current);
-      setLive({ blocks: liveBlocks.current });
+  // Each assistant session keeps its own conversation and run; several can
+  // work at once. The active one is what the panel shows.
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [runtimes, setRuntimes] = useState<Record<string, SessionRuntime>>({});
+  const runtimesRef = useRef(runtimes);
+  runtimesRef.current = runtimes;
+  // What was last saved per session, so only real changes are written.
+  const savedRef = useRef<
+    Record<string, { messages: AssistantMessage[]; condensed: CondensedHistory | null }>
+  >({});
+  const patchSession = useCallback(
+    (id: string, update: (runtime: SessionRuntime) => Partial<SessionRuntime>) => {
+      setRuntimes((current) => {
+        const runtime = current[id] ?? EMPTY_RUNTIME;
+        return { ...current, [id]: { ...runtime, ...update(runtime) } };
+      });
     },
     [],
   );
-  const startLive = useCallback((blocks: MessageBlock[] = []) => {
-    liveBlocks.current = blocks;
-    setLive({ blocks });
-  }, []);
+  const activeRuntime =
+    (activeSessionId && runtimes[activeSessionId]) || EMPTY_RUNTIME;
+  const assistantMessages = activeRuntime.messages;
+  const assistantPending = activeRuntime.pending;
+  const live = activeRuntime.live;
   // Older turns summarised so the conversation stays inside the model's
   // context window; the messages it covers stay on screen.
-  const [condensed, setCondensed] = useState<CondensedHistory | null>(null);
-  const [condensing, setCondensing] = useState(false);
-  // Proposed file changes waiting on Accept/Reject, keyed by step id.
-  const [approvals, setApprovals] = useState<Record<number, ApprovalRequest>>(
-    {},
+  const condensed = activeRuntime.condensed;
+  const condensing = activeRuntime.condensing;
+  // Proposed changes and commands waiting on Accept/Reject, keyed by step id.
+  const approvals = activeRuntime.approvals;
+  const runningSessionIds = useMemo(
+    () =>
+      Object.entries(runtimes)
+        .filter(([, runtime]) => runtime.pending)
+        .map(([id]) => id),
+    [runtimes],
+  );
+  // A prompt from a right-click action; the assistant composer takes it once.
+  const [assistantSeed, setAssistantSeed] = useState<string | null>(null);
+  // Each running turn as a timeline, per session. The ref is the source of
+  // truth so the finished message can be built the moment the run resolves.
+  const liveBlocks = useRef<Record<string, MessageBlock[]>>({});
+  const updateLive = useCallback(
+    (id: string, update: (blocks: MessageBlock[]) => MessageBlock[]) => {
+      const blocks = liveBlocks.current[id];
+
+      if (!blocks) {
+        return;
+      }
+
+      const next = update(blocks);
+      liveBlocks.current[id] = next;
+      patchSession(id, () => ({ live: { blocks: next } }));
+    },
+    [patchSession],
+  );
+  const startLive = useCallback(
+    (id: string, blocks: MessageBlock[] = []) => {
+      liveBlocks.current[id] = blocks;
+      patchSession(id, () => ({ live: { blocks } }));
+    },
+    [patchSession],
   );
   const [autoApprove, setAutoApprove] = useState(
     () => localStorage.getItem(AUTO_APPROVE_KEY) === "true",
@@ -1150,6 +1212,7 @@ export default function App() {
    */
   const condenseHistory = useCallback(
     async (
+      sessionId: string,
       messages: AssistantMessage[],
       current: CondensedHistory | null,
       window: number,
@@ -1182,7 +1245,7 @@ export default function App() {
           0,
         ) + (current ? estimateTokens(current.summary) : 0);
 
-      setCondensing(true);
+      patchSession(sessionId, () => ({ condensing: true }));
 
       try {
         const request = condenseRequest(older, current, window);
@@ -1213,18 +1276,174 @@ export default function App() {
           note: `Could not summarise (${toError(cause, "the request failed").message}); dropped ${older.length} earlier messages instead`,
         };
       } finally {
-        setCondensing(false);
+        patchSession(sessionId, () => ({ condensing: false }));
       }
     },
-    [chatTarget, openFileContextChars],
+    [chatTarget, openFileContextChars, patchSession],
   );
 
   const handleCondenseNow = useCallback(async () => {
+    if (!activeSessionId) {
+      return;
+    }
+
+    const sessionId = activeSessionId;
     const window = contextWindowFor(settings, settings.chat).tokens;
-    const result = await condenseHistory(assistantMessages, condensed, window);
-    setCondensed(result.condensed);
+    const result = await condenseHistory(sessionId, assistantMessages, condensed, window);
+    patchSession(sessionId, () => ({ condensed: result.condensed }));
     setNotice(result.note);
-  }, [assistantMessages, condenseHistory, condensed, settings]);
+  }, [activeSessionId, assistantMessages, condenseHistory, condensed, patchSession, settings]);
+
+  // ── sessions ──────────────────────────────────────────────────────────
+
+  const refreshSessions = useCallback(async () => {
+    try {
+      setSessions(await listSessions(showArchived));
+    } catch {
+      // No database: the list stays as it is.
+    }
+  }, [showArchived]);
+
+  useEffect(() => {
+    void refreshSessions();
+  }, [refreshSessions]);
+
+  const selectSession = useCallback(async (id: string) => {
+    setActiveSessionId(id);
+
+    if (runtimesRef.current[id]) {
+      return;
+    }
+
+    try {
+      const data = await loadSession(id);
+      const highest = data.messages.reduce((top, message) => Math.max(top, message.id), 0);
+      nextMessageId.current = Math.max(nextMessageId.current, highest + 1);
+      savedRef.current[id] = { messages: data.messages, condensed: data.condensed };
+      setRuntimes((current) =>
+        current[id]
+          ? current
+          : {
+              ...current,
+              [id]: { ...EMPTY_RUNTIME, messages: data.messages, condensed: data.condensed },
+            },
+      );
+    } catch (cause) {
+      setNotice(toError(cause, "The session could not be opened.").message);
+    }
+  }, []);
+
+  // Opening a folder shows its sessions and reopens the latest one.
+  useEffect(() => {
+    let cancelled = false;
+    setActiveSessionId(null);
+
+    void listSessions(false)
+      .then((list) => {
+        if (cancelled) {
+          return;
+        }
+
+        setSessions(list);
+        if (list[0]) {
+          void selectSession(list[0].id);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rootPath, selectSession]);
+
+  // A new conversation becomes a saved session with its first message.
+  const startSession = useCallback(async (text: string): Promise<string> => {
+    const fresh: SessionRuntime = { ...EMPTY_RUNTIME, messages: [] };
+    let id: string;
+
+    try {
+      const session = await createSession(titleFrom(text));
+      id = session.id;
+      savedRef.current[id] = { messages: fresh.messages, condensed: null };
+      setSessions((current) => [{ ...session, running: false }, ...current]);
+    } catch (cause) {
+      id = `unsaved-${Date.now()}`;
+      setNotice(
+        `${toError(cause, "The session database is unavailable.").message} This conversation will not be kept.`,
+      );
+    }
+
+    setRuntimes((current) => ({ ...current, [id]: fresh }));
+    setActiveSessionId(id);
+    return id;
+  }, []);
+
+  // Every change to a session's messages is written to the database.
+  useEffect(() => {
+    for (const [id, runtime] of Object.entries(runtimes)) {
+      const saved = savedRef.current[id];
+
+      if (!saved || (saved.messages === runtime.messages && saved.condensed === runtime.condensed)) {
+        continue;
+      }
+
+      savedRef.current[id] = { messages: runtime.messages, condensed: runtime.condensed };
+      void saveSession(id, runtime.messages, runtime.condensed)
+        .then(() => refreshSessions())
+        .catch((cause) => {
+          setNotice(toError(cause, "The conversation could not be saved.").message);
+        });
+    }
+  }, [refreshSessions, runtimes]);
+
+  const handleArchiveSession = useCallback(
+    async (id: string, archived: boolean) => {
+      try {
+        await archiveSession(id, archived);
+        if (archived && id === activeSessionId) {
+          setActiveSessionId(null);
+        }
+        await refreshSessions();
+      } catch (cause) {
+        setNotice(toError(cause, "The session could not be archived.").message);
+      }
+    },
+    [activeSessionId, refreshSessions],
+  );
+
+  const handleDeleteSession = useCallback(
+    async (id: string) => {
+      try {
+        await deleteSession(id);
+        delete savedRef.current[id];
+        delete liveBlocks.current[id];
+        setRuntimes((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+        if (id === activeSessionId) {
+          setActiveSessionId(null);
+        }
+        await refreshSessions();
+      } catch (cause) {
+        setNotice(toError(cause, "The session could not be deleted.").message);
+      }
+    },
+    [activeSessionId, refreshSessions],
+  );
+
+  const handleRenameSession = useCallback(
+    async (id: string, title: string) => {
+      try {
+        await renameSession(id, title);
+        await refreshSessions();
+      } catch (cause) {
+        setNotice(toError(cause, "The session could not be renamed.").message);
+      }
+    },
+    [refreshSessions],
+  );
 
   const assistantContext = useMemo(() => {
     const window = contextWindowFor(settings, settings.chat);
@@ -1276,13 +1495,19 @@ export default function App() {
 
   const handleSendPrompt = useCallback(
     async (text: string, earlier: AssistantMessage[] = assistantMessages) => {
+      // Everything below belongs to this session, even if the user switches
+      // to another one while it runs.
+      const sessionId = activeSessionId ?? (await startSession(text));
+      const setMessages = (
+        update: (messages: AssistantMessage[]) => AssistantMessage[],
+      ) => patchSession(sessionId, (runtime) => ({ messages: update(runtime.messages) }));
       const userId = nextMessageId.current;
       nextMessageId.current += 1;
 
-      setAssistantMessages([...earlier, { id: userId, role: "user", text }]);
+      setMessages(() => [...earlier, { id: userId, role: "user", text }]);
 
       if (!chatTarget) {
-        setAssistantMessages((current) => [
+        setMessages((current) => [
           ...current,
           {
             id: nextMessageId.current++,
@@ -1328,21 +1553,24 @@ export default function App() {
         projected.ratio >= CONDENSE_AT &&
         messagesToCondense(earlier, active, 2).length > 0
       ) {
-        setAssistantPending(true);
+        patchSession(sessionId, () => ({ pending: true }));
         condenseNote = {
           id: -1,
           kind: "notice",
           title: "Condensing earlier messages to free up context…",
           status: "running",
         };
-        startLive([{ type: "step", step: condenseNote }]);
-        const result = await condenseHistory(earlier, active, window);
+        startLive(sessionId, [{ type: "step", step: condenseNote }]);
+        const result = await condenseHistory(sessionId, earlier, active, window);
         active = result.condensed;
-        setCondensed(active);
+        const settled = active;
+        patchSession(sessionId, () => ({ condensed: settled }));
         condenseNote = { ...condenseNote, title: result.note, status: "done" };
-        updateLive((blocks) => upsertStep(blocks, condenseNote as AgentStep));
+        const note = condenseNote;
+        updateLive(sessionId, (blocks) => upsertStep(blocks, note));
       } else if (active !== condensed) {
-        setCondensed(active);
+        const settled = active;
+        patchSession(sessionId, () => ({ condensed: settled }));
       }
 
       const history: ChatMessage[] = [
@@ -1365,9 +1593,9 @@ export default function App() {
         reply: Awaited<ReturnType<typeof runAgent>>,
         prefix: MessageBlock[] = [],
       ) => {
-        const blocks = finishBlocks(liveBlocks.current ?? prefix, reply);
+        const blocks = finishBlocks(liveBlocks.current[sessionId] ?? prefix, reply);
 
-        setAssistantMessages((current) => [
+        setMessages((current) => [
           ...current,
           {
             id: nextMessageId.current++,
@@ -1381,11 +1609,11 @@ export default function App() {
 
       // A stopped or failed run keeps what it already did on screen.
       const fail = (message: string, stopped: boolean) => {
-        const blocks = (liveBlocks.current ?? []).filter(
+        const blocks = (liveBlocks.current[sessionId] ?? []).filter(
           (block) => block.type === "step",
         );
 
-        setAssistantMessages((current) => [
+        setMessages((current) => [
           ...current,
           {
             id: nextMessageId.current++,
@@ -1397,15 +1625,15 @@ export default function App() {
         ]);
       };
 
-      setAssistantPending(true);
+      patchSession(sessionId, () => ({ pending: true }));
 
       if (!condenseNote) {
-        startLive();
+        startLive(sessionId);
       }
 
       try {
         finish(
-          await runAgent(chatTarget, history, autoApprove),
+          await runAgent(chatTarget, history, autoApprove, window, sessionId),
         );
       } catch (cause) {
         const failure = toError(cause, "The request failed.");
@@ -1422,11 +1650,17 @@ export default function App() {
             status: "done",
           };
 
-          startLive([{ type: "step", step: note }]);
+          startLive(sessionId, [{ type: "step", step: note }]);
 
           try {
             finish(
-              await runAgent(alternative, history, autoApprove),
+              await runAgent(
+                alternative,
+                history,
+                autoApprove,
+                contextWindowFor(settings, fallback).tokens,
+                sessionId,
+              ),
             );
           } catch (retryCause) {
             const retryFailure = toError(retryCause, "The request failed.");
@@ -1436,14 +1670,13 @@ export default function App() {
           fail(failure.message, stopped);
         }
       } finally {
-        liveBlocks.current = null;
-        setAssistantPending(false);
-        setLive(null);
-        setApprovals({});
+        delete liveBlocks.current[sessionId];
+        patchSession(sessionId, () => ({ pending: false, live: null, approvals: {} }));
       }
     },
     [
       activeContent,
+      activeSessionId,
       assistantMessages,
       autoApprove,
       chatTarget,
@@ -1451,22 +1684,32 @@ export default function App() {
       condensed,
       contextPath,
       openFileContextChars,
+      patchSession,
       settings,
       startLive,
+      startSession,
       updateLive,
     ],
   );
 
-  const handleDecide = useCallback((stepId: number, accept: boolean) => {
-    setApprovals((current) => {
-      const next = { ...current };
-      delete next[stepId];
-      return next;
-    });
-    void decideChange(stepId, accept).catch((cause) => {
-      setNotice(toError(cause, "The decision could not be sent.").message);
-    });
-  }, []);
+  const handleDecide = useCallback(
+    (stepId: number, accept: boolean) => {
+      if (!activeSessionId) {
+        return;
+      }
+
+      const sessionId = activeSessionId;
+      patchSession(sessionId, (runtime) => {
+        const next = { ...runtime.approvals };
+        delete next[stepId];
+        return { approvals: next };
+      });
+      void decideChange(sessionId, stepId, accept).catch((cause) => {
+        setNotice(toError(cause, "The decision could not be sent.").message);
+      });
+    },
+    [activeSessionId, patchSession],
+  );
 
   const handleRetry = useCallback(
     (messageId: number) => {
@@ -1497,10 +1740,9 @@ export default function App() {
     );
   }, [handleSendPrompt]);
 
+  // A new session starts empty and is saved with its first message.
   const handleNewChat = useCallback(() => {
-    setAssistantMessages([]);
-    setApprovals({});
-    setCondensed(null);
+    setActiveSessionId(null);
   }, []);
 
   const toggleAutoApprove = useCallback(() => {
@@ -1532,16 +1774,25 @@ export default function App() {
       );
     };
 
-    attach<AgentStep>("agent-step", (step) => {
-      updateLive((blocks) => upsertStep(blocks, step));
+    attach<AgentStep & { session?: string }>("agent-step", ({ session, ...step }) => {
+      if (session) {
+        updateLive(session, (blocks) => upsertStep(blocks, step));
+      }
     });
 
-    attach<AgentDelta>("agent-delta", (delta) => {
-      updateLive((blocks) => appendDelta(blocks, delta));
+    attach<AgentDelta & { session?: string }>("agent-delta", ({ session, ...delta }) => {
+      if (session) {
+        updateLive(session, (blocks) => appendDelta(blocks, delta));
+      }
     });
 
     attach<ApprovalRequest>("agent-approval", (request) => {
-      setApprovals((current) => ({ ...current, [request.stepId]: request }));
+      const session = request.session;
+      if (session) {
+        patchSession(session, (runtime) => ({
+          approvals: { ...runtime.approvals, [request.stepId]: request },
+        }));
+      }
     });
 
     return () => {
@@ -1551,7 +1802,7 @@ export default function App() {
         stop();
       }
     };
-  }, [updateLive]);
+  }, [patchSession, updateLive]);
 
   // The assistant can rewrite a file through its tools; keep the editor in sync.
   const contentsRef = useRef<Record<string, string>>({});
@@ -1707,6 +1958,15 @@ export default function App() {
     onContinue: handleContinue,
     autoApprove,
     onToggleAutoApprove: toggleAutoApprove,
+    sessions,
+    activeSessionId,
+    runningSessionIds,
+    showArchived,
+    onToggleArchived: () => setShowArchived((value) => !value),
+    onSelectSession: (id: string) => void selectSession(id),
+    onArchiveSession: (id: string, archived: boolean) => void handleArchiveSession(id, archived),
+    onDeleteSession: (id: string) => void handleDeleteSession(id),
+    onRenameSession: (id: string, title: string) => void handleRenameSession(id, title),
   };
   const previewRef = useRef<MarkdownPreviewHandle>(null);
   const editorSyncUntil = useRef(0);
@@ -1878,7 +2138,7 @@ export default function App() {
               onSend={handleSendPrompt}
               seed={assistantSeed}
               onSeedConsumed={consumeAssistantSeed}
-              onStop={() => void cancelAgent()}
+              onStop={() => void cancelAgent(activeSessionId ?? undefined)}
               onOpenSettings={openSettings}
               onHide={() => {
                 setAssistantFull(false);
@@ -2200,7 +2460,7 @@ export default function App() {
             onSend={handleSendPrompt}
             seed={assistantSeed}
             onSeedConsumed={consumeAssistantSeed}
-            onStop={() => void cancelAgent()}
+            onStop={() => void cancelAgent(activeSessionId ?? undefined)}
             onOpenSettings={openSettings}
                 onHide={() => setAssistantOpen(false)}
               />

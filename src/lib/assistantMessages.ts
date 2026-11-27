@@ -1,4 +1,4 @@
-import type { AgentDelta, AgentReply, AgentStep } from "./llm";
+import type { AgentDelta, AgentReply, AgentStep, Objective } from "./llm";
 
 /**
  * An assistant turn is a timeline: text, thinking and tool steps in the order
@@ -100,6 +100,9 @@ const VERBS: Record<string, string> = {
   search_text: "searched",
   edit_file: "edited",
   write_file: "wrote",
+  run_command: "ran",
+  session_status: "checked",
+  message_sessions: "messaged",
 };
 
 /**
@@ -110,9 +113,16 @@ export function historyContent(message: AssistantMessage): string {
   const steps = (message.blocks ?? []).flatMap((block) =>
     block.type === "step" && block.step.tool ? [block.step] : [],
   );
+  // The checklist goes back too, so "continue" picks up where it stopped.
+  const checklist = objectivesOf(message.blocks ?? []);
+  const objectives = checklist
+    ? `[Objectives: ${checklist
+        .map((objective) => `${objective.title} (${objective.status.replace("_", " ")})`)
+        .join("; ")}]\n`
+    : "";
 
   if (steps.length === 0) {
-    return message.text;
+    return objectives ? `${objectives}\n${message.text}` : message.text;
   }
 
   const actions = steps.map((step) => {
@@ -128,5 +138,20 @@ export function historyContent(message: AssistantMessage): string {
     return `${verb} ${target}${outcome}`;
   });
 
-  return `[Tools used in this turn: ${actions.join("; ")}]\n\n${message.text}`;
+  return `${objectives}[Tools used in this turn: ${actions.join("; ")}]\n\n${message.text}`;
+}
+
+/** The turn's checklist, if the agent kept one. */
+export function objectivesOf(blocks: MessageBlock[]): Objective[] | null {
+  for (const block of blocks) {
+    if (
+      block.type === "step" &&
+      block.step.kind === "objectives" &&
+      block.step.objectives?.length
+    ) {
+      return block.step.objectives;
+    }
+  }
+
+  return null;
 }

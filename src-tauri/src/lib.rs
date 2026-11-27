@@ -1,9 +1,12 @@
 mod agent;
+mod command;
 mod git;
 mod gradle;
 mod gradle_settings;
 mod llm;
+mod run;
 mod secrets;
+mod store;
 mod terminal;
 mod web;
 mod workspace;
@@ -17,8 +20,12 @@ use tauri::{Manager, State};
 
 struct AppState {
     root: Mutex<Option<PathBuf>>,
-    cancel: Arc<AtomicBool>,
+    /// Stop flags of the assistant runs in progress, by session id.
+    runs: Arc<run::Runs>,
     approvals: Arc<agent::Approvals>,
+    /// The session database; None if it could not be opened (the assistant
+    /// still works, without history or coordination).
+    store: Mutex<Option<Arc<store::Store>>>,
     terminals: Mutex<HashMap<String, terminal::Session>>,
     web: web::WebState,
 }
@@ -467,20 +474,142 @@ fn terminal_kill(state: State<'_, AppState>, id: String) {
     terminal::kill(&state.terminals, &id);
 }
 
+/// Stops one session's run, or every run when no session is given.
 #[tauri::command]
-fn ai_cancel(state: State<'_, AppState>) {
-    state.cancel.store(true, Ordering::SeqCst);
+fn ai_cancel(state: State<'_, AppState>, session_id: Option<String>) {
+    if let Ok(runs) = state.runs.lock() {
+        for (session, flag) in runs.iter() {
+            if session_id.as_deref().map_or(true, |id| id == session) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
-/// The user's answer to a proposed file change from the running agent.
+/// The user's answer to a change or command a running session proposed.
 #[tauri::command]
-fn agent_decide(state: State<'_, AppState>, step_id: usize, accept: bool) -> Result<(), String> {
+fn agent_decide(
+    state: State<'_, AppState>,
+    session_id: String,
+    step_id: usize,
+    accept: bool,
+) -> Result<(), String> {
     state
         .approvals
         .lock()
         .map_err(|_| "The assistant state is unavailable.".to_string())?
-        .insert(step_id, accept);
+        .insert((session_id, step_id), accept);
     Ok(())
+}
+
+// ── sessions ────────────────────────────────────────────────────────────────
+
+fn session_store(state: &State<'_, AppState>) -> Result<Arc<store::Store>, String> {
+    state
+        .store
+        .lock()
+        .map_err(|_| "The session database is unavailable.".to_string())?
+        .clone()
+        .ok_or_else(|| "The session database could not be opened, so conversations are not saved.".to_string())
+}
+
+/// Sessions are grouped by the open folder; with none open, under "".
+fn project_key(state: &State<'_, AppState>) -> String {
+    state
+        .root
+        .lock()
+        .ok()
+        .and_then(|root| root.clone())
+        .map(|root| root.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionListing {
+    #[serde(flatten)]
+    summary: store::SessionSummary,
+    running: bool,
+}
+
+#[tauri::command]
+async fn sessions_list(
+    state: State<'_, AppState>,
+    include_archived: bool,
+) -> Result<Vec<SessionListing>, String> {
+    let store = session_store(&state)?;
+    let project = project_key(&state);
+    let runs = state.runs.clone();
+    blocking(move || {
+        Ok(store
+            .list_sessions(&project, include_archived)?
+            .into_iter()
+            .map(|summary| SessionListing {
+                running: run::is_running(&runs, &summary.id),
+                summary,
+            })
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn session_create(
+    state: State<'_, AppState>,
+    title: String,
+) -> Result<store::SessionSummary, String> {
+    let store = session_store(&state)?;
+    let project = project_key(&state);
+    blocking(move || store.create_session(&project, title.trim())).await
+}
+
+#[tauri::command]
+async fn session_load(state: State<'_, AppState>, id: String) -> Result<store::SessionData, String> {
+    let store = session_store(&state)?;
+    blocking(move || store.load_session(&id)).await
+}
+
+#[tauri::command]
+async fn session_save(
+    state: State<'_, AppState>,
+    id: String,
+    messages: Vec<serde_json::Value>,
+    condensed: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let store = session_store(&state)?;
+    blocking(move || store.save_messages(&id, &messages, condensed.as_ref())).await
+}
+
+#[tauri::command]
+async fn session_rename(state: State<'_, AppState>, id: String, title: String) -> Result<(), String> {
+    let store = session_store(&state)?;
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("Give the session a name.".into());
+    }
+    blocking(move || store.rename_session(&id, &title)).await
+}
+
+#[tauri::command]
+async fn session_archive(
+    state: State<'_, AppState>,
+    id: String,
+    archived: bool,
+) -> Result<(), String> {
+    if archived && run::is_running(&state.runs, &id) {
+        return Err("Stop this session before archiving it.".into());
+    }
+    let store = session_store(&state)?;
+    blocking(move || store.archive_session(&id, archived)).await
+}
+
+#[tauri::command]
+async fn session_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if run::is_running(&state.runs, &id) {
+        return Err("Stop this session before deleting it.".into());
+    }
+    let store = session_store(&state)?;
+    blocking(move || store.delete_session(&id)).await
 }
 
 #[tauri::command]
@@ -491,32 +620,91 @@ async fn ai_agent(
     model: String,
     messages: Vec<llm::ChatMessage>,
     auto_approve: bool,
+    context_window: Option<u64>,
+    session_id: Option<String>,
 ) -> Result<agent::AgentReply, String> {
     let root = state
         .root
         .lock()
         .map_err(|_| "The workspace state is unavailable.".to_string())?
         .clone();
+    let store = state.store.lock().ok().and_then(|store| store.clone());
+    // A run without a saved session (no database) still gets its own id.
+    let session = session_id.unwrap_or_else(store::new_id);
+    let title = store
+        .as_ref()
+        .and_then(|store| store.session(&session).ok().flatten())
+        .map(|summary| summary.title)
+        .unwrap_or_else(|| "Untitled session".to_string());
 
-    state.cancel.store(false, Ordering::SeqCst);
-    let cancel = state.cancel.clone();
-    let approvals = state.approvals.clone();
-
-    if let Ok(mut pending) = approvals.lock() {
-        pending.clear();
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut runs = state
+            .runs
+            .lock()
+            .map_err(|_| "The assistant state is unavailable.".to_string())?;
+        if runs.contains_key(&session) {
+            return Err("This session is already working. Wait for it, or stop it first.".into());
+        }
+        runs.insert(session.clone(), cancel.clone());
     }
+
+    let approvals = state.approvals.clone();
+    if let Ok(mut pending) = approvals.lock() {
+        pending.retain(|(owner, _), _| owner != &session);
+    }
+
+    let context = run::RunContext {
+        handle: app.clone(),
+        session: session.clone(),
+        title,
+        project: root
+            .as_ref()
+            .map(|root| root.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        store: store.clone(),
+        runs: state.runs.clone(),
+    };
+
+    let asked = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.lines().next().unwrap_or("").chars().take(120).collect::<String>())
+        .unwrap_or_default();
+    context.record("start", None, &asked);
 
     let result = agent::run(
         root,
-        &app,
+        &context,
         &endpoint,
         &model,
         messages,
         auto_approve,
+        context_window,
         &approvals,
         &cancel,
     )
     .await;
+
+    // Whatever happened, the session's locks go and the others hear it ended.
+    context.record(
+        "finish",
+        None,
+        &match &result {
+            Ok(reply) => reply.text.lines().find(|line| !line.trim().is_empty()).unwrap_or("").chars().take(160).collect(),
+            Err(error) => format!("stopped: {}", error.chars().take(120).collect::<String>()),
+        },
+    );
+    if let Some(store) = &store {
+        let _ = store.release_claims(&session);
+    }
+    if let Ok(mut runs) = state.runs.lock() {
+        runs.remove(&session);
+    }
+    if let Ok(mut pending) = approvals.lock() {
+        pending.retain(|(owner, _), _| owner != &session);
+    }
 
     if let Err(error) = &result {
         eprintln!("ai_agent failed: {error}");
@@ -568,8 +756,19 @@ pub fn run() {
                 }
             }
 
-            #[cfg(not(windows))]
-            let _ = app;
+            // The session database lives in the app data folder. Without it
+            // the assistant still works; conversations are just not kept.
+            match app.path().app_data_dir() {
+                Ok(folder) => match store::Store::open(&folder.join("nexium.db")) {
+                    Ok(opened) => {
+                        if let Ok(mut slot) = app.state::<AppState>().store.lock() {
+                            *slot = Some(Arc::new(opened));
+                        }
+                    }
+                    Err(error) => eprintln!("session database unavailable: {error}"),
+                },
+                Err(error) => eprintln!("no app data folder for the session database: {error}"),
+            }
 
             Ok(())
         })
@@ -583,8 +782,9 @@ pub fn run() {
         })
         .manage(AppState {
             root: Mutex::new(None),
-            cancel: Arc::new(AtomicBool::new(false)),
+            runs: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            store: Mutex::new(None),
             terminals: Mutex::new(HashMap::new()),
             web: web::WebState::default(),
         })
@@ -636,7 +836,14 @@ pub fn run() {
             llm::ai_chat,
             ai_cancel,
             agent_decide,
-            ai_agent
+            ai_agent,
+            sessions_list,
+            session_create,
+            session_load,
+            session_save,
+            session_rename,
+            session_archive,
+            session_delete
         ])
         .run(tauri::generate_context!())
         .expect("Nexium Studio failed to start");
