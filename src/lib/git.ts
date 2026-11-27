@@ -20,6 +20,11 @@ export type GitStatus = {
   behind?: number;
   /** The repository has a remote at all. */
   hasRemote?: boolean;
+  /**
+   * Set when the open folder sits inside a larger repository (it is not the
+   * repository's own folder): that repository's folder.
+   */
+  nestedIn?: string | null;
 };
 
 /** A local branch, or a remote one no local branch tracks yet. */

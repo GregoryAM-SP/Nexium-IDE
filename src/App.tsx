@@ -2759,7 +2759,7 @@ export default function App() {
           )}
         </span>
 
-        {git?.isRepo && git.hasRemote === false && (
+        {git?.isRepo && (git.hasRemote === false || git.nestedIn) && (
           <button
             type="button"
             onClick={() => setPublishOpen(true)}
@@ -2773,7 +2773,8 @@ export default function App() {
 
         {publishOpen && (
           <PublishDialog
-            isRepo={Boolean(git?.isRepo)}
+            isRepo={Boolean(git?.isRepo && !git.nestedIn)}
+            nestedIn={git?.nestedIn}
             branch={git?.branch ?? ""}
             onPublished={(result) => {
               setGit(result.status);

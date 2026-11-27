@@ -22,6 +22,8 @@ import type { GitHubAccount, PublishResult } from "../lib/github";
 type PublishDialogProps = {
   /** The folder is already a Git repository (otherwise one is started). */
   isRepo: boolean;
+  /** The folder sits inside this other repository; it gets its own. */
+  nestedIn?: string | null;
   branch: string;
   onPublished: (result: PublishResult) => void;
   onOpenSettings: () => void;
@@ -35,6 +37,7 @@ type PublishDialogProps = {
  */
 export default function PublishDialog({
   isRepo,
+  nestedIn,
   branch,
   onPublished,
   onOpenSettings,
@@ -288,9 +291,11 @@ export default function PublishDialog({
               </div>
 
               <p className="text-[10.5px] leading-relaxed text-ink/35">
-                {isRepo
-                  ? <>The repository becomes this folder's <span className="font-mono">origin</span>, and <span className="font-mono">{branch || "the current branch"}</span> is pushed to it.</>
-                  : <>This folder is not a Git repository yet: one is started (on <span className="font-mono">main</span>). Commit your files afterwards, then publish the branch.</>}
+                {nestedIn
+                  ? <>This folder is inside the repository at <span className="break-all font-mono">{nestedIn}</span>. A separate repository is started in this folder (on <span className="font-mono">main</span>) and published; the outer one is left as it is. Commit your files afterwards, then publish the branch.</>
+                  : isRepo
+                    ? <>The repository becomes this folder's <span className="font-mono">origin</span>, and <span className="font-mono">{branch || "the current branch"}</span> is pushed to it.</>
+                    : <>This folder is not a Git repository yet: one is started (on <span className="font-mono">main</span>). Commit your files afterwards, then publish the branch.</>}
               </p>
 
               {error && (

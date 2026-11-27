@@ -48,6 +48,9 @@ pub struct GitStatus {
     pub behind: u32,
     /// The repository has at least one remote.
     pub has_remote: bool,
+    /// Set when the open folder is not the repository's top level but a
+    /// folder inside another repository: that repository's folder.
+    pub nested_in: Option<String>,
 }
 
 /// A local branch, or a remote one no local branch tracks yet.
@@ -191,6 +194,7 @@ pub fn status(root: &Path) -> Result<GitStatus, String> {
             ahead: 0,
             behind: 0,
             has_remote: false,
+            nested_in: None,
         });
     }
 
@@ -207,24 +211,65 @@ pub fn status(root: &Path) -> Result<GitStatus, String> {
     };
 
     // Without `--untracked-files=all` git collapses a new folder into a single
-    // `?? folder/` entry, so its files would never show up in the panel.
+    // `?? folder/` entry, so its files would never show up in the panel. The
+    // `.` limits it to the open folder, which matters when that folder sits
+    // inside a larger repository.
     let raw = run(
         root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."],
     )?;
 
     let (upstream, ahead, behind) = tracking(root);
+    let prefix = prefix(root);
 
     Ok(GitStatus {
         is_repo: true,
         branch,
-        changes: parse_changes(&raw),
+        changes: relative_to_folder(parse_changes(&raw), &prefix),
         message: None,
         upstream,
         ahead,
         behind,
         has_remote: has_remote(root),
+        nested_in: if prefix.is_empty() { None } else { toplevel(root) },
     })
+}
+
+/// Where the open folder sits inside its repository, as git prints it
+/// (`apps/web/`), or empty at the top level.
+fn prefix(root: &Path) -> String {
+    run(root, &["rev-parse", "--show-prefix"])
+        .map(|prefix| prefix.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn toplevel(root: &Path) -> Option<String> {
+    run(root, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|path| path.trim().replace('/', std::path::MAIN_SEPARATOR_STR))
+        .filter(|path| !path.is_empty())
+}
+
+/// The repository's own folder is the open folder (not a parent of it).
+pub fn is_own_repo(root: &Path) -> bool {
+    is_repo(root) && prefix(root).is_empty()
+}
+
+/// Git reports paths from the repository's top level; everything else in the
+/// app (and every git command run in the folder) uses paths relative to the
+/// open folder. Paths outside it are dropped.
+fn relative_to_folder(changes: Vec<GitChange>, prefix: &str) -> Vec<GitChange> {
+    if prefix.is_empty() {
+        return changes;
+    }
+
+    changes
+        .into_iter()
+        .filter_map(|change| {
+            let path = change.path.strip_prefix(prefix)?.to_string();
+            Some(GitChange { path, ..change })
+        })
+        .collect()
 }
 
 fn has_remote(root: &Path) -> bool {
@@ -475,10 +520,10 @@ pub fn set_identity(root: &Path, name: &str, email: &str) -> Result<GitIdentity,
 pub fn file_diff(root: &Path, path: &str, staged: bool) -> Result<GitFileDiff, String> {
     // A new file has no HEAD entry, and neither has the first commit of a
     // repository, so both read as an empty original.
-    let original = run(root, &["show", &format!("HEAD:{path}")]).unwrap_or_default();
+    let original = run(root, &["show", &format!("HEAD:./{path}")]).unwrap_or_default();
 
     let modified = if staged {
-        run(root, &["show", &format!(":{path}")])?
+        run(root, &["show", &format!(":./{path}")])?
     } else {
         std::fs::read_to_string(root.join(path))
             .map_err(|error| format!("That file could not be read: {error}"))?
@@ -499,12 +544,13 @@ pub fn unstage(root: &Path, path: &str) -> Result<(), String> {
     }
 }
 
+/// Stages everything in the open folder (not the rest of a larger repository).
 pub fn stage_all(root: &Path) -> Result<(), String> {
-    run(root, &["add", "--all"]).map(|_| ())
+    run(root, &["add", "--all", "--", "."]).map(|_| ())
 }
 
 pub fn unstage_all(root: &Path) -> Result<(), String> {
-    match run(root, &["reset", "--quiet"]) {
+    match run(root, &["reset", "--quiet", "--", "."]) {
         Ok(_) => Ok(()),
         Err(_) => run(root, &["rm", "-r", "--cached", "--quiet", "--", "."]).map(|_| ()),
     }
@@ -994,6 +1040,59 @@ mod tests {
         assert!(checkout_tag(&work, "v9.9.9").unwrap_err().contains("no tag"));
         create_branch(&work, "hotfix/1.0.1", true).unwrap();
         assert_eq!(status(&work).unwrap().branch, "hotfix/1.0.1");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn works_in_a_folder_inside_another_repository() {
+        let base = scratch("nested");
+        run(&base, &["init", "-q", "-b", "main"]).unwrap();
+        identify(&base);
+        std::fs::write(base.join("outer.txt"), "outer").unwrap();
+        run(&base, &["add", "outer.txt"]).unwrap();
+        run(&base, &["commit", "-q", "-m", "Outer"]).unwrap();
+
+        // A new project folder inside the outer repository, as "New project" makes.
+        let project = base.join("test");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("README.md"), "# test").unwrap();
+        std::fs::write(base.join("elsewhere.txt"), "not in the project").unwrap();
+
+        let listed = status(&project).unwrap();
+        assert!(listed.nested_in.is_some(), "it says it is inside another repository");
+        assert!(!is_own_repo(&project));
+        let paths: Vec<&str> = listed.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["README.md"], "paths relative to the folder, nothing from outside it");
+
+        // Staging the path the panel shows works (it used to look in test/test/).
+        stage(&project, "README.md").unwrap();
+        let staged = status(&project).unwrap();
+        assert!(staged.changes.iter().any(|c| c.path == "README.md" && c.staged));
+        let diff = file_diff(&project, "README.md", true).unwrap();
+        assert_eq!(diff.modified, "# test");
+        unstage(&project, "README.md").unwrap();
+
+        // Stage all stays inside the folder.
+        stage_all(&project).unwrap();
+        let outer = status(&base).unwrap();
+        assert!(outer.changes.iter().any(|c| c.path == "elsewhere.txt" && !c.staged));
+        assert!(outer.changes.iter().any(|c| c.path == "test/README.md" && c.staged));
+        unstage_all(&project).unwrap();
+        assert!(status(&base).unwrap().changes.iter().all(|c| !c.staged));
+
+        // A diff of a committed file inside the folder reads the right HEAD side.
+        run(&project, &["add", "README.md"]).unwrap();
+        run(&project, &["commit", "-q", "-m", "Project readme"]).unwrap();
+        std::fs::write(project.join("README.md"), "# test, edited").unwrap();
+        let changed = file_diff(&project, "README.md", false).unwrap();
+        assert_eq!(changed.original, "# test");
+        assert_eq!(changed.modified, "# test, edited");
+
+        // Its own repository, once started, is a separate one.
+        init(&project).unwrap();
+        assert!(is_own_repo(&project));
+        assert!(status(&project).unwrap().nested_in.is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }

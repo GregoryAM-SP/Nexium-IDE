@@ -442,6 +442,24 @@ export default function SourceControlPanel({
         </div>
       ) : (
         <>
+          {status?.nestedIn && (
+            <div className="shrink-0 border-b border-line bg-ink/[0.025] px-3 py-2.5">
+              <p className="text-[10.5px] leading-relaxed text-ink/55">
+                This folder is inside the Git repository at{" "}
+                <span className="break-all font-mono text-ink/70">{status.nestedIn}</span>. Changes
+                below are this folder's, but commits, branches, pulls and pushes are that
+                repository's.
+              </p>
+              <button
+                type="button"
+                onClick={onPublish}
+                className="mt-2 flex h-6 items-center gap-1.5 rounded-md border border-ink/[0.14] px-2 text-[10.5px] text-ink/70 transition-colors duration-150 hover:border-ink/30 hover:text-ink"
+              >
+                <CloudUpload className="size-3" strokeWidth={1.75} />
+                Publish this folder as its own GitHub repository
+              </button>
+            </div>
+          )}
           <div className="flex shrink-0 items-center gap-2 border-b border-line px-3 py-2">
             <GitBranch
               className="size-3.5 shrink-0 text-ink/30"
@@ -450,7 +468,7 @@ export default function SourceControlPanel({
             <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink/55">
               {status?.branch || (busy ? "Reading repository…" : "no branch")}
             </span>
-            {status?.isRepo && status.hasRemote === false && (
+            {status?.isRepo && status.hasRemote === false && !status.nestedIn && (
               <button
                 type="button"
                 onClick={onPublish}

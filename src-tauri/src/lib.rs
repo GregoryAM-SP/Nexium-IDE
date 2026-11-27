@@ -292,7 +292,9 @@ async fn github_publish(
 
     let check = root.clone();
     blocking(move || {
-        if git::is_repo(&check) {
+        // A folder inside a larger repository gets a repository of its own;
+        // only a repository rooted here can already have an origin.
+        if git::is_own_repo(&check) {
             if let Some(url) = git::remote_url(&check, "origin") {
                 return Err(format!("This repository already has an origin remote ({url}). Push to it instead."));
             }
@@ -316,7 +318,7 @@ async fn github_publish(
     let clone_url = repo.clone_url.clone();
     let token = credentials.token.clone();
     let (pushed, push_error, status) = blocking(move || {
-        if !git::is_repo(&root) {
+        if !git::is_own_repo(&root) {
             git::init(&root)?;
         }
         git::add_origin(&root, &clone_url)?;

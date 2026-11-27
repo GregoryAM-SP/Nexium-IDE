@@ -231,6 +231,8 @@ Commits made from the panel credit Nexium as a co-author: the message ends with 
 
 A change opens as a read-only side-by-side diff in the editor area, titled `HEAD → staged` for a staged change (the index against `HEAD`) or `HEAD → working tree` for everything else (the file on disk against `HEAD`), with the file's own language, the app's fonts and the active `nexium` theme; the header carries the path and a close button that returns to the editor. A new file, or any file in a repository without commits, diffs against empty. The two sides are Monaco models owned by the diff pane: they are created per open and disposed after the widget is gone, so opening and closing diffs repeatedly leaks nothing.
 
+A folder opened inside a larger repository (for example a new project created inside another project's folder) works too: the panel lists only that folder's changes, with paths relative to it, and **Stage all** / **Unstage all** stay inside it. A note at the top names the outer repository, since commits, branches, pulls and pushes are that repository's, and offers **Publish this folder as its own GitHub repository**: publishing a nested folder starts a separate repository in it (`git init -b main`) and never touches the outer one.
+
 Every action returns the fresh status, so the panel never shows a stale tree. Saving a file or the assistant writing one refreshes it too. If the folder is not a repository the panel says so and suggests `git init`; git errors (missing identity, empty index, hooks) are shown verbatim in the panel footer. Nothing is ever committed automatically, and no history-rewriting command is reachable from the UI.
 
 ## Terminal
