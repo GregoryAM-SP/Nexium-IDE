@@ -31,6 +31,7 @@ import {
   Wrench,
   X,
   Zap,
+  Layers,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -38,6 +39,8 @@ import type { ReactNode } from "react";
 import type { AssistantMessage, MessageBlock } from "../lib/assistantMessages";
 import { sameModel } from "../lib/assistantSettings";
 import type { ModelOption, ModelRef } from "../lib/assistantSettings";
+import { estimateTokens, formatTokens } from "../lib/contextBudget";
+import type { CondensedHistory } from "../lib/contextBudget";
 import { lineDiff } from "../lib/lineDiff";
 import type { AgentStep, ApprovalRequest } from "../lib/llm";
 import MarkdownMessage from "./MarkdownMessage";
@@ -82,6 +85,21 @@ type AiAssistantProps = {
   /** When on, the agent's edits are written without asking first. */
   autoApprove: boolean;
   onToggleAutoApprove: () => void;
+  /** Estimated share of the model's context the next request uses. */
+  context: {
+    used: number;
+    window: number;
+    ratio: number;
+    /** Where the window size comes from: the user, the provider, or a default. */
+    source: "set" | "reported" | "assumed";
+    /** Share at which older turns are condensed. */
+    threshold: number;
+  };
+  /** The summary standing in for older turns, if any. */
+  condensed: CondensedHistory | null;
+  condensing: boolean;
+  canCondense: boolean;
+  onCondense: () => void;
 };
 
 const iconButton =
@@ -116,6 +134,11 @@ export default function AiAssistant({
   onContinue,
   autoApprove,
   onToggleAutoApprove,
+  context,
+  condensed,
+  condensing,
+  canCondense,
+  onCondense,
 }: AiAssistantProps) {
   const full = fullscreen;
   const [prompt, setPrompt] = useState("");
@@ -225,7 +248,8 @@ export default function AiAssistant({
     setAtBottom(true);
   }, [messages, pending, live, approvals]);
 
-  const canSend = configured && !pending && prompt.trim().length > 0;
+  const canSend =
+    configured && !pending && !condensing && prompt.trim().length > 0;
 
   const submit = () => {
     if (!canSend) {
@@ -374,7 +398,13 @@ export default function AiAssistant({
                 {messages.map((message) => (
                   <li key={message.id} className="text-[13px] leading-relaxed">
                     {message.role === "user" ? (
-                      <div className="flex justify-end">
+                      <div
+                        className={`flex justify-end ${
+                          condensed && message.id <= condensed.throughId
+                            ? "opacity-60"
+                            : ""
+                        }`}
+                      >
                         <div
                           className={`max-w-[92%] rounded-xl rounded-br-sm border border-ink/[0.07] bg-ink/[0.05] leading-relaxed whitespace-pre-wrap text-ink/85 ${
                             full
@@ -386,7 +416,13 @@ export default function AiAssistant({
                         </div>
                       </div>
                     ) : (
-                      <div>
+                      <div
+                        className={
+                          condensed && message.id <= condensed.throughId
+                            ? "opacity-60"
+                            : undefined
+                        }
+                      >
                         <p className="mb-2 flex items-center gap-1.5 text-[9.5px] uppercase tracking-[0.2em] text-ink/25">
                           <Sparkles className="size-3" strokeWidth={1.75} />
                           Assistant
@@ -414,6 +450,9 @@ export default function AiAssistant({
                           />
                         )}
                       </div>
+                    )}
+                    {condensed && message.id === condensed.throughId && (
+                      <CondensedDivider condensed={condensed} />
                     )}
                   </li>
                 ))}
@@ -606,9 +645,20 @@ export default function AiAssistant({
               className="block max-h-[220px] w-full resize-none bg-transparent px-3 pt-2 pb-1 text-[12.5px] leading-relaxed text-ink placeholder:text-ink/25 focus:outline-none disabled:cursor-not-allowed disabled:text-ink/30"
             />
             <div className="flex items-center justify-between gap-2 px-2 pt-0.5 pb-2">
-              <span className="truncate text-[9.5px] text-ink/25">
-                Enter to send · Shift+Enter for newline
-              </span>
+              {configured ? (
+                <ContextMeter
+                  context={context}
+                  draftTokens={estimateTokens(prompt)}
+                  condensed={condensed}
+                  condensing={condensing}
+                  canCondense={canCondense}
+                  onCondense={onCondense}
+                />
+              ) : (
+                <span className="truncate text-[9.5px] text-ink/25">
+                  Enter to send · Shift+Enter for newline
+                </span>
+              )}
               {pending ? (
                 <button
                   type="button"
@@ -1149,6 +1199,199 @@ function LiveRun({ live, model, ...timeline }: LiveRunProps) {
               Large models can take a minute or more before the first token.
             </p>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Marks where the summarised part of the conversation ends. */
+function CondensedDivider({ condensed }: { condensed: CondensedHistory }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="mt-5">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="group flex w-full items-center gap-2 text-[9.5px] uppercase tracking-[0.18em] text-ink/35 transition-colors duration-150 hover:text-ink/65"
+      >
+        <span className="h-px flex-1 bg-ink/[0.1]" />
+        <Layers className="size-3" strokeWidth={1.75} />
+        Earlier messages condensed
+        {condensed.saved > 0 && (
+          <span className="normal-case tracking-normal text-ink/30">
+            · ~{formatTokens(condensed.saved)} tokens freed
+          </span>
+        )}
+        <ChevronRight
+          className={`size-3 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+          strokeWidth={2}
+        />
+        <span className="h-px flex-1 bg-ink/[0.1]" />
+      </button>
+      {open && (
+        <div className="mt-2 rounded-lg border border-ink/[0.08] bg-ink/[0.02] px-3 py-2">
+          <p className="mb-1.5 text-[10px] text-ink/40">
+            The assistant sees this summary instead of the messages above it.
+          </p>
+          <MarkdownMessage text={condensed.summary} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A small ring showing how full the model's context will be with the next
+ * message; click for the numbers and to condense older turns by hand.
+ */
+function ContextMeter({
+  context,
+  draftTokens,
+  condensed,
+  condensing,
+  canCondense,
+  onCondense,
+}: {
+  context: AiAssistantProps["context"];
+  draftTokens: number;
+  condensed: CondensedHistory | null;
+  condensing: boolean;
+  canCondense: boolean;
+  onCondense: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const used = context.used + draftTokens;
+  const ratio = used / Math.max(1, context.window);
+  const percent = Math.min(100, Math.round(ratio * 100));
+  const near = ratio >= context.threshold * 0.9;
+  const radius = 6;
+  const circumference = 2 * Math.PI * radius;
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown, true);
+
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative min-w-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        aria-label={`Context ${percent}% used. Show details`}
+        title={`≈ ${formatTokens(used)} of ${formatTokens(context.window)} tokens`}
+        className={`flex items-center gap-1.5 rounded-md px-1 py-0.5 text-[10px] transition-colors duration-150 hover:bg-ink/[0.06] ${
+          near ? "text-ink/75" : "text-ink/35 hover:text-ink/65"
+        }`}
+      >
+        <svg viewBox="0 0 16 16" className="size-3.5 shrink-0 -rotate-90" aria-hidden="true">
+          <circle cx="8" cy="8" r={radius} fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2" />
+          <circle
+            cx="8"
+            cy="8"
+            r={radius}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeDasharray={`${(Math.min(1, ratio) * circumference).toFixed(2)} ${circumference.toFixed(2)}`}
+          />
+        </svg>
+        {condensing ? (
+          <span className="flex items-center gap-1">
+            <LoaderCircle className="size-3 animate-spin" />
+            Condensing…
+          </span>
+        ) : (
+          <span className="font-mono">{percent}%</span>
+        )}
+        <span className="hidden truncate text-ink/25 sm:inline">context</span>
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          aria-label="Context usage"
+          className="absolute bottom-full left-0 z-30 mb-2 w-[260px] rounded-xl border border-ink/[0.09] bg-raised/95 p-3 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.95)] backdrop-blur-xl"
+        >
+          <p className="text-[9.5px] uppercase tracking-[0.18em] text-ink/35">
+            Context
+          </p>
+          <p className="mt-1 font-mono text-[12px] text-ink/85">
+            ≈ {formatTokens(used)} / {formatTokens(context.window)} tokens · {percent}%
+          </p>
+          <div className="mt-2 h-1 overflow-hidden rounded-full bg-ink/[0.08]">
+            <div
+              className="h-full rounded-full bg-ink/70"
+              style={{ width: `${percent}%` }}
+            />
+          </div>
+          <div className="relative -mt-1 h-1">
+            <span
+              className="absolute top-0 h-2 w-px -translate-y-0.5 bg-ink/50"
+              style={{ left: `${context.threshold * 100}%` }}
+              title={`Condenses at ${Math.round(context.threshold * 100)}%`}
+            />
+          </div>
+          <p className="mt-2 text-[10.5px] leading-relaxed text-ink/45">
+            Counts the conversation, the open file, the assistant's tools and
+            room for its reply. Older messages are condensed into a summary at{" "}
+            {Math.round(context.threshold * 100)}%, so the chat never runs out
+            of room.
+          </p>
+          {context.source === "assumed" && (
+            <p className="mt-1.5 text-[10.5px] leading-relaxed text-ink/40">
+              This model's window size is an assumption; set the real figure in
+              Settings → AI providers.
+            </p>
+          )}
+          {condensed && (
+            <p className="mt-1.5 text-[10.5px] text-ink/40">
+              Already condensed once · ~{formatTokens(condensed.saved)} tokens freed.
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onCondense();
+            }}
+            disabled={!canCondense || condensing}
+            title={
+              canCondense
+                ? "Summarise all but the latest exchanges now"
+                : "Nothing old enough to condense yet"
+            }
+            className="mt-3 flex h-7 w-full items-center justify-center gap-1.5 rounded-lg border border-ink/[0.1] text-[11px] text-ink/65 transition-colors duration-150 hover:border-ink/25 hover:text-ink disabled:pointer-events-none disabled:opacity-40"
+          >
+            <Layers className="size-3.5" strokeWidth={1.75} />
+            Condense now
+          </button>
         </div>
       )}
     </div>

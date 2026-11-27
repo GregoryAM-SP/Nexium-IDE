@@ -191,9 +191,62 @@ export async function unstageAll(): Promise<GitStatus> {
   return demoStatus();
 }
 
+/**
+ * Commits made from Nexium Studio credit it as a co-author, so GitHub shows
+ * "Nexium" next to the author. The address is on the reserved `.invalid`
+ * domain: it can never belong to a GitHub account, so the credit is the name
+ * only and can never be attributed to a stranger's profile.
+ */
+export const NEXIUM_CO_AUTHOR = "Nexium <noreply@nexium-studio.invalid>";
+const CREDIT_KEY = "nexium.git.creditNexium";
+
+/** On unless the user turned it off in Settings → Source control. */
+export function creditsNexium(): boolean {
+  try {
+    return localStorage.getItem(CREDIT_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function setCreditsNexium(on: boolean): void {
+  try {
+    localStorage.setItem(CREDIT_KEY, String(on));
+  } catch {
+    // Without storage the default (on) simply applies.
+  }
+}
+
+const TRAILER = /^[A-Za-z][A-Za-z0-9-]*:\s+\S/;
+
+/**
+ * Adds the `Co-authored-by: Nexium` trailer. GitHub only reads trailers in the
+ * message's last paragraph, so it joins an existing trailer block (keeping any
+ * co-authors already there) instead of starting a paragraph after it.
+ */
+export function withNexiumCredit(message: string): string {
+  const text = message.trim();
+
+  if (!text || /^co-authored-by:\s*nexium\b/im.test(text)) {
+    return text;
+  }
+
+  const trailer = `Co-authored-by: ${NEXIUM_CO_AUTHOR}`;
+  const paragraphs = text.split(/\n\s*\n/);
+  const last = paragraphs[paragraphs.length - 1].split("\n");
+  const endsWithTrailers =
+    paragraphs.length > 1 && last.every((line) => TRAILER.test(line.trim()));
+
+  return endsWithTrailers ? `${text}\n${trailer}` : `${text}\n\n${trailer}`;
+}
+
+function creditedMessage(message: string): string {
+  return creditsNexium() ? withNexiumCredit(message) : message;
+}
+
 export async function commitChanges(message: string): Promise<GitStatus> {
   if (isTauri()) {
-    return call("git_commit", { message });
+    return call("git_commit", { message: creditedMessage(message) });
   }
 
   demo = {
@@ -206,7 +259,7 @@ export async function commitChanges(message: string): Promise<GitStatus> {
 
 export async function commitAndSync(message: string): Promise<GitStatus> {
   if (isTauri()) {
-    return call("git_commit_and_sync", { message });
+    return call("git_commit_and_sync", { message: creditedMessage(message) });
   }
 
   // The browser demo has no remote, so syncing only commits there.

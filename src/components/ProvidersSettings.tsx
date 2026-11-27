@@ -21,6 +21,7 @@ import type { ReactNode } from "react";
 
 import {
   baseUrlFor,
+  contextWindowFor,
   emptyProviderState,
   modelOptions,
   providerConnected,
@@ -44,6 +45,7 @@ import {
   baseUrlProblem,
 } from "../lib/providers";
 import type { ProviderCategory } from "../lib/providers";
+import { formatTokens } from "../lib/contextBudget";
 import { toError } from "../lib/tauriBridge";
 
 type ProvidersSettingsProps = {
@@ -594,6 +596,112 @@ function DefaultModels({ settings, onSave }: ProvidersSettingsProps) {
           every pause in typing.
         </p>
       )}
+      {chatValid && settings.chat && (
+        <ContextWindowField
+          key={refKey(settings.chat)}
+          settings={settings}
+          chat={settings.chat}
+          onSave={onSave}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * How many tokens the assistant model accepts. Providers that report it fill
+ * it in; for the rest (Ollama, LM Studio, many gateways) it is a cautious
+ * default the user can correct, since the context meter and condensing plan
+ * against it.
+ */
+function ContextWindowField({
+  settings,
+  chat,
+  onSave,
+}: ProvidersSettingsProps & { chat: ModelRef }) {
+  const window = contextWindowFor(settings, chat);
+  const [draft, setDraft] = useState(String(window.tokens));
+  const state = settings.providers[chat.provider] ?? emptyProviderState;
+  const parsed = Number(draft.replace(/[,_\s]/g, ""));
+  const valid = Number.isInteger(parsed) && parsed >= 1024 && parsed <= 10_000_000;
+  const changed = valid && parsed !== window.tokens;
+
+  const save = (contextSet: Record<string, number>) =>
+    onSave({
+      ...settings,
+      providers: {
+        ...settings.providers,
+        [chat.provider]: { ...state, contextSet },
+      },
+    });
+
+  return (
+    <div className="col-span-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-line pt-3">
+      <label htmlFor="context-window" className={label}>
+        Context window
+      </label>
+      <input
+        id="context-window"
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && changed) {
+            save({ ...state.contextSet, [chat.model]: parsed });
+          }
+        }}
+        inputMode="numeric"
+        spellCheck={false}
+        aria-describedby="context-window-hint"
+        className="w-28 rounded-md border border-line bg-app px-2 py-1 font-mono text-[11.5px] text-ink/80 focus:border-ink/25 focus:outline-none"
+      />
+      <span className="font-mono text-[10.5px] text-ink/35">tokens</span>
+      {changed && (
+        <button
+          type="button"
+          onClick={() => save({ ...state.contextSet, [chat.model]: parsed })}
+          className={primary}
+        >
+          Save
+        </button>
+      )}
+      {window.source === "set" && !changed && (
+        <button
+          type="button"
+          onClick={() => {
+            const contextSet = { ...state.contextSet };
+            delete contextSet[chat.model];
+            save(contextSet);
+            setDraft(
+              String(
+                contextWindowFor(
+                  {
+                    ...settings,
+                    providers: {
+                      ...settings.providers,
+                      [chat.provider]: { ...state, contextSet },
+                    },
+                  },
+                  chat,
+                ).tokens,
+              ),
+            );
+          }}
+          className={button}
+        >
+          <RotateCcw className="size-3.5" strokeWidth={1.75} />
+          Use default
+        </button>
+      )}
+      <p id="context-window-hint" className="basis-full text-[10.5px] text-ink/30">
+        {!valid && draft.trim()
+          ? "Enter a whole number of tokens, at least 1024."
+          : window.source === "reported"
+            ? `Reported by the provider for ${chat.model}.`
+            : window.source === "set"
+              ? `Set by you for ${chat.model}.`
+              : `${chat.model} did not report its context window, so this is an assumption — set it to what the model (or your local server) actually allows.`}{" "}
+        The assistant's context meter and condensing plan against this figure.
+      </p>
     </div>
   );
 }
@@ -698,8 +806,14 @@ function ProviderDetail({
     setMessage(null);
 
     try {
-      const catalogue = await listModels(endpoint());
-      updateState({ catalogue, checkedAt: Date.now() });
+      const listed = await listModels(endpoint());
+      const catalogue = listed.map((model) => model.id);
+      const contextWindows = Object.fromEntries(
+        listed.flatMap((model) =>
+          model.contextWindow ? [[model.id, model.contextWindow]] : [],
+        ),
+      );
+      updateState({ catalogue, contextWindows, checkedAt: Date.now() });
       setMessage({
         text: `${catalogue.length} models listed. Turn on the ones you want in the assistant.`,
         error: false,
@@ -1084,6 +1198,7 @@ function ProviderDetail({
                 {catalogue.slice(0, 500).map((model) => {
                   const on = state.models.includes(model);
                   const ms = state.latency[model];
+                  const context = state.contextWindows[model];
                   const isChat = sameModel(settings.chat, {
                     provider: info.id,
                     model,
@@ -1112,6 +1227,14 @@ function ProviderDetail({
                         {isChat && (
                           <span className="shrink-0 rounded bg-ink/[0.08] px-1 text-[9px] uppercase tracking-[0.1em] text-ink/60">
                             assistant
+                          </span>
+                        )}
+                        {context !== undefined && (
+                          <span
+                            title={`${context.toLocaleString()} tokens of context`}
+                            className="shrink-0 font-mono text-[10px] text-ink/30"
+                          >
+                            {formatTokens(context)}
                           </span>
                         )}
                         {ms !== undefined && (

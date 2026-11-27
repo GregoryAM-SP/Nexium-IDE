@@ -43,7 +43,7 @@ const VIEW_KEY = "nexium.preview.device";
 const WIDTH_KEY = "nexium.preview.width";
 const MIN_WIDTH = 340;
 /** How long a known dev server may take to print its address. */
-const NO_PREVIEW_AFTER_MS = 30_000;
+const NO_PREVIEW_AFTER_MS = 45_000;
 
 const VIEWPORTS: { id: Viewport; label: string; icon: LucideIcon }[] = [
   { id: "desktop", label: `Desktop (${DEVICES.desktop.width}×${DEVICES.desktop.height})`, icon: Monitor },

@@ -187,23 +187,56 @@ function answerText(body: unknown): string {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/** A model in a provider's catalogue, with its context window if reported. */
+export type ModelInfo = {
+  id: string;
+  contextWindow?: number;
+};
+
+const CONTEXT_KEYS = [
+  "context_length",
+  "context_window",
+  "max_model_len",
+  "max_context_length",
+  "input_token_limit",
+  "inputTokenLimit",
+];
+
 /** The provider's model catalogue. */
-export async function listModels(endpoint: Endpoint): Promise<string[]> {
+export async function listModels(endpoint: Endpoint): Promise<ModelInfo[]> {
   if (isTauri()) {
     try {
-      return await invoke<string[]>("ai_models", { endpoint });
+      return await invoke<ModelInfo[]>("ai_models", { endpoint });
     } catch (cause) {
       throw toError(cause, `Could not load ${endpoint.name}'s models.`);
     }
   }
 
   const body = (await browserFetch(endpoint, "models")) as {
-    data?: { id?: string }[];
+    data?: Record<string, unknown>[];
   };
 
   return (body.data ?? [])
-    .flatMap((item) => (typeof item.id === "string" ? [item.id] : []))
-    .sort((a, b) => a.localeCompare(b));
+    .flatMap((item): ModelInfo[] => {
+      if (typeof item.id !== "string") {
+        return [];
+      }
+
+      const top = item.top_provider as Record<string, unknown> | undefined;
+      const raw =
+        CONTEXT_KEYS.map((key) => item[key]).find((value) => value != null) ??
+        top?.context_length;
+      const tokens = Number(raw);
+
+      return [
+        {
+          id: item.id,
+          contextWindow:
+            Number.isFinite(tokens) && tokens >= 512 ? tokens : undefined,
+        },
+      ];
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /** Sends each model a one-token request; only the ones that answer work. */

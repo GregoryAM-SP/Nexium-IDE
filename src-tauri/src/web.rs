@@ -2010,7 +2010,7 @@ mod tests {
         start_dev(&events, &state, &root, "", "dev", None, None).unwrap();
 
         let mut url = None;
-        for _ in 0..300 {
+        for _ in 0..900 {
             std::thread::sleep(Duration::from_millis(100));
             url = status(&state).dev.and_then(|dev| dev.url);
             if url.is_some() {

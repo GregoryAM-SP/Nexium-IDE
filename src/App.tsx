@@ -11,7 +11,7 @@ import {
   Save,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import AboutDialog from "./components/AboutDialog";
 import ActivityRail from "./components/ActivityRail";
@@ -47,6 +47,7 @@ import type { AssistantSettings, ModelRef } from "./lib/assistantSettings";
 import { generateCommitMessage } from "./lib/commitMessage";
 import {
   loadAssistantSettings,
+  contextWindowFor,
   loadStoredKeys,
   modelOptions,
   saveAssistantSettings,
@@ -75,6 +76,18 @@ import {
   historyContent,
   upsertStep,
 } from "./lib/assistantMessages";
+import {
+  CONDENSE_AT,
+  condenseRequest,
+  contextUsage,
+  estimateTokens,
+  formatTokens,
+  liveMessages,
+  messagesToCondense,
+  messagesToKeep,
+  summaryMessage,
+} from "./lib/contextBudget";
+import type { CondensedHistory } from "./lib/contextBudget";
 import type {
   AssistantMessage,
   MessageBlock,
@@ -95,7 +108,7 @@ import { languageForPath } from "./lib/languages";
 import { isFontPath, isImagePath } from "./lib/media";
 import { applyTheme, loadThemeId, saveThemeId } from "./lib/themes";
 import { monaco } from "./lib/monacoSetup";
-import { cancelAgent, decideChange, runAgent } from "./lib/llm";
+import { cancelAgent, chat, decideChange, runAgent } from "./lib/llm";
 import type {
   AgentDelta,
   AgentStep,
@@ -305,6 +318,10 @@ export default function App() {
     liveBlocks.current = blocks;
     setLive({ blocks });
   }, []);
+  // Older turns summarised so the conversation stays inside the model's
+  // context window; the messages it covers stay on screen.
+  const [condensed, setCondensed] = useState<CondensedHistory | null>(null);
+  const [condensing, setCondensing] = useState(false);
   // Proposed file changes waiting on Accept/Reject, keyed by step id.
   const [approvals, setApprovals] = useState<Record<number, ApprovalRequest>>(
     {},
@@ -1120,6 +1137,143 @@ export default function App() {
     [activePath, askAssistant],
   );
 
+  // How much of the open file goes along with each request.
+  const openFileContextChars =
+    contextPath && activeContent !== undefined
+      ? Math.min(activeContent.length, MAX_CONTEXT_CHARS) + contextPath.length + 120
+      : 0;
+
+  /**
+   * Summarises everything but the latest exchanges. If the summary request
+   * fails, the oldest messages are dropped instead so the next request still
+   * fits; either way the messages stay visible in the chat.
+   */
+  const condenseHistory = useCallback(
+    async (
+      messages: AssistantMessage[],
+      current: CondensedHistory | null,
+      window: number,
+    ): Promise<{ condensed: CondensedHistory | null; note: string }> => {
+      const keep = messagesToKeep(
+        (candidate) =>
+          contextUsage({
+            window,
+            messages,
+            condensed: candidate,
+            openFileChars: openFileContextChars,
+          }),
+        messages,
+        current,
+      );
+      const older = messagesToCondense(messages, current, keep);
+
+      if (older.length === 0 || !chatTarget) {
+        return { condensed: current, note: "Nothing old enough to condense yet." };
+      }
+
+      const throughId = older[older.length - 1].id;
+      const before =
+        older.reduce(
+          (total, message) =>
+            total +
+            estimateTokens(
+              message.role === "assistant" ? historyContent(message) : message.text,
+            ),
+          0,
+        ) + (current ? estimateTokens(current.summary) : 0);
+
+      setCondensing(true);
+
+      try {
+        const request = condenseRequest(older, current, window);
+        // A summary needs no deliberation, so it asks for the fast,
+        // no-reasoning reply first; a thinking model otherwise spends minutes
+        // on it. A provider that cannot answer that way gets a normal request.
+        const summary = (
+          await chat(chatTarget, request, 1500, true).catch(() =>
+            chat(chatTarget, request, 1500),
+          )
+        ).trim();
+        const saved = Math.max(0, before - estimateTokens(summary));
+
+        return {
+          condensed: { summary, throughId, saved: (current?.saved ?? 0) + saved },
+          note: `Condensed ${older.length} earlier messages, freeing about ${formatTokens(saved)} tokens`,
+        };
+      } catch (cause) {
+        const summary = [
+          current?.summary,
+          "Some earlier messages were removed to stay within the model's context window (they could not be summarised).",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        return {
+          condensed: { summary, throughId, saved: (current?.saved ?? 0) + before },
+          note: `Could not summarise (${toError(cause, "the request failed").message}); dropped ${older.length} earlier messages instead`,
+        };
+      } finally {
+        setCondensing(false);
+      }
+    },
+    [chatTarget, openFileContextChars],
+  );
+
+  const handleCondenseNow = useCallback(async () => {
+    const window = contextWindowFor(settings, settings.chat).tokens;
+    const result = await condenseHistory(assistantMessages, condensed, window);
+    setCondensed(result.condensed);
+    setNotice(result.note);
+  }, [assistantMessages, condenseHistory, condensed, settings]);
+
+  const assistantContext = useMemo(() => {
+    const window = contextWindowFor(settings, settings.chat);
+
+    return {
+      ...contextUsage({
+        window: window.tokens,
+        messages: assistantMessages,
+        condensed,
+        openFileChars: openFileContextChars,
+      }),
+      source: window.source,
+      threshold: CONDENSE_AT,
+    };
+  }, [assistantMessages, condensed, openFileContextChars, settings]);
+
+  // A long reply can leave the chat over the threshold; condense straight away
+  // rather than waiting for the next send, so the meter never sits near 100%.
+  // At most one attempt per new message.
+  const autoCondensed = useRef("");
+  useEffect(() => {
+    if (
+      assistantPending ||
+      condensing ||
+      !chatTarget ||
+      assistantContext.ratio < CONDENSE_AT ||
+      messagesToCondense(assistantMessages, condensed, 2).length === 0
+    ) {
+      return;
+    }
+
+    const attempt = `${assistantMessages.length}:${condensed?.throughId ?? -1}`;
+
+    if (autoCondensed.current === attempt) {
+      return;
+    }
+
+    autoCondensed.current = attempt;
+    void handleCondenseNow();
+  }, [
+    assistantContext.ratio,
+    assistantMessages,
+    assistantPending,
+    chatTarget,
+    condensed,
+    condensing,
+    handleCondenseNow,
+  ]);
+
   const handleSendPrompt = useCallback(
     async (text: string, earlier: AssistantMessage[] = assistantMessages) => {
       const userId = nextMessageId.current;
@@ -1152,10 +1306,51 @@ export default function App() {
             ]
           : [];
 
+      // A retry can cut the conversation above the condensed point; the old
+      // summary would then describe messages that are gone.
+      let active =
+        condensed && earlier.some((message) => message.id === condensed.throughId)
+          ? condensed
+          : null;
+      const window = contextWindowFor(settings, settings.chat).tokens;
+      const projected = contextUsage({
+        window,
+        messages: earlier,
+        condensed: active,
+        openFileChars: openFileContextChars,
+        draft: text,
+      });
+      let condenseNote: AgentStep | null = null;
+
+      // Condense before the request would pass the threshold, so the model
+      // never runs out of room.
+      if (
+        projected.ratio >= CONDENSE_AT &&
+        messagesToCondense(earlier, active, 2).length > 0
+      ) {
+        setAssistantPending(true);
+        condenseNote = {
+          id: -1,
+          kind: "notice",
+          title: "Condensing earlier messages to free up context…",
+          status: "running",
+        };
+        startLive([{ type: "step", step: condenseNote }]);
+        const result = await condenseHistory(earlier, active, window);
+        active = result.condensed;
+        setCondensed(active);
+        condenseNote = { ...condenseNote, title: result.note, status: "done" };
+        updateLive((blocks) => upsertStep(blocks, condenseNote as AgentStep));
+      } else if (active !== condensed) {
+        setCondensed(active);
+      }
+
       const history: ChatMessage[] = [
         ...system,
-        ...earlier
-          .filter((message) => !message.error)
+        ...(active
+          ? [{ role: "system" as const, content: summaryMessage(active) }]
+          : []),
+        ...liveMessages(earlier, active)
           .map((message) => ({
             role: message.role as "user" | "assistant",
             content:
@@ -1203,7 +1398,10 @@ export default function App() {
       };
 
       setAssistantPending(true);
-      startLive();
+
+      if (!condenseNote) {
+        startLive();
+      }
 
       try {
         finish(
@@ -1249,9 +1447,13 @@ export default function App() {
       assistantMessages,
       autoApprove,
       chatTarget,
+      condenseHistory,
+      condensed,
       contextPath,
+      openFileContextChars,
       settings,
       startLive,
+      updateLive,
     ],
   );
 
@@ -1298,6 +1500,7 @@ export default function App() {
   const handleNewChat = useCallback(() => {
     setAssistantMessages([]);
     setApprovals({});
+    setCondensed(null);
   }, []);
 
   const toggleAutoApprove = useCallback(() => {
@@ -1492,6 +1695,14 @@ export default function App() {
         ? (code: string) => editorRef.current?.insertText(code)
         : null,
     onNewChat: handleNewChat,
+    context: assistantContext,
+    condensed,
+    condensing,
+    canCondense:
+      !assistantPending &&
+      !condensing &&
+      messagesToCondense(assistantMessages, condensed, 2).length > 0,
+    onCondense: () => void handleCondenseNow(),
     onRetry: handleRetry,
     onContinue: handleContinue,
     autoApprove,

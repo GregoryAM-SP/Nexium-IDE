@@ -1,7 +1,13 @@
 import { LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { readGitIdentity, saveGitIdentity } from "../lib/git";
+import {
+  NEXIUM_CO_AUTHOR,
+  creditsNexium,
+  readGitIdentity,
+  saveGitIdentity,
+  setCreditsNexium,
+} from "../lib/git";
 import type { GitIdentity } from "../lib/git";
 import { toError } from "../lib/tauriBridge";
 
@@ -12,6 +18,7 @@ export default function SourceControlSettings() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [credit, setCredit] = useState(creditsNexium);
 
   useEffect(() => {
     let active = true;
@@ -138,6 +145,34 @@ export default function SourceControlSettings() {
               <span className="text-[11px] text-red-300/70">{error}</span>
             )}
           </div>
+        </section>
+
+        <section className="mt-4 rounded-2xl border border-line bg-ink/[0.015] p-6">
+          <label className="flex cursor-pointer items-start justify-between gap-4">
+            <span>
+              <span className="block text-[12.5px] font-semibold text-ink/80">
+                Credit Nexium as a co-author
+              </span>
+              <span className="mt-1 block max-w-[52ch] text-[10.5px] leading-relaxed text-ink/30">
+                Commits made from Nexium Studio end with a{" "}
+                <code className="font-mono text-ink/45">
+                  Co-authored-by: {NEXIUM_CO_AUTHOR}
+                </code>{" "}
+                line, so GitHub lists Nexium next to you on each commit. You
+                stay the author; the address belongs to no account, so only the
+                name is shown.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              checked={credit}
+              onChange={(event) => {
+                setCredit(event.target.checked);
+                setCreditsNexium(event.target.checked);
+              }}
+              className="mt-0.5 size-4 shrink-0 accent-ink"
+            />
+          </label>
         </section>
       </div>
     </div>

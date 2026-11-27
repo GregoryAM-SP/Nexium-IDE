@@ -1,3 +1,4 @@
+import { DEFAULT_CONTEXT, DEFAULT_LOCAL_CONTEXT } from "./contextBudget";
 import { PROVIDERS, presetFor } from "./providers";
 import type { ProviderPreset } from "./providers";
 import { invoke, isTauri } from "./tauriBridge";
@@ -18,6 +19,10 @@ export type ProviderState = {
   catalogue: string[];
   /** Probe round-trip per model, so a stalled model can fall back to a fast one. */
   latency: Record<string, number>;
+  /** Context window per model, as the provider's model list reports it. */
+  contextWindows: Record<string, number>;
+  /** Context window per model, set by the user; wins over the reported one. */
+  contextSet: Record<string, number>;
   checkedAt: number | null;
 };
 
@@ -52,6 +57,8 @@ export const emptyProviderState: ProviderState = {
   models: [],
   catalogue: [],
   latency: {},
+  contextWindows: {},
+  contextSet: {},
   checkedAt: null,
 };
 
@@ -107,6 +114,8 @@ function parseProvider(value: unknown): ProviderState {
     models: strings(raw.models),
     catalogue: strings(raw.catalogue),
     latency: numbers(raw.latency),
+    contextWindows: numbers(raw.contextWindows),
+    contextSet: numbers(raw.contextSet),
     checkedAt: typeof raw.checkedAt === "number" ? raw.checkedAt : null,
   };
 }
@@ -371,6 +380,46 @@ export function modelOptions(settings: AssistantSettings): ModelOption[] {
       latency: state.latency[model],
     }));
   });
+}
+
+/** Where a model's context window figure comes from. */
+export type ContextWindow = {
+  tokens: number;
+  source: "set" | "reported" | "assumed";
+};
+
+/**
+ * The context window to plan against: the user's figure, else the provider's,
+ * else a cautious default (smaller for local servers, which usually run with a
+ * short context unless configured otherwise).
+ */
+export function contextWindowFor(
+  settings: AssistantSettings,
+  ref: ModelRef | null,
+): ContextWindow {
+  if (!ref) {
+    return { tokens: DEFAULT_CONTEXT, source: "assumed" };
+  }
+
+  const state = settings.providers[ref.provider];
+  const set = state?.contextSet[ref.model];
+
+  if (set) {
+    return { tokens: set, source: "set" };
+  }
+
+  const reported = state?.contextWindows[ref.model];
+
+  if (reported) {
+    return { tokens: reported, source: "reported" };
+  }
+
+  const local = providerInfo(settings, ref.provider)?.category === "local";
+
+  return {
+    tokens: local ? DEFAULT_LOCAL_CONTEXT : DEFAULT_CONTEXT,
+    source: "assumed",
+  };
 }
 
 export const sameModel = (a: ModelRef | null, b: ModelRef | null) =>
