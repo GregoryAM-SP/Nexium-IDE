@@ -50,7 +50,7 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
 
@@ -74,15 +74,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        # The builds upload into this release by its numeric id. Listing
+        # releases right after creating a draft can come back empty (that is
+        # what left v1.0.0 without files), so the id is taken from the create
+        # call itself, or looked up by tag with retries when it already exists.
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; builds will upload into it."
+          id=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId 2>/dev/null || true)
+
+          if [[ -n "$id" ]]; then
+            echo "Release $TAG already exists (id $id); builds will upload into it."
           else
-            flags=(--draft --generate-notes --title "Nexium Studio $TAG")
-            if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
-            gh release create "$TAG" "${flags[@]}" --verify-tag
+            id=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f tag_name="$TAG" \
+              -f name="Nexium Studio $TAG" \
+              -F draft=true \
+              -F prerelease="$PRERELEASE" \
+              -F generate_release_notes=true \
+              --jq .id)
+            echo "Created draft release $TAG (id $id)."
           fi
-          id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
+
+          for attempt in 1 2 3 4 5; do
+            [[ -n "$id" ]] && break
+            sleep 3
+            id=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId 2>/dev/null || true)
+          done
+
+          if [[ -z "$id" ]]; then
+            echo "::error::Could not find the release id for $TAG, so the builds would have nowhere to upload."
+            exit 1
+          fi
+
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
   build:
@@ -103,9 +125,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
+
+      # Fail in seconds, not after a full build, if there is nowhere to upload.
+      - name: Check the release to upload into
+        shell: bash
+        run: |
+          if [[ -z "${{ needs.create-release.outputs.release_id }}" ]]; then
+            echo "::error::The create-release job did not report a release id."
+            exit 1
+          fi
+          echo "Uploading into release id ${{ needs.create-release.outputs.release_id }}"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -117,7 +149,7 @@ jobs:
             libssl-dev libxdo-dev libdbus-1-dev
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
 
@@ -181,6 +213,33 @@ jobs:
     needs: [create-release, build]
     runs-on: ubuntu-latest
     steps:
+      # Never publish a release that is missing installers or the update
+      # manifest: installed apps would see an update they cannot download.
+      - name: Check every file was uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.create-release.outputs.prerelease }}
+        run: |
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          echo "Assets on $TAG:"
+          echo "$assets" | sed 's/^/  /'
+
+          expected=('-setup\.exe$' '\.deb$' '\.rpm$' '\.AppImage$' '^latest\.json$')
+          if [[ "$PRERELEASE" != "true" ]]; then expected+=('\.msi$'); fi
+
+          missing=0
+          for pattern in "${expected[@]}"; do
+            if ! grep -Eq "$pattern" <<< "$assets"; then
+              echo "::error::No asset matching $pattern was uploaded to $TAG."
+              missing=1
+            fi
+          done
+
+          if [[ "$missing" == 1 ]]; then
+            echo "::error::The release stays a draft. Re-run the failed build, or run this workflow by hand for $TAG."
+            exit 1
+          fi
+
       - name: Publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
