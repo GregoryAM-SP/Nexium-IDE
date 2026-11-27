@@ -6,6 +6,7 @@ import {
   GitBranch,
   Info,
   MessageSquare,
+  RefreshCw,
   PanelLeft,
   Redo2,
   Replace,
@@ -39,6 +40,7 @@ type TitleBarMenuProps = {
   onOpenProject: () => void;
   onRevealExplorer: () => void;
   onAbout: () => void;
+  onCheckUpdates: () => void;
   onUndo: () => void;
   onRedo: () => void;
   onFind: () => void;
@@ -69,6 +71,7 @@ export default function TitleBarMenu({
   onOpenProject,
   onRevealExplorer,
   onAbout,
+  onCheckUpdates,
   onUndo,
   onRedo,
   onFind,
@@ -169,7 +172,8 @@ export default function TitleBarMenu({
   ];
 
   const helpItems: ContextMenuItem[] = [
-    { label: "About Nexium", icon: Info, onSelect: onAbout },
+    { label: "Check for Updates…", icon: RefreshCw, onSelect: onCheckUpdates },
+    { label: "About Nexium", icon: Info, onSelect: onAbout, separatorBefore: true },
   ];
 
   const items =

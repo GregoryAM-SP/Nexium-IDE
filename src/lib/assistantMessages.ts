@@ -1,4 +1,4 @@
-import type { AgentDelta, AgentReply, AgentStep } from "./nim";
+import type { AgentDelta, AgentReply, AgentStep } from "./llm";
 
 /**
  * An assistant turn is a timeline: text, thinking and tool steps in the order

@@ -1,11 +1,13 @@
 import { listen } from "@tauri-apps/api/event";
 import {
   ChevronRight,
+  Download,
   Eye,
   FileText,
   FolderOpen,
   GitBranch,
   Info,
+  LoaderCircle,
   Save,
   X,
 } from "lucide-react";
@@ -32,30 +34,37 @@ import type { MarkdownPreviewHandle } from "./components/MarkdownPreview";
 import SourceControlPanel from "./components/SourceControlPanel";
 import SettingsNav from "./components/SettingsNav";
 import type { SettingsSection } from "./components/SettingsNav";
-import SettingsPage from "./components/SettingsPage";
+import ProvidersSettings from "./components/ProvidersSettings";
 import SourceControlSettings from "./components/SourceControlSettings";
 import SvgPreview from "./components/SvgPreview";
 import TerminalPanel from "./components/TerminalPanel";
 import TitleBarMenu from "./components/TitleBarMenu";
 import WindowControls from "./components/WindowControls";
-import type { AssistantSettings } from "./lib/assistantSettings";
+import type { AssistantSettings, ModelRef } from "./lib/assistantSettings";
 import { generateCommitMessage } from "./lib/commitMessage";
 import {
   loadAssistantSettings,
-  loadStoredApiKey,
+  loadStoredKeys,
+  modelOptions,
   saveAssistantSettings,
+  sameModel,
+  targetFor,
 } from "./lib/assistantSettings";
 import {
   commitAndSync,
   commitChanges,
   readGitFileDiff,
   readGitStatus,
+  readGitTags,
+  createGitTag,
+  pushGitTag,
+  deleteGitTag,
   stageAll,
   stagePath,
   unstageAll,
   unstagePath,
 } from "./lib/git";
-import type { GitStatus } from "./lib/git";
+import type { GitStatus, GitTag } from "./lib/git";
 import { pathPrompt, selectionPrompt } from "./lib/assistantPrompt";
 import {
   appendDelta,
@@ -72,14 +81,22 @@ import { languageForPath } from "./lib/languages";
 import { isFontPath, isImagePath } from "./lib/media";
 import { applyTheme, loadThemeId, saveThemeId } from "./lib/themes";
 import { monaco } from "./lib/monacoSetup";
-import { cancelAgent, decideChange, runAgent } from "./lib/nim";
+import { cancelAgent, decideChange, runAgent } from "./lib/llm";
 import type {
   AgentDelta,
   AgentStep,
   ApprovalRequest,
   ChatMessage,
-} from "./lib/nim";
+} from "./lib/llm";
 import { isTauri, toError } from "./lib/tauriBridge";
+import {
+  checkForUpdates,
+  installNow,
+  onUpdateState,
+  startAutoUpdates,
+  updateState,
+} from "./lib/updater";
+import type { UpdateState } from "./lib/updater";
 import type { ExplorerNode, FolderNode } from "./lib/workspace";
 import { modelUri } from "./lib/workspace";
 import { registerWorkspaceSources } from "./lib/workspaceModels";
@@ -112,7 +129,7 @@ import {
 const MAX_CONTEXT_CHARS = 24_000;
 const AUTO_APPROVE_KEY = "nexium.assistant.autoApprove";
 
-/** The Rust client reports a dead connection when NVIDIA stays silent. */
+/** The Rust client reports a dead connection when a provider stays silent. */
 function stalled(message: string): boolean {
   return /no data for \d+s|stopped responding \(no data/i.test(message);
 }
@@ -121,28 +138,22 @@ function speedHint(id: string): number {
   return /flash|bolt|lightning|nano|mini|small|fast/i.test(id) ? 0 : 1;
 }
 
-/** Fastest verified model other than the one that just stalled. */
-function fallbackModel(settings: AssistantSettings): string | null {
-  const candidates = settings.workingModels.filter(
-    (id) => id !== settings.model,
+/** Fastest tested model, on any provider, other than the one that just stalled. */
+function fallbackModel(settings: AssistantSettings): ModelRef | null {
+  const candidates = modelOptions(settings).filter(
+    (option) => !sameModel(option, settings.chat),
   );
 
-  if (candidates.length === 0) {
-    return null;
-  }
+  const ranked = [...candidates].sort(
+    (left, right) =>
+      (left.latency ?? Number.MAX_SAFE_INTEGER) -
+        (right.latency ?? Number.MAX_SAFE_INTEGER) ||
+      speedHint(left.model) - speedHint(right.model) ||
+      left.model.localeCompare(right.model),
+  );
 
-  const ranked = [...candidates].sort((left, right) => {
-    const leftMs = settings.latency[left] ?? Number.MAX_SAFE_INTEGER;
-    const rightMs = settings.latency[right] ?? Number.MAX_SAFE_INTEGER;
-
-    return (
-      leftMs - rightMs ||
-      speedHint(left) - speedHint(right) ||
-      left.localeCompare(right)
-    );
-  });
-
-  return ranked[0] ?? null;
+  const best = ranked[0];
+  return best ? { provider: best.provider, model: best.model } : null;
 }
 
 export default function App() {
@@ -159,6 +170,7 @@ export default function App() {
   const [git, setGit] = useState<GitStatus | null>(null);
   const [gitBusy, setGitBusy] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
+  const [gitTags, setGitTags] = useState<GitTag[]>([]);
   // Opening a change replaces the editor with a read-only diff of that file.
   const [diff, setDiff] = useState<{
     path: string;
@@ -221,20 +233,40 @@ export default function App() {
   const [settings, setSettings] = useState<AssistantSettings>(
     loadAssistantSettings,
   );
-  // The key lives in the OS credential store, which can only be read
-  // asynchronously, so it joins the settings once it arrives.
+  // Keys live in the OS credential store, which can only be read
+  // asynchronously, so they join the settings once they arrive.
   useEffect(() => {
     let cancelled = false;
 
-    void loadStoredApiKey().then((apiKey) => {
-      if (!cancelled && apiKey) {
-        setSettings((current) => ({ ...current, apiKey }));
+    void loadStoredKeys(loadAssistantSettings()).then((keys) => {
+      if (!cancelled) {
+        setSettings((current) => ({ ...current, keys }));
       }
     });
 
     return () => {
       cancelled = true;
     };
+  }, []);
+  // Updates download in the background and install when the window closes.
+  const [update, setUpdate] = useState<UpdateState>(updateState);
+  useEffect(() => {
+    const stopListening = onUpdateState(setUpdate);
+    const stopUpdates = startAutoUpdates();
+
+    return () => {
+      stopListening();
+      stopUpdates();
+    };
+  }, []);
+  const handleCheckUpdates = useCallback(async () => {
+    const result = await checkForUpdates();
+
+    if (result.phase === "current") {
+      setNotice("Nexium Studio is up to date.");
+    } else if (result.phase === "error") {
+      setNotice(result.message);
+    }
   }, []);
   const nextMessageId = useRef(1);
   const workspaceSources = useRef<Set<string>>(new Set());
@@ -355,11 +387,23 @@ export default function App() {
     saveThemeId(themeId);
   }, [themeId]);
 
-  // Ghost-text completions use the assistant's verified key and model, so they
-  // start working the moment a model is chosen and stop when the key is removed.
+  // The model the assistant and its helpers talk to, resolved to a provider
+  // endpoint and key; null until a provider and model are set up.
+  const chatTarget = targetFor(settings, settings.chat);
+  const completionTarget = targetFor(
+    settings,
+    settings.completion ?? settings.chat,
+  );
+  const configured = chatTarget !== null;
+
+  // Ghost-text completions start the moment a model is set up and stop when
+  // its provider's key is removed.
+  const completionKey = completionTarget
+    ? `${completionTarget.provider}|${completionTarget.baseUrl}|${completionTarget.model}|${completionTarget.apiKey}`
+    : "";
   useEffect(() => {
-    setInlineCompletionModel(settings.apiKey, settings.model);
-  }, [settings.apiKey, settings.model]);
+    setInlineCompletionModel(completionTarget);
+  }, [completionKey]);
 
 
   const openSettings = useCallback(() => {
@@ -473,7 +517,57 @@ export default function App() {
     }
 
     void applyGit(readGitStatus);
+    // Tags are listed beside the changes; a repository without any is fine.
+    void readGitTags()
+      .then(setGitTags)
+      .catch(() => setGitTags([]));
   }, [applyGit, tree]);
+
+  /** Runs a tag operation, keeping the list and the panel's error line current. */
+  const applyTags = useCallback(
+    async (
+      action: () => Promise<GitTag[]>,
+      success: string,
+    ): Promise<boolean> => {
+      setGitBusy(true);
+
+      try {
+        setGitTags(await action());
+        setGitError(null);
+        setNotice(success);
+        return true;
+      } catch (cause) {
+        setGitError(toError(cause, "The tag operation failed.").message);
+        // A tag can be created even when its push fails.
+        void readGitTags().then(setGitTags).catch(() => {});
+        return false;
+      } finally {
+        setGitBusy(false);
+      }
+    },
+    [],
+  );
+
+  const handleCreateTag = useCallback(
+    (name: string, message: string, push: boolean) =>
+      applyTags(
+        () => createGitTag(name, message, push),
+        push ? `Created and pushed ${name}.` : `Created ${name}.`,
+      ),
+    [applyTags],
+  );
+
+  const handlePushTag = useCallback(
+    (name: string) =>
+      applyTags(() => pushGitTag(name), `Pushed ${name} to origin.`),
+    [applyTags],
+  );
+
+  const handleDeleteTag = useCallback(
+    (name: string) =>
+      applyTags(() => deleteGitTag(name), `Deleted the local tag ${name}.`),
+    [applyTags],
+  );
 
   const refreshGitRef = useRef(refreshGit);
   refreshGitRef.current = refreshGit;
@@ -535,8 +629,8 @@ export default function App() {
 
   // The commit message button uses the assistant's selected model.
   const handleGenerateMessage = useCallback(
-    () => generateCommitMessage(settings.apiKey, settings.model, git?.changes ?? []),
-    [git, settings.apiKey, settings.model],
+    () => generateCommitMessage(chatTarget, git?.changes ?? []),
+    [git, chatTarget],
   );
 
   // Keep the status bar branch and the change list current.
@@ -712,12 +806,12 @@ export default function App() {
   }, []);
 
   const handleSelectModel = useCallback(
-    (id: string) => {
-      if (id === settings.model) {
+    (ref: ModelRef) => {
+      if (sameModel(ref, settings.chat)) {
         return;
       }
 
-      handleSaveSettings({ ...settings, model: id });
+      handleSaveSettings({ ...settings, chat: ref });
     },
     [handleSaveSettings, settings],
   );
@@ -788,14 +882,14 @@ export default function App() {
 
       setAssistantMessages([...earlier, { id: userId, role: "user", text }]);
 
-      if (!settings.apiKey || !settings.model) {
+      if (!chatTarget) {
         setAssistantMessages((current) => [
           ...current,
           {
             id: nextMessageId.current++,
             role: "assistant",
             error: true,
-            text: "Connect NVIDIA NIM in Settings first.",
+            text: "Choose a provider and model in Settings → AI providers first.",
           },
         ]);
         return;
@@ -868,19 +962,20 @@ export default function App() {
 
       try {
         finish(
-          await runAgent(settings.apiKey, settings.model, history, autoApprove),
+          await runAgent(chatTarget, history, autoApprove),
         );
       } catch (cause) {
         const failure = toError(cause, "The request failed.");
         const stopped = failure.message === "Stopped.";
-        const alternative = stopped ? null : fallbackModel(settings);
+        const fallback = stopped ? null : fallbackModel(settings);
+        const alternative = targetFor(settings, fallback);
 
         // A silent, very large model would otherwise dead-end the request.
         if (alternative && stalled(failure.message)) {
           const note: AgentStep = {
             id: 0,
             kind: "notice",
-            title: `${settings.model} stopped responding — retried with ${alternative}`,
+            title: `${chatTarget.model} stopped responding — retried with ${alternative.model} (${alternative.name})`,
             status: "done",
           };
 
@@ -888,7 +983,7 @@ export default function App() {
 
           try {
             finish(
-              await runAgent(settings.apiKey, alternative, history, autoApprove),
+              await runAgent(alternative, history, autoApprove),
             );
           } catch (retryCause) {
             const retryFailure = toError(retryCause, "The request failed.");
@@ -908,6 +1003,7 @@ export default function App() {
       activeContent,
       assistantMessages,
       autoApprove,
+      chatTarget,
       contextPath,
       settings,
       startLive,
@@ -1171,7 +1267,6 @@ export default function App() {
     editorSyncUntil.current = performance.now() + 220;
     editorRef.current?.scrollToLine(line);
   }, []);
-  const configured = Boolean(settings.apiKey && settings.model);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-app text-ink">
@@ -1245,6 +1340,7 @@ export default function App() {
               setExplorerOpen(true);
             }}
             onAbout={() => setAboutOpen(true)}
+            onCheckUpdates={() => void handleCheckUpdates()}
             onUndo={() => editorRef.current?.runAction("undo")}
             onRedo={() => editorRef.current?.runAction("redo")}
             onFind={() => editorRef.current?.runAction("actions.find")}
@@ -1303,12 +1399,11 @@ export default function App() {
             {...assistantExtras}
               messages={assistantMessages}
               configured={configured}
-              model={settings.model}
+              model={settings.chat}
               pending={assistantPending}
               live={live}
               contextPath={contextPath}
-              models={settings.workingModels}
-              latency={settings.latency}
+              models={modelOptions(settings)}
               onSelectModel={handleSelectModel}
               explorerOpen={explorerOpen}
               onToggleExplorer={() => setExplorerOpen((open) => !open)}
@@ -1377,9 +1472,13 @@ export default function App() {
             onCommit={handleCommit}
             onCommitAndSync={handleCommitAndSync}
             onGenerateMessage={handleGenerateMessage}
-            canGenerate={Boolean(settings.apiKey && settings.model)}
+            canGenerate={configured}
             onSelect={(path, staged) => void handleOpenDiff(path, staged)}
             onHide={() => setScmOpen(false)}
+            tags={gitTags}
+            onCreateTag={handleCreateTag}
+            onPushTag={handlePushTag}
+            onDeleteTag={handleDeleteTag}
           />
         ) : explorerOpen && tree ? (
           <Explorer
@@ -1403,7 +1502,7 @@ export default function App() {
             ) : settingsSection === "fonts" ? (
               <FontsSettings />
             ) : settingsSection === "assistant" ? (
-              <SettingsPage
+              <ProvidersSettings
                 settings={settings}
                 onSave={handleSaveSettings}
               />
@@ -1616,13 +1715,12 @@ export default function App() {
           <AiAssistant
             {...assistantExtras}
             messages={assistantMessages}
-            configured={Boolean(settings.apiKey && settings.model)}
-            model={settings.model}
+            configured={configured}
+            model={settings.chat}
             pending={assistantPending}
             live={live}
             contextPath={contextPath}
-            models={settings.workingModels}
-            latency={settings.latency}
+            models={modelOptions(settings)}
             onSelectModel={handleSelectModel}
             explorerOpen={explorerOpen}
             onToggleExplorer={() => setExplorerOpen((open) => !open)}
@@ -1659,6 +1757,44 @@ export default function App() {
           >
             <Info className="size-3 shrink-0 text-ink/30" strokeWidth={1.75} />
             <span className="truncate">{notice}</span>
+          </span>
+        )}
+
+        {update.phase === "downloading" && (
+          <span
+            title={`Downloading Nexium Studio ${update.version}`}
+            className="flex items-center gap-1.5 border-r border-line px-2.5 text-ink/45"
+          >
+            <Download className="size-3 shrink-0 text-ink/35" strokeWidth={1.75} />
+            Update {update.version}
+            {update.total
+              ? ` · ${Math.min(100, Math.round((update.received / update.total) * 100))}%`
+              : "…"}
+          </span>
+        )}
+        {update.phase === "ready" && (
+          <span className="flex items-center border-r border-line text-ink/60">
+            <span
+              title={update.notes || `Nexium Studio ${update.version} is downloaded and installs when you close the app.`}
+              className="flex items-center gap-1.5 px-2.5"
+            >
+              <Download className="size-3 shrink-0 text-ink/50" strokeWidth={1.75} />
+              {update.version} installs on close
+            </span>
+            <button
+              type="button"
+              onClick={() => void installNow()}
+              title="Install the update and restart now"
+              className="h-full px-2 text-ink/70 transition-colors duration-150 hover:bg-ink/[0.08] hover:text-ink"
+            >
+              Restart now
+            </button>
+          </span>
+        )}
+        {update.phase === "installing" && (
+          <span className="flex items-center gap-1.5 border-r border-line px-2.5 text-ink/60">
+            <LoaderCircle className="size-3 shrink-0 animate-spin" />
+            Installing {update.version}…
           </span>
         )}
 
@@ -1721,7 +1857,7 @@ export default function App() {
             className={`size-1.5 shrink-0 rounded-full ${configured ? "bg-ink/70" : "bg-ink/20"}`}
           />
           <span className="truncate font-mono text-[10px]">
-            {settings.model || "no model"}
+            {settings.chat?.model || "no model"}
           </span>
         </button>
       </footer>

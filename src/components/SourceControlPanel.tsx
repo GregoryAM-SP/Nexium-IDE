@@ -15,8 +15,9 @@ import {
 import { useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import type { GitChange, GitStatus } from "../lib/git";
+import type { GitChange, GitStatus, GitTag } from "../lib/git";
 import ExplorerContextMenu from "./ExplorerContextMenu";
+import TagsSection from "./TagsSection";
 
 type SourceControlPanelProps = {
   status: GitStatus | null;
@@ -33,6 +34,10 @@ type SourceControlPanelProps = {
   canGenerate: boolean;
   onSelect: (path: string, staged: boolean) => void;
   onHide: () => void;
+  tags: GitTag[];
+  onCreateTag: (name: string, message: string, push: boolean) => Promise<boolean>;
+  onPushTag: (name: string) => Promise<boolean>;
+  onDeleteTag: (name: string) => Promise<boolean>;
 };
 
 const iconButton =
@@ -262,6 +267,10 @@ export default function SourceControlPanel({
   canGenerate,
   onSelect,
   onHide,
+  tags,
+  onCreateTag,
+  onPushTag,
+  onDeleteTag,
 }: SourceControlPanelProps) {
   const [message, setMessage] = useState("");
   const [committing, setCommitting] = useState(false);
@@ -553,6 +562,14 @@ export default function SourceControlPanel({
                 </div>
               </div>
             )}
+
+            <TagsSection
+              tags={tags}
+              hasChanges={total > 0}
+              onCreate={onCreateTag}
+              onPush={onPushTag}
+              onDelete={onDeleteTag}
+            />
           </div>
         </>
       )}

@@ -251,6 +251,148 @@ pub fn commit(root: &Path, message: &str) -> Result<(), String> {
     run(root, &["commit", "-m", message]).map(|_| ())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTag {
+    pub name: String,
+    /// Short hash of the commit the tag points at.
+    pub commit: String,
+    /// Annotated tags carry a message, an author and a date of their own.
+    pub annotated: bool,
+    /// The tag message (annotated) or the tagged commit's subject.
+    pub subject: String,
+    /// ISO 8601 date the tag (or, for a lightweight tag, the commit) was made.
+    pub date: String,
+}
+
+const MAX_TAGS: usize = 100;
+const FIELD: char = '\u{1f}';
+
+/// A tag name git accepts and that cannot be read as a command-line option.
+fn check_tag_name(root: &Path, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Enter a tag name.".into());
+    }
+
+    if name.starts_with('-') || name.chars().any(char::is_whitespace) {
+        return Err("A tag name cannot start with \"-\" or contain spaces.".into());
+    }
+
+    run(root, &["check-ref-format", &format!("refs/tags/{name}")])
+        .map(|_| ())
+        .map_err(|_| format!("\"{name}\" is not a valid tag name."))
+}
+
+fn tag_exists(root: &Path, name: &str) -> bool {
+    run(
+        root,
+        &["rev-parse", "-q", "--verify", &format!("refs/tags/{name}")],
+    )
+    .is_ok()
+}
+
+fn parse_tags(raw: &str) -> Vec<GitTag> {
+    raw.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(FIELD).collect();
+
+            if fields.len() < 5 || fields[0].is_empty() {
+                return None;
+            }
+
+            Some(GitTag {
+                name: fields[0].to_string(),
+                commit: fields[1].to_string(),
+                annotated: fields[2] == "tag",
+                date: fields[3].to_string(),
+                subject: fields[4].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The newest tags first. Annotated tags report the commit they point at,
+/// not the tag object.
+pub fn tags(root: &Path) -> Result<Vec<GitTag>, String> {
+    let format = [
+        "%(refname:short)",
+        "%(if)%(*objectname)%(then)%(*objectname:short)%(else)%(objectname:short)%(end)",
+        "%(objecttype)",
+        "%(creatordate:iso-strict)",
+        "%(if)%(contents:subject)%(then)%(contents:subject)%(else)%(*subject)%(end)",
+    ]
+    .join("\u{1f}");
+
+    let raw = run(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-creatordate",
+            &format!("--count={MAX_TAGS}"),
+            &format!("--format={format}"),
+            "refs/tags",
+        ],
+    )?;
+
+    Ok(parse_tags(&raw))
+}
+
+/// Tags the current commit. A message makes it an annotated tag, which is
+/// what release tooling usually expects; without one it is lightweight.
+pub fn create_tag(root: &Path, name: &str, message: &str) -> Result<(), String> {
+    let name = name.trim();
+    check_tag_name(root, name)?;
+
+    if run(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_err() {
+        return Err("Make a first commit before creating a tag.".into());
+    }
+
+    if tag_exists(root, name) {
+        return Err(format!("A tag named \"{name}\" already exists."));
+    }
+
+    let message = message.trim();
+
+    if message.is_empty() {
+        run(root, &["tag", name])
+    } else {
+        run(root, &["tag", "-a", name, "-m", message])
+    }
+    .map(|_| ())
+}
+
+/// Pushes one tag to `origin`. Only that tag moves; branches are untouched.
+pub fn push_tag(root: &Path, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    check_tag_name(root, name)?;
+
+    if !tag_exists(root, name) {
+        return Err(format!("There is no tag named \"{name}\"."));
+    }
+
+    let remotes = run(root, &["remote"])?;
+
+    if !remotes.split_whitespace().any(|remote| remote == "origin") {
+        return Err("This repository has no origin remote to push the tag to.".into());
+    }
+
+    let refspec = format!("refs/tags/{name}:refs/tags/{name}");
+    execute(root, &["push", "origin", &refspec], false).map(|_| ())
+}
+
+/// Deletes a tag from this repository only; a tag already pushed stays on
+/// the remote.
+pub fn delete_tag(root: &Path, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    check_tag_name(root, name)?;
+
+    if !tag_exists(root, name) {
+        return Err(format!("There is no tag named \"{name}\"."));
+    }
+
+    run(root, &["tag", "-d", name]).map(|_| ())
+}
+
 /// Pushes the current branch to its upstream, or sets `origin` as the upstream
 /// when the branch has none yet. Nothing is pulled, merged or rebased.
 pub fn sync(root: &Path) -> Result<(), String> {
@@ -312,6 +454,67 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn parses_annotated_and_lightweight_tags() {
+        let raw = "v1.1.0\u{1f}abc1234\u{1f}tag\u{1f}2026-11-26T10:00:00+00:00\u{1f}Release 1.1\n\
+                   v1.0.0\u{1f}def5678\u{1f}commit\u{1f}2026-11-20T09:00:00+00:00\u{1f}Fix the build\n";
+        let tags = parse_tags(raw);
+
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "v1.1.0");
+        assert!(tags[0].annotated);
+        assert_eq!(tags[0].subject, "Release 1.1");
+        assert_eq!(tags[1].commit, "def5678");
+        assert!(!tags[1].annotated);
+    }
+
+    #[test]
+    fn creates_lists_and_deletes_tags_in_a_real_repository() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexium-tags-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| run(&dir, args);
+
+        git(&["init", "-q"]).unwrap();
+        git(&["config", "user.name", "Test"]).unwrap();
+        git(&["config", "user.email", "test@example.com"]).unwrap();
+
+        assert!(create_tag(&dir, "v0.1.0", "").is_err(), "no commit yet");
+
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        git(&["add", "a.txt"]).unwrap();
+        git(&["commit", "-q", "-m", "First"]).unwrap();
+
+        create_tag(&dir, "v1.0.0", "").unwrap();
+        create_tag(&dir, "v1.1.0", "Release 1.1").unwrap();
+        assert!(create_tag(&dir, "v1.0.0", "").is_err(), "duplicate");
+        assert!(create_tag(&dir, "-v2", "").is_err(), "option-like");
+        assert!(create_tag(&dir, "bad name", "").is_err(), "space");
+        assert!(create_tag(&dir, "v1..2", "").is_err(), "invalid ref");
+
+        let listed = tags(&dir).unwrap();
+        let names: Vec<&str> = listed.iter().map(|tag| tag.name.as_str()).collect();
+        assert!(names.contains(&"v1.0.0") && names.contains(&"v1.1.0"));
+        let annotated = listed.iter().find(|tag| tag.name == "v1.1.0").unwrap();
+        assert!(annotated.annotated);
+        assert_eq!(annotated.subject, "Release 1.1");
+        let light = listed.iter().find(|tag| tag.name == "v1.0.0").unwrap();
+        assert_eq!(light.subject, "First");
+        assert_eq!(light.commit, annotated.commit);
+
+        assert!(push_tag(&dir, "v1.0.0").unwrap_err().contains("no origin"));
+
+        delete_tag(&dir, "v1.0.0").unwrap();
+        assert!(tags(&dir).unwrap().iter().all(|tag| tag.name != "v1.0.0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

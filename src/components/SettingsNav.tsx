@@ -22,7 +22,7 @@ const sections: {
 }[] = [
   { id: "appearance", label: "Appearance", hint: "themes", icon: Palette },
   { id: "fonts", label: "Fonts", hint: "in use", icon: Type },
-  { id: "assistant", label: "AI assistant", hint: "key · models", icon: Sparkles },
+  { id: "assistant", label: "AI providers", hint: "keys · models", icon: Sparkles },
   { id: "source-control", label: "Source control", hint: "identity", icon: GitBranch },
 ];
 

@@ -1,6 +1,6 @@
 mod agent;
 mod git;
-mod nim;
+mod llm;
 mod secrets;
 mod terminal;
 mod workspace;
@@ -226,6 +226,58 @@ async fn git_commit(state: State<'_, AppState>, message: String) -> Result<git::
 }
 
 #[tauri::command]
+async fn git_tags(state: State<'_, AppState>) -> Result<Vec<git::GitTag>, String> {
+    with_root(&state, |root| git::tags(root)).await
+}
+
+/// Tags the current commit and, when asked, pushes the tag to origin. A push
+/// failure keeps the tag (it exists locally) and says so.
+#[tauri::command]
+async fn git_create_tag(
+    state: State<'_, AppState>,
+    name: String,
+    message: String,
+    push: bool,
+) -> Result<Vec<git::GitTag>, String> {
+    with_root(&state, move |root| {
+        git::create_tag(root, &name, &message)?;
+
+        if push {
+            git::push_tag(root, name.trim()).map_err(|error| {
+                format!("Created {}, but pushing it failed: {error}", name.trim())
+            })?;
+        }
+
+        git::tags(root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_push_tag(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<git::GitTag>, String> {
+    with_root(&state, move |root| {
+        git::push_tag(root, &name)?;
+        git::tags(root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_delete_tag(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<git::GitTag>, String> {
+    with_root(&state, move |root| {
+        git::delete_tag(root, &name)?;
+        git::tags(root)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn git_commit_and_sync(
     state: State<'_, AppState>,
     message: String,
@@ -239,14 +291,18 @@ async fn git_commit_and_sync(
     .await
 }
 
+/// Every stored provider key, keyed by provider id (missing ones are absent).
 #[tauri::command]
-async fn secret_get_api_key() -> Result<Option<String>, String> {
-    blocking(secrets::get_api_key).await
+async fn secret_get_keys(
+    providers: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    blocking(move || secrets::get_keys(&providers)).await
 }
 
+/// Stores (or, with an empty key, removes) one provider's key.
 #[tauri::command]
-async fn secret_set_api_key(key: String) -> Result<(), String> {
-    blocking(move || secrets::set_api_key(&key)).await
+async fn secret_set_key(provider: String, key: String) -> Result<(), String> {
+    blocking(move || secrets::set_key(&provider, &key)).await
 }
 
 #[tauri::command]
@@ -285,7 +341,7 @@ fn terminal_kill(state: State<'_, AppState>, id: String) {
 }
 
 #[tauri::command]
-fn nim_cancel(state: State<'_, AppState>) {
+fn ai_cancel(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
 }
 
@@ -301,12 +357,12 @@ fn agent_decide(state: State<'_, AppState>, step_id: usize, accept: bool) -> Res
 }
 
 #[tauri::command]
-async fn nim_agent(
+async fn ai_agent(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-    api_key: String,
+    endpoint: llm::Endpoint,
     model: String,
-    messages: Vec<nim::ChatMessage>,
+    messages: Vec<llm::ChatMessage>,
     auto_approve: bool,
 ) -> Result<agent::AgentReply, String> {
     let root = state
@@ -326,7 +382,7 @@ async fn nim_agent(
     let result = agent::run(
         root,
         &app,
-        api_key.trim(),
+        &endpoint,
         &model,
         messages,
         auto_approve,
@@ -336,7 +392,7 @@ async fn nim_agent(
     .await;
 
     if let Err(error) = &result {
-        eprintln!("nim_agent failed: {error}");
+        eprintln!("ai_agent failed: {error}");
     }
 
     result
@@ -373,6 +429,10 @@ fn hand_shortcuts_to_the_page(window: &tauri::WebviewWindow) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Updates come from the latest GitHub release's latest.json; the UI
+        // downloads them in the background and installs them on close.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             #[cfg(windows)]
             {
@@ -419,18 +479,23 @@ pub fn run() {
             git_unstage_all,
             git_commit,
             git_commit_and_sync,
-            secret_get_api_key,
-            secret_set_api_key,
+            git_tags,
+            git_create_tag,
+            git_push_tag,
+            git_delete_tag,
+            secret_get_keys,
+            secret_set_key,
             terminal_start,
             terminal_write,
             terminal_resize,
             terminal_kill,
-            nim::nim_verify,
-            nim::nim_ping,
-            nim::nim_chat,
-            nim_cancel,
+            llm::ai_models,
+            llm::ai_probe,
+            llm::ai_ping,
+            llm::ai_chat,
+            ai_cancel,
             agent_decide,
-            nim_agent
+            ai_agent
         ])
         .run(tauri::generate_context!())
         .expect("Nexium Studio failed to start");

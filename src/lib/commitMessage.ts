@@ -1,6 +1,7 @@
 import { readGitFileDiff } from "./git";
 import type { GitChange } from "./git";
-import { chat } from "./nim";
+import type { ModelTarget } from "./assistantSettings";
+import { chat } from "./llm";
 
 /**
  * Writes the commit message for the staged changes with the assistant's model.
@@ -125,11 +126,10 @@ function cleanCommitMessage(reply: string): string {
 }
 
 export async function generateCommitMessage(
-  apiKey: string,
-  model: string,
+  target: ModelTarget | null,
   changes: GitChange[],
 ): Promise<string> {
-  if (!apiKey || !model) {
+  if (!target) {
     throw new Error("Select a model in Settings to generate a commit message.");
   }
 
@@ -154,7 +154,7 @@ export async function generateCommitMessage(
     }),
   );
 
-  const reply = await chat(apiKey, model, [
+  const reply = await chat(target, [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: buildPrompt(staged, sections) },
   ]);

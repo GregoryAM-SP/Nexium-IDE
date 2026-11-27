@@ -36,8 +36,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import type { AssistantMessage, MessageBlock } from "../lib/assistantMessages";
+import { sameModel } from "../lib/assistantSettings";
+import type { ModelOption, ModelRef } from "../lib/assistantSettings";
 import { lineDiff } from "../lib/lineDiff";
-import type { AgentStep, ApprovalRequest } from "../lib/nim";
+import type { AgentStep, ApprovalRequest } from "../lib/llm";
 import MarkdownMessage from "./MarkdownMessage";
 
 export type { AssistantMessage } from "../lib/assistantMessages";
@@ -45,13 +47,14 @@ export type { AssistantMessage } from "../lib/assistantMessages";
 type AiAssistantProps = {
   messages: AssistantMessage[];
   configured: boolean;
-  model: string;
+  /** The model the assistant is using, if one is set up. */
+  model: ModelRef | null;
   pending: boolean;
   live: { blocks: MessageBlock[] } | null;
   contextPath: string | null;
-  models: string[];
-  latency: Record<string, number>;
-  onSelectModel: (id: string) => void;
+  /** Every turned-on model of every connected provider. */
+  models: ModelOption[];
+  onSelectModel: (ref: ModelRef) => void;
   explorerOpen: boolean;
   onToggleExplorer: () => void;
   /** Chat-only mode: the panel fills the window instead of the side rail. */
@@ -92,7 +95,6 @@ export default function AiAssistant({
   live,
   contextPath,
   models,
-  latency,
   onSelectModel,
   explorerOpen,
   onToggleExplorer,
@@ -421,7 +423,11 @@ export default function AiAssistant({
                       <Sparkles className="size-3" strokeWidth={1.75} />
                       Assistant
                     </p>
-                    <LiveRun live={live} model={model} {...timelineProps} />
+                    <LiveRun
+                      live={live}
+                      model={model?.model ?? ""}
+                      {...timelineProps}
+                    />
                   </li>
                 )}
               </ul>
@@ -466,7 +472,7 @@ export default function AiAssistant({
                   onClick={() => setSwitcherOpen((open) => !open)}
                   aria-haspopup="listbox"
                   aria-expanded={switcherOpen}
-                  aria-label={`Model: ${model}. Change model`}
+                  aria-label={`Model: ${model?.model ?? "none"}. Change model`}
                   title={switcherOpen ? "Close model list" : "Change model"}
                   className={`flex min-w-0 items-center gap-1.5 rounded-md border px-1.5 py-1 transition-colors duration-150 ${
                     switcherOpen
@@ -476,7 +482,7 @@ export default function AiAssistant({
                 >
                   <Cpu className="size-3 shrink-0" strokeWidth={1.75} />
                   <span className="min-w-0 max-w-[9rem] truncate font-mono text-[10px]">
-                    {model}
+                    {model?.model ?? "Choose a model"}
                   </span>
                   <ChevronDown
                     className={`size-3 shrink-0 transition-transform duration-150 ${
@@ -517,21 +523,33 @@ export default function AiAssistant({
                   >
                     {models.length === 0 ? (
                       <p className="px-2.5 py-2 text-[11px] leading-relaxed text-ink/35">
-                        No verified models yet. Verify your key in Settings.
+                        No models turned on yet. Connect a provider in
+                        Settings → AI providers.
                       </p>
                     ) : (
-                      models.map((id) => {
-                        const selected = id === model;
-                        const ms = latency[id];
+                      models.map((option, index) => {
+                        const selected = sameModel(option, model);
+                        const ms = option.latency;
+                        const heading =
+                          index === 0 ||
+                          models[index - 1].provider !== option.provider;
 
                         return (
+                          <div key={`${option.provider}/${option.model}`}>
+                          {heading && (
+                            <p className="px-2.5 pt-2 pb-1 text-[9px] uppercase tracking-[0.18em] text-ink/30">
+                              {option.providerName}
+                            </p>
+                          )}
                           <button
-                            key={id}
                             type="button"
                             role="option"
                             aria-selected={selected}
                             onClick={() => {
-                              onSelectModel(id);
+                              onSelectModel({
+                                provider: option.provider,
+                                model: option.model,
+                              });
                               setSwitcherOpen(false);
                             }}
                             className={`flex h-8 w-full items-center gap-2 rounded-lg px-2.5 text-left transition-colors duration-100 ${
@@ -541,7 +559,7 @@ export default function AiAssistant({
                             }`}
                           >
                             <span className="min-w-0 flex-1 truncate font-mono text-[11px]">
-                              {id}
+                              {option.model}
                             </span>
                             {ms !== undefined && (
                               <span className="shrink-0 font-mono text-[9.5px] text-ink/25">
@@ -557,6 +575,7 @@ export default function AiAssistant({
                               />
                             )}
                           </button>
+                          </div>
                         );
                       })
                     )}

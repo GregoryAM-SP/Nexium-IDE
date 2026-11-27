@@ -10,8 +10,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
-use crate::nim;
-use crate::nim::ChatMessage;
+use crate::llm;
+use crate::llm::{ChatMessage, Endpoint};
 use crate::workspace;
 
 const MAX_STEPS: usize = 25;
@@ -480,8 +480,11 @@ fn apply_delta(
         }
     }
 
+    // NVIDIA, DeepSeek and most others stream `reasoning_content`; Ollama and
+    // OpenRouter call the same thing `reasoning`.
     if let Some(thought) = delta
         .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
         .and_then(|value| value.as_str())
     {
         if !thought.is_empty() {
@@ -535,6 +538,7 @@ fn turn_from_message(message: &Value) -> StreamedTurn {
             .to_string(),
         reasoning: message
             .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string(),
@@ -599,27 +603,26 @@ impl Failure {
 
 async fn stream_turn(
     client: &reqwest::Client,
-    api_key: &str,
+    endpoint: &Endpoint,
     body: &Value,
     app: &AppHandle,
     cancel: &AtomicBool,
 ) -> Result<StreamedTurn, Failure> {
-    let response = client
-        .post(format!("{}/chat/completions", nim::BASE))
-        .bearer_auth(api_key)
+    let response = endpoint
+        .post(client, "chat/completions")
         .header("Accept", "text/event-stream")
         .json(body)
         .send()
         .await
-        .map_err(|error| Failure::Transport(nim::transport_error(&error)))?;
+        .map_err(|error| Failure::Transport(llm::transport_error(&endpoint.name, &error)))?;
 
     let status = response.status().as_u16();
 
     if !(200..=299).contains(&status) {
-        let detail = nim::read_detail(response).await;
+        let detail = llm::read_detail(response).await;
         return Err(Failure::Http {
             status,
-            message: nim::describe(status, detail.as_deref()),
+            message: llm::describe(&endpoint.name, status, detail.as_deref()),
         });
     }
 
@@ -651,7 +654,8 @@ async fn stream_turn(
             break;
         };
 
-        let bytes = chunk.map_err(|error| Failure::Transport(nim::transport_error(&error)))?;
+        let bytes = chunk
+            .map_err(|error| Failure::Transport(llm::transport_error(&endpoint.name, &error)))?;
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
         while let Some(position) = buffer.find('\n') {
@@ -694,41 +698,44 @@ async fn stream_turn(
     Ok(turn)
 }
 
-async fn send(client: &reqwest::Client, api_key: &str, body: &Value) -> Result<Value, Failure> {
-    let response = client
-        .post(format!("{}/chat/completions", nim::BASE))
-        .bearer_auth(api_key)
+async fn send(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    body: &Value,
+) -> Result<Value, Failure> {
+    let response = endpoint
+        .post(client, "chat/completions")
         .json(body)
         .send()
         .await
-        .map_err(|error| Failure::Transport(nim::transport_error(&error)))?;
+        .map_err(|error| Failure::Transport(llm::transport_error(&endpoint.name, &error)))?;
 
     let status = response.status().as_u16();
 
     if !(200..=299).contains(&status) {
-        let detail = nim::read_detail(response).await;
+        let detail = llm::read_detail(response).await;
         return Err(Failure::Http {
             status,
-            message: nim::describe(status, detail.as_deref()),
+            message: llm::describe(&endpoint.name, status, detail.as_deref()),
         });
     }
 
     response
         .json()
         .await
-        .map_err(|error| Failure::Transport(format!("NVIDIA returned an unexpected reply: {error}")))
+        .map_err(|error| Failure::Transport(format!("{} returned an unexpected reply: {error}", endpoint.name)))
 }
 
 async fn request_turn(
     client: &reqwest::Client,
-    api_key: &str,
+    endpoint: &Endpoint,
     body: &mut Value,
     app: &AppHandle,
     streaming: &mut bool,
     cancel: &AtomicBool,
 ) -> Result<StreamedTurn, Failure> {
     if *streaming {
-        match stream_turn(client, api_key, body, app, cancel).await {
+        match stream_turn(client, endpoint, body, app, cancel).await {
             Ok(turn) => return Ok(turn),
             // The deployment ignored `stream` and sent one JSON body instead.
             Err(Failure::EmptyStream) => {
@@ -742,7 +749,7 @@ async fn request_turn(
         }
     }
 
-    let value = send(client, api_key, body).await?;
+    let value = send(client, endpoint, body).await?;
     Ok(turn_from_message(
         value
             .get("choices")
@@ -756,18 +763,20 @@ async fn request_turn(
 pub async fn run(
     root: Option<PathBuf>,
     app: &AppHandle,
-    api_key: &str,
+    endpoint: &Endpoint,
     model: &str,
     messages: Vec<ChatMessage>,
     auto_approve: bool,
     approvals: &Approvals,
     cancel: &AtomicBool,
 ) -> Result<AgentReply, String> {
-    if api_key.trim().is_empty() {
-        return Err("Connect NVIDIA NIM in Settings first.".into());
+    endpoint.validate()?;
+
+    if model.trim().is_empty() {
+        return Err("Choose a model in Settings first.".into());
     }
 
-    let client = nim::client()?;
+    let client = llm::client()?;
     let mut conversation: Vec<Value> = Vec::new();
     let mut tools_enabled = root.is_some();
     let mut streaming = true;
@@ -816,7 +825,7 @@ pub async fn run(
         }
 
 
-        let turn = match request_turn(&client, api_key, &mut body, app, &mut streaming, cancel)
+        let turn = match request_turn(&client, endpoint, &mut body, app, &mut streaming, cancel)
             .await
         {
             Ok(turn) => turn,
@@ -840,7 +849,7 @@ pub async fn run(
                     object.remove("tool_choice");
                 }
 
-                request_turn(&client, api_key, &mut body, app, &mut streaming, cancel)
+                request_turn(&client, endpoint, &mut body, app, &mut streaming, cancel)
                     .await
                     .map_err(Failure::message)?
             }
@@ -997,7 +1006,7 @@ pub async fn run(
         final_body["stream"] = json!(true);
     }
 
-    if let Ok(turn) = request_turn(&client, api_key, &mut final_body, app, &mut streaming, cancel)
+    if let Ok(turn) = request_turn(&client, endpoint, &mut final_body, app, &mut streaming, cancel)
         .await
     {
         let text = if turn.content.trim().is_empty() {

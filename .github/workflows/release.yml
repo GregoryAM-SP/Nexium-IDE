@@ -1,0 +1,189 @@
+# Builds Nexium Studio for Windows and Linux and publishes a GitHub release
+# whenever a version tag is pushed:
+#
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# Windows: NSIS installer (.exe) and MSI (.msi)
+# Linux:   .deb, .rpm and .AppImage
+# Updates: signed update files plus latest.json, which installed copies of the
+#          app check (see plugins.updater in src-tauri/tauri.conf.json).
+#
+# Needs the repository secret TAURI_SIGNING_PRIVATE_KEY (and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD if the key has a password).
+#
+# The release is created as a draft, every platform uploads into it, and it is
+# only published once all builds have succeeded — a failed build never leaves a
+# half-filled public release behind. Tags with a pre-release part
+# (v1.1.0-beta.1) are published as pre-releases.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  # Re-run a release by hand for an existing tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Read version from tag
+        id: version
+        run: |
+          version="${TAG#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $TAG is not a version like v1.2.3 or v1.2.3-beta.1"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create (or reuse) the draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; builds will upload into it."
+          else
+            flags=(--draft --generate-notes --title "Nexium Studio $TAG")
+            if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" "${flags[@]}" --verify-tag
+          fi
+          id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            bundles: nsis,msi
+          - name: Linux
+            # The oldest supported Ubuntu, so the .deb/.AppImage run on older
+            # glibc versions too.
+            os: ubuntu-22.04
+            bundles: deb,rpm,appimage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file pkg-config patchelf \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libxdo-dev libdbus-1-dev
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Stamp the version from the tag
+        run: node scripts/set-version.mjs "${{ env.TAG }}"
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      # MSI (WiX) only accepts numeric versions, so a pre-release such as
+      # v1.1.0-beta.1 ships the .exe installer on Windows but no .msi.
+      - name: Choose bundles
+        id: bundles
+        shell: bash
+        run: |
+          bundles="${{ matrix.bundles }}"
+          if [[ "${{ needs.create-release.outputs.prerelease }}" == "true" ]]; then
+            bundles="${bundles//,msi/}"
+          fi
+          echo "list=$bundles" >> "$GITHUB_OUTPUT"
+
+      - name: Check the update signing key is set
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::Add the TAURI_SIGNING_PRIVATE_KEY repository secret (the contents of ~/.tauri/nexium.key). See README → In-app updates."
+            exit 1
+          fi
+
+      # Builds the installers, signs the update artifacts with the private key,
+      # uploads everything to the draft release and merges this platform into
+      # latest.json, which installed copies of the app read to find updates.
+      - name: Build and upload
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --bundles ${{ steps.bundles.outputs.list }}
+          includeUpdaterJson: true
+          # The in-app updater on Windows installs the .exe (NSIS) build.
+          updaterJsonPreferNsis: true
+
+  publish:
+    name: Publish release
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

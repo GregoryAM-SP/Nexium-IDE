@@ -1,6 +1,7 @@
 import * as monaco from "monaco-editor";
 
-import { chat } from "./nim";
+import type { ModelTarget } from "./assistantSettings";
+import { chat } from "./llm";
 
 /**
  * AI inline completions: after a pause in typing, the editor asks the selected
@@ -26,12 +27,8 @@ const SYSTEM_PROMPT = [
   "If nothing sensible can follow, reply with an empty string.",
 ].join(" ");
 
-type Credentials = {
-  apiKey: string;
-  model: string;
-};
-
-let credentials: Credentials = { apiKey: "", model: "" };
+/** The model suggestions come from; null turns suggestions off. */
+let target: ModelTarget | null = null;
 
 /** Only the newest request may answer; every keystroke supersedes the last. */
 let generation = 0;
@@ -51,13 +48,18 @@ function remember(key: string, value: string): void {
   cache.set(key, value);
 }
 
-/** The assistant's key and model; without both, no request is ever sent. */
-export function setInlineCompletionModel(apiKey: string, model: string): void {
-  if (credentials.apiKey !== apiKey || credentials.model !== model) {
+const targetKey = (value: ModelTarget | null) =>
+  value
+    ? `${value.provider}|${value.baseUrl}|${value.model}|${value.apiKey.length}`
+    : "";
+
+/** The provider and model to ask; null (no model set up) sends nothing. */
+export function setInlineCompletionModel(next: ModelTarget | null): void {
+  if (targetKey(next) !== targetKey(target)) {
     cache.clear();
   }
 
-  credentials = { apiKey, model };
+  target = next;
 }
 
 type PromptInput = {
@@ -132,7 +134,9 @@ async function completeInline(
   position: monaco.Position,
   token: monaco.CancellationToken,
 ): Promise<string> {
-  if (!credentials.apiKey || !credentials.model) {
+  const using = target;
+
+  if (!using) {
     return "";
   }
 
@@ -165,7 +169,7 @@ async function completeInline(
   let reply: string;
 
   try {
-    reply = await chat(credentials.apiKey, credentials.model, [
+    reply = await chat(using, [
       { role: "system", content: SYSTEM_PROMPT },
       {
         role: "user",
@@ -176,7 +180,7 @@ async function completeInline(
           suffix,
         }),
       },
-    ]);
+    ], 160);
   } catch {
     // A suggestion that never arrives must not interrupt typing.
     return "";

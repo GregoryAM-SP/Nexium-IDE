@@ -212,3 +212,139 @@ export async function commitAndSync(message: string): Promise<GitStatus> {
   // The browser demo has no remote, so syncing only commits there.
   return commitChanges(message);
 }
+
+export type GitTag = {
+  name: string;
+  /** Short hash of the tagged commit. */
+  commit: string;
+  annotated: boolean;
+  /** The tag message (annotated) or the tagged commit's subject. */
+  subject: string;
+  /** ISO 8601. */
+  date: string;
+};
+
+/** The browser demo keeps its tags in memory. */
+let demoTags: GitTag[] = [
+  {
+    name: "v0.1.0",
+    commit: "8602459",
+    annotated: true,
+    subject: "First preview",
+    date: "2026-11-20T09:00:00+00:00",
+  },
+];
+
+async function callTags(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<GitTag[]> {
+  try {
+    return await invoke<GitTag[]>(command, args);
+  } catch (cause) {
+    throw toError(cause, "The tag operation failed.");
+  }
+}
+
+/** Newest first, at most 100. */
+export async function readGitTags(): Promise<GitTag[]> {
+  return isTauri() ? callTags("git_tags") : demoTags.map((tag) => ({ ...tag }));
+}
+
+/** Tags the current commit; a message makes it annotated. */
+export async function createGitTag(
+  name: string,
+  message: string,
+  push: boolean,
+): Promise<GitTag[]> {
+  if (isTauri()) {
+    return callTags("git_create_tag", { name, message, push });
+  }
+
+  if (demoTags.some((tag) => tag.name === name.trim())) {
+    throw new Error(`A tag named "${name.trim()}" already exists.`);
+  }
+
+  demoTags = [
+    {
+      name: name.trim(),
+      commit: "a53ec27",
+      annotated: message.trim().length > 0,
+      subject: message.trim() || "Latest commit",
+      date: new Date().toISOString(),
+    },
+    ...demoTags,
+  ];
+
+  return readGitTags();
+}
+
+export async function pushGitTag(name: string): Promise<GitTag[]> {
+  if (isTauri()) {
+    return callTags("git_push_tag", { name });
+  }
+
+  throw new Error("The browser demo has no remote to push to.");
+}
+
+/** Removes the tag from this repository only, never from the remote. */
+export async function deleteGitTag(name: string): Promise<GitTag[]> {
+  if (isTauri()) {
+    return callTags("git_delete_tag", { name });
+  }
+
+  demoTags = demoTags.filter((tag) => tag.name !== name);
+  return readGitTags();
+}
+
+/** Accepts v1.2.3 and 1.2.3, with an optional -pre.release part. */
+const VERSION = /^(v?)(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/;
+
+/**
+ * The next patch, minor and major version after the newest version tag
+ * (keeping its "v" prefix), or v0.1.0 / v1.0.0 when there is none yet.
+ */
+export function nextVersions(
+  tags: GitTag[],
+): { label: string; name: string }[] {
+  let best: [string, number, number, number] | null = null;
+
+  for (const tag of tags) {
+    const match = VERSION.exec(tag.name);
+
+    if (!match) {
+      continue;
+    }
+
+    const version: [string, number, number, number] = [
+      match[1],
+      Number(match[2]),
+      Number(match[3]),
+      Number(match[4]),
+    ];
+
+    if (
+      !best ||
+      version[1] > best[1] ||
+      (version[1] === best[1] && version[2] > best[2]) ||
+      (version[1] === best[1] && version[2] === best[2] && version[3] > best[3])
+    ) {
+      best = version;
+    }
+  }
+
+  if (!best) {
+    return [
+      { label: "First release", name: "v1.0.0" },
+      { label: "Preview", name: "v0.1.0" },
+    ];
+  }
+
+  const [prefix, major, minor, patch] = best;
+
+  return [
+    { label: "Patch", name: `${prefix}${major}.${minor}.${patch + 1}` },
+    { label: "Minor", name: `${prefix}${major}.${minor + 1}.0` },
+    { label: "Major", name: `${prefix}${major + 1}.0.0` },
+  ];
+}

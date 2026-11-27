@@ -1,6 +1,6 @@
 # Nexium Studio
 
-A local desktop code editor built with **Tauri 2 + Rust** on the outside and **React 19 + TypeScript + Monaco** on the inside. It opens a folder from your disk, edits real files through a Monaco editor, and ships an AI assistant that runs on **NVIDIA NIM** — the assistant reads, searches and writes the files in the folder you have open, streaming its answer token by token while it works.
+A local desktop code editor built with **Tauri 2 + Rust** on the outside and **React 19 + TypeScript + Monaco** on the inside. It opens a folder from your disk, edits real files through a Monaco editor, and ships an AI assistant that runs on **any OpenAI-compatible provider** — NVIDIA NIM, Groq, Gemini, OpenRouter, Mistral, a local Ollama and about ninety more presets — the assistant reads, searches and writes the files in the folder you have open, streaming its answer token by token while it works.
 
 The interface is built from three values per theme — a page colour, an ink and an accent — with every surface, hairline and overlay mixed from them; the default Nexium theme is pure black with white ink, bundled Inter and JetBrains Mono. Colour is spent on two things only: the theme accent (selections, focus, caret) and code — each theme carries a syntax palette for keywords, strings, numbers, types, tags, attributes and comments, and themes without a palette of their own draw keywords and tags in their accent, so the code carries some of the chosen theme's colour without losing the reading colours of strings, numbers and comments.
 
@@ -11,7 +11,7 @@ The interface is built from three values per theme — a page colour, an ink and
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [Getting an NVIDIA API key](#getting-an-nvidia-api-key)
+- [Connecting a provider](#connecting-a-provider)
 - [Scripts](#scripts)
 - [How the assistant works](#how-the-assistant-works)
 - [Model verification and fallback](#model-verification-and-fallback)
@@ -36,7 +36,7 @@ The interface is built from three values per theme — a page colour, an ink and
 - **Explorer** with per-extension file icons, folders collapsed by default, inline rename, a right-click context menu (Ask AI about this file/folder, New File, New Folder, Rename, Copy Path, Delete) and a hide toggle. Delete always opens a confirmation dialog naming the target — Cancel is focused, Escape and a backdrop click cancel, and folders warn that everything inside goes with them.
 - **Editor bar**: the open file as a raised tab with dirty marker and close button, the path as mono breadcrumbs beside it (hidden for root-level files where it would repeat the tab), and, grouped on the right, the Preview toggle and the Save control with its ⌘S keycap (disabled while the buffer is clean).
 - **Status bar** in six segments: transient notices (when there is one), branch with a change-count badge (opens Source Control), relative path, language, `Ln/Col` from the Monaco caret, `UTF-8`, and the assistant model (opens Settings).
-- **Source control panel** (Git): the branch, every staged and unstaged change, per-file stage/unstage, stage/unstage all, and a commit box. Git runs as a subprocess on the Rust side, in the folder you have open; the panel is read-only about history — no history rewriting, no force operations.
+- **Source control panel** (Git): the branch, every staged and unstaged change, per-file stage/unstage, stage/unstage all, a commit box, and a **Tags** list to create, push and delete version tags. Git runs as a subprocess on the Rust side, in the folder you have open; the panel is read-only about history — no history rewriting, no force operations.
 - **Markdown preview**: opening a `.md`, `.markdown` or `.mdx` file shows a **Preview** toggle in the tab strip that splits the pane — rendered document beside the editor, rendered from the live buffer with the same component map as assistant replies. Scrolling either side moves the other to the same source line, anchored on the rendered blocks rather than a flat percentage.
 - **Font files**: `.woff2`, `.woff`, `.ttf` and `.otf` have no text to edit, so selecting one opens a specimen in the editor area instead of an empty pane: the bytes are read in Rust (`read_media_file`, the same 16 MB-capped binary path as images, now also mapping `font/woff2`, `font/woff`, `font/ttf` and `font/otf`) and injected as an `@font-face` data URL, then the face is drawn with “The quick brown fox jumps over the lazy dog”, an alphabet/digit sample and a 13/17/21 px ladder, with a footer for the file's extension, size and path. The browser demo has no face bytes, so it shows the same specimen in the bundled mono font and says so.
 - **SVG preview**: the same **Preview** toggle appears for `.svg` files and splits the pane with the image the browser draws from the live buffer, sized to fit a 16 px grid with its intrinsic dimensions in the pane header. It is rendered through a `data:` URL in an `<img>`, so a file's own scripts and external references never touch the editor.
@@ -61,18 +61,23 @@ The interface is built from three values per theme — a page colour, an ink and
 - **Ask AI from the right-click menu**: right-clicking inside the editor offers **Ask AI about this file**, and highlighting code turns the menu selection-aware: **Explain this selection**, **Refactor this selection**, **Find bugs in this selection** and **Document this selection** each seed the composer with that question plus the highlighted lines; the explorer's menu offers the same for the file or folder under the pointer. Each one opens the assistant if it was hidden and pre-fills the composer with a ready prompt — the highlighted lines travel inside the message with their path and line range, while file and folder prompts name the path for the assistant's own tools — caret at the end, nothing sent until you press Enter.
 - **Markdown rendering** of replies (GFM tables, lists, code blocks, inline code) through a monochrome component map — no raw HTML is ever injected.
 - **Auto-follow while generating**, which pauses the moment you scroll up and offers a "jump to latest" chevron instead of fighting you.
-- **Stop button** that cancels the in-flight request on the Rust side (`nim_cancel`), so a runaway generation cannot keep writing files.
+- **Stop button** that cancels the in-flight request on the Rust side (`ai_cancel`), so a runaway generation cannot keep writing files.
 - **Model switcher inside the composer**: pick any verified model without leaving the chat; the menu opens upward and shows each model's measured latency.
-- **Stall handling**: if a model produces no data for five minutes, the request is retried once with your fastest verified model and a step note explains the swap.
+- **Stall handling**: if a model produces no data for five minutes, the request is retried once with your fastest tested model (on any connected provider) and a step note explains the swap.
 
 ### Settings
 
-- The **Settings** page (left rail, gear) is the single home for the assistant: an **AI assistant** section with a **Connection** card (masked key entry, save and verify, test connection, remove key) and a **Models** card (verified models with latency, fastest-first, radio pick). Verification probes every catalogue model with a real 1-token request.
+- **AI providers** (Settings → AI providers) is where the assistant is set up. The top of the page picks the **assistant model** and the **inline-completions model** (a small, fast one is best; by default the assistant's) from every connected provider, with a **Test** button. Below, a searchable provider list with filters (All, Connected, Free, Routers, Trial, Local) sits beside the selected provider's details:
+  - a note on its free offer and anything to watch for (training on prompts, card or verification required), and a **Get a key** link;
+  - the **API key** (stored in Windows Credential Manager; hidden for local servers, optional where an anonymous tier exists);
+  - the **base URL**, prefilled where it is known and editable. Keys only ever go to `https://` URLs or to `localhost`;
+  - **Models**: **Load models** fetches the provider's `/models` list; tick the models the assistant may use (they appear in the composer's model menu, grouped by provider), filter the list (with a `:free only` toggle for routers), add an id by hand, and **Test models** times each ticked model with a 1-token request.
+  - **Add custom provider** takes a name and any OpenAI-compatible base URL.
 - An **Appearance** page with twenty-four themes — Nexium, Graphite, Daylight, Paper, Glacier, Dracula, Nord, Forest, Ocean, Sunset, Rosé Pine, Gruvbox, Solarized, Tokyo Night, Monokai, Catppuccin, One Dark, GitHub Dark, GitHub Light, Night Owl, Kanagawa, Everforest, Cobalt2 and Zenburn — picked from a card grid and applied instantly. Themes set a page colour, an ink and an accent on `<html>`; every panel, hairline, overlay and the Monaco palette are mixed from those three, so light themes stay legible and the choice is remembered in `localStorage` (`nexium-theme`).
 - A **Fonts** page that shows the two faces the window actually uses, at the weights it ships: **JetBrains Mono** (the editor, diffs, the explorer and every monospaced label) and **Inter** (panels, menus, the assistant). Each face lists its weights and renders “The quick brown fox jumps over the lazy dog” in that face and weight, so the shapes can be compared at a glance; it is a reference page, not a picker — the app keeps its bundled faces rather than borrowing installed system fonts.
-- Settings takes over the window: the left sidebar becomes a list of option pages (**Appearance**, **Fonts**, **AI assistant**, **Source control**) with the back arrow above it, and the editor area shows the selected page only. Opening settings closes the left panel (explorer or source control) and the assistant, hiding the assistant rail, and closing the tab lives off that state — nothing stays technically open behind the settings page; leaving settings reopens whichever panel was showing and the assistant if it had been open.
+- Settings takes over the window: the left sidebar becomes a list of option pages (**Appearance**, **Fonts**, **AI providers**, **Source control**) with the back arrow above it, and the editor area shows the selected page only. Opening settings closes the left panel (explorer or source control) and the assistant, hiding the assistant rail, and closing the tab lives off that state — nothing stays technically open behind the settings page; leaving settings reopens whichever panel was showing and the assistant if it had been open.
 - A **Source control** page: the git identity git uses for commits (`user.name` / `user.email`), read from the effective config and shown as `configured` or `not set`. Saving writes both values to the global git config, which is where commits look for an author; validation rejects an empty name or an address without `@`.
-- Settings are stored locally and never leave the machine except as the `Authorization` header of your own NIM requests.
+- Settings are stored locally and never leave the machine except as the `Authorization` header of your own requests to the provider you chose.
 
 ---
 
@@ -84,7 +89,7 @@ The interface is built from three values per theme — a page colour, an ink and
 | **WebView2 runtime** | Preinstalled on Windows 11 and current Windows 10. If the window is blank, install the Evergreen runtime from Microsoft. |
 | **Node.js 20.19+ or 22.12+** | Required by Vite 8. The repo ships a `bun.lock`; `bun` or `npm` 10+ both work. |
 | **Rust (stable) + MSVC toolchain** | `rustup default stable` and the "Desktop development with C++" workload from Visual Studio Build Tools. |
-| **NVIDIA API key** | Only needed for the assistant; the editor works without one. |
+| **A provider** | Only needed for the assistant; the editor works without one. A free key from any listed provider, or a local Ollama / LM Studio, is enough. |
 
 ---
 
@@ -103,19 +108,24 @@ The first `npm run desktop` compiles the Rust crate, which takes a few minutes. 
 Then:
 
 1. Click the folder icon in the **Explorer** header (or the empty state) and pick a project folder.
-2. Open the assistant from the activity rail, press **Settings**, paste your `nvapi-…` key and hit **Verify**.
-3. Wait for the model list — models are probed with a real request, so only the ones that actually answer appear, sorted fastest first.
-4. Ask it to change something. It will read files, make the edit and the editor will refresh.
+2. Open **Settings → AI providers**, pick a provider (for example Groq, Google AI Studio, OpenRouter or a local Ollama), paste its key and press **Load models**.
+3. Tick a model or two; the first one becomes the assistant's model.
+4. Ask the assistant to change something. It reads files, proposes the edit as a diff, and the editor refreshes once you accept it.
 
 ---
 
-## Getting an NVIDIA API key
+## Connecting a provider
 
-1. Go to <https://build.nvidia.com> and sign in.
-2. Open **API Keys** and create one; it looks like `nvapi-xxxxxxxx…`.
-3. Paste it into **Settings** inside the app.
+Every provider speaks the OpenAI chat-completions API, so connecting one is a key, a base URL and a list of models. The built-in list (`src/lib/providers.ts`) is the chat-capable part of the *Free AI APIs — Complete Deduplicated List* (verified Nov 8, 2026):
 
-Keys are stored in Windows Credential Manager (entry `com.nexium.studio`), are only read by the app's own Rust code, and are sent only to `https://integrate.api.nvidia.com`. The free tier is rate-limited (roughly 40 requests per minute), so very long agent runs can hit a 429 — see [Troubleshooting](#troubleshooting).
+- **Free tier**: NVIDIA NIM, Google AI Studio (Gemini), Groq, Cerebras, Cloudflare Workers AI, Mistral, Cohere, Hugging Face, Kilo Code Gateway, LLM7.io, OVHcloud, Z.ai, SambaNova, SiliconFlow, ModelScope, DashScope, SEA-LION, OpenTyphoon, Ollama Cloud, Novita, Aion Labs, Arli AI and more.
+- **Routers** (one key, many models): OpenRouter, Requesty, AIHubMix, Vercel AI Gateway, Api.Airforce and more.
+- **Trial credit**: xAI, DeepSeek, AI21, Upstage, Inception, Fireworks, Regolo and more.
+- **Local**: Ollama, LM Studio, llama.cpp, GPT4All, Jan — no key, unlimited, private.
+
+Providers whose OpenAI-compatible URL is not known ship without one and show **needs URL**; copy it from the provider's docs. Image, audio, OCR, search, translation and coding-IDE plans from that list are not chat APIs, so they are not included, and neither are dead or app-only offers (GitHub Models, Chutes, Kluster, OpenCode Zen) or non-OpenAI-compatible APIs (IBM watsonx).
+
+Keys are stored in Windows Credential Manager (service `com.nexium.studio`, one entry per provider), are only read by the app's own Rust code, and are sent only to that provider's base URL. Free tiers are rate-limited, so very long agent runs can hit a 429 — switch models from the composer, or see [Troubleshooting](#troubleshooting). Free tiers change often; check the provider's pricing before relying on one.
 
 ---
 
@@ -137,10 +147,10 @@ The window is pinned to port 5173 (`strictPort: true`) because `tauri.conf.json`
 
 ## How the assistant works
 
-Nothing about the assistant happens in the webview except rendering. The API key, the HTTP client, the tool loop and all filesystem access live in Rust (`src-tauri/src/agent.rs`, `nim.rs`, `workspace.rs`).
+Nothing about the assistant happens in the webview except rendering. The HTTP client, the tool loop and all filesystem access live in Rust (`src-tauri/src/agent.rs`, `llm.rs`, `workspace.rs`); the UI passes the chosen provider's endpoint (name, base URL, key) with each request.
 
-1. The UI sends the conversation plus the workspace root to the `nim_agent` command.
-2. Rust calls `POST /v1/chat/completions` on `integrate.api.nvidia.com` with the tool schema, streams deltas back as `agent-delta` events, and shows reasoning separately from the answer.
+1. The UI sends the conversation and the provider endpoint to the `ai_agent` command.
+2. Rust calls `POST {base URL}/chat/completions` with the tool schema, streams deltas back as `agent-delta` events, and shows reasoning separately from the answer.
 3. When the model calls a tool, Rust executes it against the open folder, emits the result as an `agent-step` note (and `workspace:file-changed` for writes), then loops back to the model with the tool output.
 4. When the model stops calling tools, the final message is returned and the UI settles on it. If it spends every step on tools, the loop asks once more with the tools removed — "answer with what you have already read" — so a long exploration still ends in prose instead of an error note.
 
@@ -148,7 +158,7 @@ Hard limits, chosen so a confused model can never spin forever or rewrite a huge
 
 | Limit | Value |
 | --- | --- |
-| Agent loop steps per request | 8 (then one tool-free answer) |
+| Agent loop steps per request | 25 (then one tool-free answer, and a **Continue** button) |
 | Characters of context sent per request | 24 000 |
 | Tool output kept per call | 40 000 chars |
 | Characters a single `write_file` may write | 200 000 |
@@ -163,11 +173,10 @@ Folders that would swamp the tree or the model (`node_modules`, `.git`, `target`
 
 ## Model verification and fallback
 
-NVIDIA's model catalogue is not a capability list: a model can exist and still reject chat completions, be offline, or be unusably slow. So **Verify** in Settings probes each catalogue model with a minimal 1-token request and keeps only the ones that answer, recording the round-trip time.
+A provider's `/models` list is not a capability list: a model can be listed and still reject chat completions, be offline, or be unusably slow — and routers list hundreds. So nothing is probed automatically: you tick the models you want, and **Test models** sends each ticked model (up to 40) a 1-token request and records the round-trip time.
 
-- The picker is ordered fastest-first, with the measured latency shown next to each model.
-- Verification results and latencies are cached until you verify again.
-- If the selected model sends no data for five minutes, the request is retried once with the fastest verified model instead of leaving you on a dead model.
+- Latencies are shown in the provider's model list, the default-model pickers and the composer's model menu, and are kept until you test again.
+- If the selected model sends no data for five minutes, the request is retried once with the fastest tested model on any connected provider instead of leaving you on a dead model.
 
 ---
 
@@ -179,6 +188,8 @@ Open the branch icon in the activity rail. The panel reads `git status --porcela
 - **Staged** and **Changes** groups with counts, each rendered as a folder tree: directories show a folder icon and how many changed files sit below them, files are indented under their folder with their porcelain status in a small badge (`M`, `A`, `D`, `R`, `C`, `U` for untracked). Clicking a file opens its diff in the editor (deleted files are struck through and not clickable);
 - a per-row **Stage** / **Unstage** action on hover, plus **Stage all** / **Unstage all** per group;
 - a commit card: the message field explains what is staged, the **Commit** button enables once something is staged and a message is written (`Ctrl`/`Cmd` + `Enter` submits), and a successful commit clears the message, reloads the list and falls back to the “Working tree clean” state. The caret beside it opens the commit options — **Commit** and **Commit & Sync**; the panel only ever lists local commits, so syncing is what sends them to the remote: it pushes the current branch to its upstream, or sets `origin` as the upstream when the branch has none, and nothing is pulled, merged or rebased. A **Generate** button at the top right of the message field writes the message with the assistant's selected model from the staged file list and the lines around each change; it is disabled until a model is configured and something is staged, and a failure is reported in the line under the field instead of overwriting the message.
+
+- a **Tags** section under the changes: the 100 newest tags (8 shown, **Show all** for the rest), each with its age; hover a tag to **push** it to `origin` or **delete** it (locally only, after a confirm — a tag already on the remote stays there). **New tag** opens a form that suggests the next patch, minor and major version after the newest `vX.Y.Z` tag, takes an optional message (which makes it an annotated tag) and a **Push to origin** box that is on by default. It tags the last commit, warns when there are uncommitted changes, rejects duplicates and names git would not accept, and notes that pushing a version tag starts the release workflow ([Publishing a release from a tag](#publishing-a-release-from-a-tag)). If the push fails the tag still exists locally and can be pushed again from its row.
 
 A change opens as a read-only side-by-side diff in the editor area, titled `HEAD → staged` for a staged change (the index against `HEAD`) or `HEAD → working tree` for everything else (the file on disk against `HEAD`), with the file's own language, the app's fonts and the active `nexium` theme; the header carries the path and a close button that returns to the editor. A new file, or any file in a repository without commits, diffs against empty. The two sides are Monaco models owned by the diff pane: they are created per open and disposed after the widget is gone, so opening and closing diffs repeatedly leaks nothing.
 
@@ -214,11 +225,11 @@ Every action returns the fresh status, so the panel never shows a stale tree. Sa
 │  lib/tauriBridge.ts  (typed invoke wrappers + isTauri)    │
 └───────────────▲───────────────────────────┬───────────────┘
                 │ events                    │ invoke
-                │ agent-delta/step          │ nim_agent, read_workspace_file …
+                │ agent-delta/step          │ ai_agent, read_workspace_file …
 ┌───────────────┴───────────────────────────▼───────────────┐
 │                    Rust core (src-tauri)                  │
 │  workspace.rs  safe path joining, tree, read/write/search │
-│  nim.rs        catalogue, streaming chat, probes, cancel  │
+│  llm.rs        any OpenAI-compatible provider, probes      │
 │  agent.rs      tool loop, system prompt, event emission   │
 └───────────────────────────┬───────────────────────────────┘
                             │ HTTPS (key never reaches JS)
@@ -275,7 +286,7 @@ Nexium-IDE/
 │       ├── media.ts            # image and font paths → data URL from Rust
 │       ├── monacoSetup.ts      # worker setup and theme
 │       ├── git.ts              # status/stage/commit wrappers + browser demo repo
-│       ├── nim.ts              # model catalogue, verification, chat calls
+│       ├── llm.ts              # provider calls: models, probes, chat, agent
 │       ├── assistantPrompt.ts  # right-click selection/file prompts for the composer
 │       ├── inlineCompletion.ts # ghost-text AI completions in the editor
 │       └── assistantSettings.ts# settings persistence (key → credential store)
@@ -288,7 +299,7 @@ Nexium-IDE/
         ├── lib.rs              # commands, builder, dialog plugin, state
         ├── workspace.rs        # safe_join, tree snapshot, read/write/search, tests
         ├── git.rs              # porcelain parser, diff sides, stage/unstage, commit
-        ├── nim.rs              # NIM client, streaming SSE parser, probes, cancellation
+        ├── llm.rs              # OpenAI-compatible client for every provider, probes
         └── agent.rs            # tool schema, tool loop, step notes, write events
 ```
 
@@ -304,7 +315,7 @@ Nexium-IDE/
 - Assistant output is rendered as Markdown without HTML, so a model cannot inject markup or script into the window.
 - Writes performed by the assistant go through the same path checks as your own edits, and the UI is told which file changed so the editor never shows stale content. Deleting asks for confirmation first and is the only destructive action in the app.
 - The terminal is a real shell behind a pseudo-terminal. It is only available once a project is open and always starts in that project's folder (opening another project restarts it there); commands typed into it run with your own permissions and are not sandboxed.
-- Source control shells out to `git` inside the open folder, only ever with `status --untracked-files=all`, `show` (read-only, for the diff sides), `add`, `restore`, `reset`, `rm --cached`, `commit -m` and `push` (with `GIT_TERMINAL_PROMPT=0`, so a credential prompt fails instead of blocking the window); paths are passed after `--` so they cannot be read as options.
+- Source control shells out to `git` inside the open folder, only ever with `status --untracked-files=all`, `show` (read-only, for the diff sides), `add`, `restore`, `reset`, `rm --cached`, `commit -m`, `tag` (create or delete one local tag; names are checked with `check-ref-format`), `for-each-ref refs/tags` and `push` (the current branch, or one `refs/tags/<name>`) (with `GIT_TERMINAL_PROMPT=0`, so a credential prompt fails instead of blocking the window); paths are passed after `--` so they cannot be read as options.
 
 ---
 
@@ -312,8 +323,8 @@ Nexium-IDE/
 
 | Data | Location |
 | --- | --- |
-| API key | OS credential store (Windows Credential Manager), service `com.nexium.studio`, account `nvidia-nim-api-key` |
-| Chosen model, verified models, latencies | WebView `localStorage`, key `nexium.assistant.nim` |
+| Provider API keys | OS credential store (Windows Credential Manager), service `com.nexium.studio`, account `api-key:<provider id>` |
+| Chosen models, turned-on models per provider, base-URL overrides, custom providers, latencies | WebView `localStorage`, key `nexium.assistant.providers` (settings from older builds under `nexium.assistant.nim` are migrated) |
 | Conversation | In memory for the session (cleared when the window closes) |
 | Your project files | Untouched on disk until you or the assistant saves |
 
@@ -329,6 +340,46 @@ npm run desktop:build
 
 The installer and binaries are produced under `src-tauri/target/release/bundle/` (MSI and NSIS on Windows). The release profile uses `lto = true`, `codegen-units = 1` and `opt-level = "s"` to keep the binary small; the first release build is slow, subsequent ones reuse the cache.
 
+### Publishing a release from a tag
+
+`.github/workflows/release.yml` builds and publishes a GitHub release whenever a version tag is pushed:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+| Runner | Files attached to the release |
+| --- | --- |
+| `windows-latest` | `Nexium Studio_1.0.0_x64-setup.exe` (NSIS), `Nexium Studio_1.0.0_x64_en-US.msi` |
+| `ubuntu-22.04` | `.deb`, `.rpm`, `.AppImage` |
+
+- The version comes from the tag: `scripts/set-version.mjs` stamps it into `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` before building, so the files in the repository do not have to be bumped by hand (run the script locally if you want them to match).
+- The release is created as a **draft**, both builds upload into it, and it is published only when both succeed. If one fails, the draft stays: fix the problem and re-run the failed job from the Actions tab, or run the workflow by hand (**Run workflow**, with the tag) to rebuild an existing tag.
+- Tags with a pre-release part, such as `v1.1.0-beta.1`, are published as GitHub **pre-releases**. Windows Installer only accepts numeric versions, so pre-releases ship the `.exe` installer but no `.msi`.
+- Linux builds run on Ubuntu 22.04, so the `.deb` and `.AppImage` also work on distributions with an older glibc. On Linux, API keys are kept in the desktop keyring (GNOME Keyring or KWallet, through the Secret Service API).
+- The installers are not code-signed, so Windows SmartScreen will warn on first launch until a signing certificate is added.
+
+### In-app updates
+
+Installed copies update themselves from this repository's releases:
+
+1. A few seconds after launch (and every 6 hours) the app fetches `https://github.com/GregoryAM-SP/Nexium-IDE/releases/latest/download/latest.json`.
+2. If it names a newer version, the update downloads quietly in the background; the status bar shows **Update x.y.z · nn%**, then **x.y.z installs on close** with a **Restart now** button.
+3. When you close the window, the update installs and the app exits: on Windows the NSIS installer runs in passive mode (a progress bar, no questions); on Linux the AppImage is replaced in place. **Restart now** installs and reopens the new version immediately.
+4. **Help → Check for Updates…** checks on demand and reports when you are up to date.
+
+Only stable releases are offered: GitHub's `releases/latest` skips pre-releases, so `v1.1.0-beta.1` reaches only people who download it by hand. The updater covers the Windows `.exe`/`.msi` installs and the Linux AppImage; `.deb` and `.rpm` installs update through a new package from the release page. Nothing is checked in `npm run desktop` (dev) builds.
+
+**Signing.** Every update is signed, and the app refuses anything that does not verify against the public key in `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`). The matching private key is `~/.tauri/nexium.key` on the maintainer's machine; keep it safe — if it is lost, existing installs can no longer be updated. The release workflow needs it as repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | the contents of `~/.tauri/nexium.key` |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | the key's password (leave unset: this key has none) |
+
+Because `bundle.createUpdaterArtifacts` is on, a local `npm run desktop:build` also needs the key, e.g. in PowerShell: `$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw ~/.tauri/nexium.key`.
+
 ---
 
 ## Browser-only development
@@ -337,7 +388,7 @@ The installer and binaries are produced under `src-tauri/target/release/bundle/`
 
 - `isTauri()` is false, so filesystem calls fall back to an in-memory demo workspace (`workspaceFs.ts`) — you can click around, open files and edit them, but nothing is written to disk.
 - The custom window buttons render nothing (there is no window to control).
-- Assistant requests go through the Vite `/nim` proxy to `integrate.api.nvidia.com`, because NVIDIA's API sends no CORS headers. The proxy also exists in `vite preview`, so a built `dist/` can be tested the same way.
+- Assistant requests go straight from the page to the provider with `fetch`, so only providers that allow cross-origin requests work here (local Ollama does; many cloud APIs do not). NVIDIA sends no CORS headers, so its requests go through the Vite `/nim` proxy, which also exists in `vite preview`. The desktop app sends every request from Rust and has no such limit.
 
 This mode is for UI work; anything involving real files, permissions or window behaviour must be checked in `npm run desktop`.
 
@@ -350,7 +401,7 @@ cd src-tauri
 cargo test --lib
 ```
 
-The Rust suite covers path sandboxing (`safe_join` rejects escapes), workspace reads/writes and the NIM SSE parser. One test is marked `#[ignore]` because it performs a live request against NVIDIA's API with a deliberately bogus key; run it explicitly when you want to check the authorisation error path:
+The Rust suite covers path sandboxing (`safe_join` rejects escapes), workspace reads/writes, the SSE parser, `edit_file` matching, base-URL rules and provider error messages. Two tests are marked `#[ignore]` because they need the network: one sends NVIDIA a deliberately bogus key to check the authorisation error path, the other lists and pings a local Ollama. Run them explicitly:
 
 ```bash
 cargo test --lib -- --ignored
