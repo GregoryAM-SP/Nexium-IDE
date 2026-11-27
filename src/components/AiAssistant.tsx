@@ -374,21 +374,34 @@ export default function AiAssistant({
                 <span className="flex size-10 items-center justify-center rounded-xl bg-ink/[0.03] ring-1 ring-ink/[0.08] ring-inset">
                   <Sparkles className="size-4 text-ink/30" strokeWidth={1.5} />
                 </span>
-                <div>
-                  <p className="text-[12.5px] text-ink/55">
-                    NVIDIA NIM is not connected
-                  </p>
-                  <p className="mt-1 text-[11px] leading-relaxed text-ink/30">
-                    Add an API key to let the assistant read and edit this
-                    workspace.
-                  </p>
-                </div>
+                {models.length === 0 ? (
+                  <div>
+                    <p className="text-[12.5px] text-ink/55">
+                      No AI provider connected
+                    </p>
+                    <p className="mx-auto mt-1 max-w-[30ch] text-[11px] leading-relaxed text-ink/30">
+                      Connect a provider to let the assistant read and edit
+                      this workspace — a free tier like Groq or Gemini, a
+                      router like OpenRouter, or a local model with Ollama.
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="text-[12.5px] text-ink/55">
+                      No model selected
+                    </p>
+                    <p className="mx-auto mt-1 max-w-[30ch] text-[11px] leading-relaxed text-ink/30">
+                      Choose which of your connected models the assistant
+                      should use.
+                    </p>
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={onOpenSettings}
                   className="rounded-lg bg-ink px-3 py-1.5 text-[11.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90"
                 >
-                  Open settings
+                  {models.length === 0 ? "Connect a provider" : "Choose a model"}
                 </button>
               </div>
             ) : messages.length === 0 && !pending ? (
