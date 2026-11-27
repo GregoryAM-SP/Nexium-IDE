@@ -50,3 +50,24 @@ createRoot(container).render(
     <App />
   </StrictMode>,
 );
+
+// The boot loader in index.html covers the window until the editor has painted
+// its first frame (two animation frames after the render), then fades out.
+// Animation frames never fire while the window is hidden or minimised, so a
+// timer clears the loader as well, whichever comes first.
+const BOOT_FADE_MS = 260;
+const BOOT_FALLBACK_MS = 1500;
+
+function hideBootLoader() {
+  const loader = document.getElementById("boot-loader");
+
+  if (!loader || loader.dataset.hidden === "true") {
+    return;
+  }
+
+  loader.dataset.hidden = "true";
+  window.setTimeout(() => loader.remove(), BOOT_FADE_MS);
+}
+
+requestAnimationFrame(() => requestAnimationFrame(hideBootLoader));
+window.setTimeout(hideBootLoader, BOOT_FALLBACK_MS);

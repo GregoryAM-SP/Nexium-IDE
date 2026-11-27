@@ -3,7 +3,8 @@
 //! endpoint (base URL, key, display name), so nothing here is tied to one
 //! vendor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
@@ -38,7 +39,10 @@ impl Endpoint {
         let trimmed = self.base_url.trim();
 
         if trimmed.is_empty() {
-            return Err(format!("{} has no base URL yet. Add it in Settings.", self.name));
+            return Err(format!(
+                "{} has no base URL yet. Add it in Settings.",
+                self.name
+            ));
         }
 
         if trimmed.contains("ACCOUNT_ID") {
@@ -62,7 +66,10 @@ impl Endpoint {
                 "The {} base URL must use https:// (plain http is only allowed for localhost).",
                 self.name
             )),
-            _ => Err(format!("The {} base URL must start with https://.", self.name)),
+            _ => Err(format!(
+                "The {} base URL must start with https://.",
+                self.name
+            )),
         }
     }
 
@@ -120,15 +127,46 @@ pub struct Ping {
 pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(300);
 const TOTAL_LIMIT: Duration = Duration::from_secs(900);
 
+/// One client for the whole app. reqwest keeps connections alive per client,
+/// so reusing it saves a TCP and TLS handshake on every request — which is most
+/// of the wait for an inline suggestion from a fast model.
 pub(crate) fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let built = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(20))
         // A slow model may think for minutes, but silence for this long means
         // the connection is dead rather than the model being thoughtful.
         .read_timeout(SILENCE_LIMIT)
         .timeout(TOTAL_LIMIT)
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    Ok(CLIENT.get_or_init(|| built).clone())
+}
+
+/// Provider and model pairs that rejected `reasoning_effort`, so fast requests
+/// stop sending it (and stop paying for a failed round-trip) after the first try.
+fn no_reasoning_control() -> &'static Mutex<HashSet<String>> {
+    static REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// A 400/422 that complains about the reasoning option rather than the request.
+fn rejects_reasoning_option(status: u16, detail: &str) -> bool {
+    matches!(status, 400 | 422) && {
+        let detail = detail.to_ascii_lowercase();
+        detail.contains("reasoning")
+            || detail.contains("unrecognized")
+            || detail.contains("unknown")
+            || detail.contains("not supported")
+            || detail.contains("extra")
+    }
 }
 
 /// reqwest's Display often omits the cause, which turned "timed out" into an
@@ -166,16 +204,16 @@ pub(crate) fn describe(name: &str, status: u16, detail: Option<&str>) -> String 
             Some(detail) => format!("{name} rejected the request: {detail}"),
             None => format!("{name} rejected this API key. Check it in Settings."),
         },
-        404 | 410 => detail
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{name} does not offer that model (or the base URL is wrong).")),
+        404 | 410 => detail.map(str::to_string).unwrap_or_else(|| {
+            format!("{name} does not offer that model (or the base URL is wrong).")
+        }),
         402 => format!(
             "{name} says this needs credit: {}",
             detail.unwrap_or("the free allowance may be used up.")
         ),
-        429 => format!(
-            "{name} rate limit reached. Wait a moment and try again, or switch provider."
-        ),
+        429 => {
+            format!("{name} rate limit reached. Wait a moment and try again, or switch provider.")
+        }
         400 | 422 => detail
             .map(str::to_string)
             .unwrap_or_else(|| format!("{name} rejected the request for that model.")),
@@ -231,7 +269,10 @@ pub async fn ai_models(endpoint: Endpoint) -> Result<Vec<String>, String> {
     }
 
     let value: Value = response.json().await.map_err(|error| {
-        format!("{} returned an unexpected model list: {error}", endpoint.name)
+        format!(
+            "{} returned an unexpected model list: {error}",
+            endpoint.name
+        )
     })?;
 
     // OpenAI style is `{"data": [{"id"}]}`; a few servers return a bare array
@@ -281,7 +322,12 @@ async fn probe(client: &reqwest::Client, endpoint: &Endpoint, model: &str) -> Pr
 
     let started = Instant::now();
 
-    let response = match endpoint.post(client, "chat/completions").json(&body).send().await {
+    let response = match endpoint
+        .post(client, "chat/completions")
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(error) => return Probe::Failed(transport_error(&endpoint.name, &error)),
     };
@@ -417,9 +463,10 @@ pub async fn ai_ping(endpoint: Endpoint, model: String) -> Result<Ping, String> 
         return Err(failure(&endpoint.name, response).await);
     }
 
-    let value: Value = response.json().await.map_err(|error| {
-        format!("{} returned an unexpected reply: {error}", endpoint.name)
-    })?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{} returned an unexpected reply: {error}", endpoint.name))?;
 
     let reply = reply_text(&value);
 
@@ -434,12 +481,19 @@ pub async fn ai_ping(endpoint: Endpoint, model: String) -> Result<Ping, String> 
 }
 
 /// A plain, non-streaming completion: commit messages and inline suggestions.
+///
+/// `fast` is for inline suggestions. It asks the model not to reason
+/// (`reasoning_effort: "none"`): a thinking model otherwise spends its whole
+/// small token budget thinking — 20+ seconds and no code for a five-character
+/// completion. Providers that reject the option are retried without it and
+/// remembered. A fast reply is the answer only, never the model's reasoning.
 #[tauri::command]
 pub async fn ai_chat(
     endpoint: Endpoint,
     model: String,
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
+    fast: Option<bool>,
 ) -> Result<String, String> {
     endpoint.validate()?;
 
@@ -452,35 +506,92 @@ pub async fn ai_chat(
         return Err("That conversation is too large to send.".into());
     }
 
+    let fast = fast.unwrap_or(false);
     let client = client()?;
-    let body = json!({
+    let pair = format!("{}|{}", endpoint.base_url.trim(), model);
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens.unwrap_or(1024),
     });
 
-    let response = endpoint
+    let control_known_bad = no_reasoning_control()
+        .lock()
+        .map(|rejected| rejected.contains(&pair))
+        .unwrap_or(false);
+
+    if fast && !control_known_bad {
+        body["reasoning_effort"] = json!("none");
+    }
+
+    let mut response = endpoint
         .post(&client, "chat/completions")
         .json(&body)
         .send()
         .await
         .map_err(|error| transport_error(&endpoint.name, &error))?;
 
+    if !response.status().is_success() && body.get("reasoning_effort").is_some() {
+        let status = response.status().as_u16();
+        let detail = read_detail(response).await.unwrap_or_default();
+
+        if !rejects_reasoning_option(status, &detail) {
+            return Err(describe(
+                &endpoint.name,
+                status,
+                Some(&detail).filter(|d| !d.is_empty()).map(String::as_str),
+            ));
+        }
+
+        if let Ok(mut rejected) = no_reasoning_control().lock() {
+            rejected.insert(pair);
+        }
+
+        if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+        }
+
+        response = endpoint
+            .post(&client, "chat/completions")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| transport_error(&endpoint.name, &error))?;
+    }
+
     if !response.status().is_success() {
         return Err(failure(&endpoint.name, response).await);
     }
 
-    let value: Value = response.json().await.map_err(|error| {
-        format!("{} returned an unexpected reply: {error}", endpoint.name)
-    })?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{} returned an unexpected reply: {error}", endpoint.name))?;
 
-    let content = reply_text(&value);
+    let content = if fast {
+        answer_text(&value)
+    } else {
+        reply_text(&value)
+    };
 
     if content.is_empty() {
         return Err("The model returned an empty reply.".into());
     }
 
     Ok(content)
+}
+
+/// The answer alone, without falling back to the reasoning channel.
+fn answer_text(value: &Value) -> String {
+    value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -497,17 +608,19 @@ mod tests {
 
     #[test]
     fn keys_only_travel_over_https_or_to_localhost() {
-        assert!(endpoint("https://api.groq.com/openai/v1").validate().is_ok());
+        assert!(endpoint("https://api.groq.com/openai/v1")
+            .validate()
+            .is_ok());
         assert!(endpoint("http://localhost:11434/v1").validate().is_ok());
         assert!(endpoint("http://127.0.0.1:1234/v1").validate().is_ok());
         assert!(endpoint("http://example.com/v1").validate().is_err());
         assert!(endpoint("ftp://example.com").validate().is_err());
         assert!(endpoint("").validate().is_err());
-        assert!(endpoint(
-            "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
-        )
-        .validate()
-        .is_err());
+        assert!(
+            endpoint("https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -523,8 +636,69 @@ mod tests {
         let answer = json!({ "choices": [{ "message": { "content": " ok " } }] });
         assert_eq!(reply_text(&answer), "ok");
 
-        let thinking = json!({ "choices": [{ "message": { "content": "", "reasoning_content": "hmm" } }] });
+        let thinking =
+            json!({ "choices": [{ "message": { "content": "", "reasoning_content": "hmm" } }] });
         assert_eq!(reply_text(&thinking), "hmm");
+    }
+
+    #[test]
+    fn fast_replies_never_use_the_reasoning_channel() {
+        let thinking =
+            json!({ "choices": [{ "message": { "content": "", "reasoning": "Let me think" } }] });
+        assert_eq!(answer_text(&thinking), "");
+        assert_eq!(reply_text(&thinking), "Let me think");
+    }
+
+    #[test]
+    fn spots_a_rejected_reasoning_option() {
+        assert!(rejects_reasoning_option(
+            400,
+            "reasoning_effort is not supported with this model"
+        ));
+        assert!(rejects_reasoning_option(
+            422,
+            "Unrecognized request argument: reasoning_effort"
+        ));
+        assert!(!rejects_reasoning_option(401, "reasoning_effort"));
+        assert!(!rejects_reasoning_option(400, "model not found"));
+    }
+
+    #[test]
+    fn shares_one_client() {
+        assert!(client().is_ok());
+        assert!(client().is_ok());
+    }
+
+    /// Needs Ollama with a thinking model (qwen3.5:4b) pulled.
+    #[test]
+    #[ignore]
+    fn fast_completion_skips_thinking_on_ollama() {
+        let local = Endpoint {
+            name: "Ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            api_key: String::new(),
+        };
+        let messages = vec![
+            ChatMessage { role: "system".into(), content: "Reply with the exact code to insert at the cursor and nothing else.".into() },
+            ChatMessage { role: "user".into(), content: "Code before the cursor:\nfunction add(a, b) {\n  return \n\nCode after the cursor:\n}".into() },
+        ];
+
+        for round in 0..2 {
+            let started = Instant::now();
+            let reply = tauri::async_runtime::block_on(ai_chat(
+                local.clone(),
+                "qwen3.5:4b".into(),
+                messages.clone(),
+                Some(160),
+                Some(true),
+            ))
+            .expect("a completion");
+            println!(
+                "round {round}: {:?} in {} ms",
+                reply,
+                started.elapsed().as_millis()
+            );
+        }
     }
 
     #[test]
@@ -570,6 +744,9 @@ mod tests {
         ));
 
         let message = outcome.expect_err("a bogus key must fail");
-        assert!(message.contains("rejected"), "unexpected message: {message}");
+        assert!(
+            message.contains("rejected"),
+            "unexpected message: {message}"
+        );
     }
 }

@@ -176,6 +176,15 @@ function replyText(body: unknown): string {
   ).trim();
 }
 
+/** The answer alone, never the reasoning channel. */
+function answerText(body: unknown): string {
+  return (
+    (
+      body as { choices?: { message?: { content?: string | null } }[] }
+    ).choices?.[0]?.message?.content ?? ""
+  ).trim();
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /** The provider's model catalogue. */
@@ -269,10 +278,16 @@ export async function pingModel(
   };
 }
 
+/**
+ * A plain completion. `fast` is for inline suggestions: the model is asked not
+ * to reason first (a thinking model otherwise spends 20+ seconds and its whole
+ * token budget on a five-character completion), and only the answer counts.
+ */
 export async function chat(
   target: ModelTarget,
   messages: ChatMessage[],
   maxTokens = 1024,
+  fast = false,
 ): Promise<string> {
   const endpoint = endpointOf(target);
 
@@ -283,19 +298,36 @@ export async function chat(
         model: target.model,
         messages,
         maxTokens,
+        fast,
       });
     } catch (cause) {
       throw toError(cause, "The assistant request failed.");
     }
   }
 
-  const content = replyText(
-    await browserFetch(endpoint, "chat/completions", {
-      model: target.model,
-      messages,
-      max_tokens: maxTokens,
-    }),
-  );
+  const request = {
+    model: target.model,
+    messages,
+    max_tokens: maxTokens,
+  };
+  let body: unknown;
+
+  try {
+    body = await browserFetch(
+      endpoint,
+      "chat/completions",
+      fast ? { ...request, reasoning_effort: "none" } : request,
+    );
+  } catch (cause) {
+    // Some providers reject the option; ask again without it.
+    if (!fast) {
+      throw cause;
+    }
+
+    body = await browserFetch(endpoint, "chat/completions", request);
+  }
+
+  const content = fast ? answerText(body) : replyText(body);
 
   if (!content) {
     throw new Error("The model returned an empty reply.");

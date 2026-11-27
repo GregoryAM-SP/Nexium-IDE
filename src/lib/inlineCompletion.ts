@@ -9,8 +9,11 @@ import { chat } from "./llm";
  * accepts, Escape dismisses, and nothing is inserted until one of those.
  */
 
-/** Long enough that a burst of typing never sends a request of its own. */
-const DEBOUNCE_MS = 700;
+/**
+ * Long enough that a burst of typing never sends a request of its own, short
+ * enough that a pause feels answered.
+ */
+const DEBOUNCE_MS = 400;
 /** The model only needs the neighbourhood of the cursor, not the whole file. */
 const MAX_PREFIX_CHARS = 2600;
 const MAX_SUFFIX_CHARS = 600;
@@ -180,7 +183,7 @@ async function completeInline(
           suffix,
         }),
       },
-    ], 160);
+    ], 160, true);
   } catch {
     // A suggestion that never arrives must not interrupt typing.
     return "";

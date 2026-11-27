@@ -4,9 +4,95 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nexium IDE</title>
+    <title>Nexium Studio</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000000;
+      }
+
+      /* The website's boot loader: the Nexium mark breathing inside a spinning
+         ring. It is plain HTML and CSS so it paints on the very first frame,
+         before the editor bundle has loaded; src/main.tsx fades it out once
+         the window has rendered. It sits above every application layer. */
+      #boot-loader {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: grid;
+        place-items: center;
+        background: #000000;
+        transition: opacity 240ms ease;
+      }
+
+      #boot-loader[data-hidden="true"] {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #boot-loader img {
+        grid-area: 1 / 1;
+        width: 52px;
+        height: 52px;
+        opacity: 0.92;
+        animation: boot-mark 1.8s ease-in-out infinite;
+      }
+
+      #boot-loader span {
+        grid-area: 1 / 1;
+        width: 78px;
+        height: 78px;
+        border-radius: 50%;
+        background: conic-gradient(
+          from 0deg,
+          rgba(255, 255, 255, 0) 0deg,
+          rgba(255, 255, 255, 0) 190deg,
+          rgba(255, 255, 255, 0.65) 300deg,
+          rgba(255, 255, 255, 0.9) 350deg,
+          rgba(255, 255, 255, 0) 360deg
+        );
+        mask: radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 0);
+        -webkit-mask: radial-gradient(
+          farthest-side,
+          transparent calc(100% - 1.5px),
+          #000 0
+        );
+        animation: boot-spin 1.15s linear infinite;
+      }
+
+      @keyframes boot-mark {
+        0%,
+        100% {
+          opacity: 0.55;
+          transform: scale(0.97);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #boot-loader img,
+        #boot-loader span {
+          animation: none;
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="boot-loader" role="status" aria-label="Loading Nexium Studio">
+      <span aria-hidden="true"></span>
+      <img src="/nexium.svg" width="52" height="52" alt="" />
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
