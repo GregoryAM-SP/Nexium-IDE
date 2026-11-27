@@ -306,6 +306,16 @@ export const PROVIDERS: ProviderPreset[] = [
     caution: "The team needs a payment method on file, or requests fail with 403.",
   },
   {
+    id: "vyce",
+    name: "Vyce AI",
+    category: "router",
+    baseUrl: "https://vyceai.com/v1",
+    key: "required",
+    docsUrl: "https://vyceai.com",
+    note: "One key for GPT, Claude, DeepSeek and more. Free starter credits after Discord verification.",
+    caution: "A third-party proxy: prompts pass through Vyce on the way to each model's vendor. Confirm the base URL in your Vyce dashboard.",
+  },
+  {
     id: "airforce",
     name: "Api.Airforce",
     category: "router",

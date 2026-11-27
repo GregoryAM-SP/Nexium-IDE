@@ -523,24 +523,28 @@ export default function App() {
       .catch(() => setGitTags([]));
   }, [applyGit, tree]);
 
-  /** Runs a tag operation, keeping the list and the panel's error line current. */
+  /**
+   * Runs a tag operation and keeps the list and the panel's error line
+   * current. Resolves to the error message, or null when it worked.
+   */
   const applyTags = useCallback(
     async (
       action: () => Promise<GitTag[]>,
       success: string,
-    ): Promise<boolean> => {
+    ): Promise<string | null> => {
       setGitBusy(true);
 
       try {
         setGitTags(await action());
         setGitError(null);
         setNotice(success);
-        return true;
+        return null;
       } catch (cause) {
-        setGitError(toError(cause, "The tag operation failed.").message);
+        const message = toError(cause, "The tag operation failed.").message;
+        setGitError(message);
         // A tag can be created even when its push fails.
         void readGitTags().then(setGitTags).catch(() => {});
-        return false;
+        return message;
       } finally {
         setGitBusy(false);
       }
@@ -558,14 +562,18 @@ export default function App() {
   );
 
   const handlePushTag = useCallback(
-    (name: string) =>
-      applyTags(() => pushGitTag(name), `Pushed ${name} to origin.`),
+    async (name: string) =>
+      (await applyTags(() => pushGitTag(name), `Pushed ${name} to origin.`)) ===
+      null,
     [applyTags],
   );
 
   const handleDeleteTag = useCallback(
-    (name: string) =>
-      applyTags(() => deleteGitTag(name), `Deleted the local tag ${name}.`),
+    async (name: string) =>
+      (await applyTags(
+        () => deleteGitTag(name),
+        `Deleted the local tag ${name}.`,
+      )) === null,
     [applyTags],
   );
 

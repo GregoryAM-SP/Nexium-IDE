@@ -35,7 +35,12 @@ type SourceControlPanelProps = {
   onSelect: (path: string, staged: boolean) => void;
   onHide: () => void;
   tags: GitTag[];
-  onCreateTag: (name: string, message: string, push: boolean) => Promise<boolean>;
+  /** Resolves to an error message, or null when the tag was created. */
+  onCreateTag: (
+    name: string,
+    message: string,
+    push: boolean,
+  ) => Promise<string | null>;
   onPushTag: (name: string) => Promise<boolean>;
   onDeleteTag: (name: string) => Promise<boolean>;
 };
@@ -565,6 +570,7 @@ export default function SourceControlPanel({
 
             <TagsSection
               tags={tags}
+              branch={status?.branch ?? ""}
               hasChanges={total > 0}
               onCreate={onCreateTag}
               onPush={onPushTag}

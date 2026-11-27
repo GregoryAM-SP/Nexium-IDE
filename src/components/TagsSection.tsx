@@ -6,21 +6,27 @@ import {
   Tag,
   Trash2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 
-import { nextVersions } from "../lib/git";
 import type { GitTag } from "../lib/git";
+import TagDialog from "./TagDialog";
 
 type TagsSectionProps = {
   tags: GitTag[];
+  /** The branch whose latest commit a new tag points at. */
+  branch: string;
   /** Uncommitted changes exist, so the tag will not include them. */
   hasChanges: boolean;
-  onCreate: (name: string, message: string, push: boolean) => Promise<boolean>;
+  /** Resolves to an error message, or null when the tag was created. */
+  onCreate: (
+    name: string,
+    message: string,
+    push: boolean,
+  ) => Promise<string | null>;
   onPush: (name: string) => Promise<boolean>;
   onDelete: (name: string) => Promise<boolean>;
 };
 
-const VERSION_TAG = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 const SHOWN = 8;
 
 function when(iso: string): string {
@@ -46,6 +52,7 @@ function when(iso: string): string {
 /** Lists recent tags and creates, pushes or deletes them. */
 export default function TagsSection({
   tags,
+  branch,
   hasChanges,
   onCreate,
   onPush,
@@ -54,41 +61,9 @@ export default function TagsSection({
   const [open, setOpen] = useState(true);
   const [creating, setCreating] = useState(false);
   const [showAll, setShowAll] = useState(false);
-  const [name, setName] = useState("");
-  const [message, setMessage] = useState("");
-  const [push, setPush] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-
-  const suggestions = useMemo(() => nextVersions(tags), [tags]);
-  const trimmed = name.trim();
-  const duplicate = tags.some((tag) => tag.name === trimmed);
-  const badName = /\s/.test(trimmed) || trimmed.startsWith("-");
-  const canCreate = trimmed.length > 0 && !duplicate && !badName && !busy;
   const visible = showAll ? tags : tags.slice(0, SHOWN);
-
-  const startCreating = () => {
-    setCreating(true);
-    setOpen(true);
-    setName(suggestions[0]?.name ?? "");
-    setMessage("");
-  };
-
-  const create = async () => {
-    if (!canCreate) {
-      return;
-    }
-
-    setBusy("create");
-    const ok = await onCreate(trimmed, message, push);
-    setBusy(null);
-
-    if (ok) {
-      setCreating(false);
-      setName("");
-      setMessage("");
-    }
-  };
 
   const run = async (key: string, action: () => Promise<boolean>) => {
     setBusy(key);
@@ -114,119 +89,19 @@ export default function TagsSection({
         <span className="rounded bg-ink/[0.05] px-[5px] font-mono text-[9px] leading-4 text-ink/35">
           {tags.length}
         </span>
-        {!creating && (
-          <button
-            type="button"
-            onClick={startCreating}
-            className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ink/30 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/80"
-          >
-            <Plus className="size-3" strokeWidth={2} />
-            New tag
-          </button>
-        )}
-      </div>
-
-      {open && creating && (
-        <form
-          className="mx-2 mt-1 mb-2 space-y-2 rounded-lg border border-ink/[0.09] bg-ink/[0.02] p-2.5"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void create();
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              setCreating(false);
-            }
-          }}
+        <button
+          type="button"
+          onClick={() => setCreating(true)}
+          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ink/30 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink/80"
         >
-          <div className="flex flex-wrap gap-1">
-            {suggestions.map((suggestion) => (
-              <button
-                key={suggestion.name}
-                type="button"
-                onClick={() => setName(suggestion.name)}
-                title={`${suggestion.label}: ${suggestion.name}`}
-                className={`rounded-md border px-1.5 py-0.5 font-mono text-[10px] transition-colors duration-150 ${
-                  trimmed === suggestion.name
-                    ? "border-ink/25 bg-ink/[0.08] text-ink/85"
-                    : "border-ink/[0.08] text-ink/45 hover:border-ink/20 hover:text-ink/75"
-                }`}
-              >
-                {suggestion.name}
-              </button>
-            ))}
-          </div>
-
-          <input
-            autoFocus
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="v1.0.0"
-            aria-label="Tag name"
-            spellCheck={false}
-            className="w-full rounded-md border border-line bg-app px-2 py-1.5 font-mono text-[11.5px] text-ink placeholder:text-ink/20 focus:border-ink/25 focus:outline-none"
-          />
-          <textarea
-            value={message}
-            onChange={(event) => setMessage(event.target.value)}
-            placeholder="Message (optional — makes an annotated tag)"
-            aria-label="Tag message"
-            rows={2}
-            className="block w-full resize-none rounded-md border border-line bg-app px-2 py-1.5 text-[11px] leading-relaxed text-ink placeholder:text-ink/20 focus:border-ink/25 focus:outline-none"
-          />
-
-          <label className="flex items-center gap-1.5 text-[10.5px] text-ink/50">
-            <input
-              type="checkbox"
-              checked={push}
-              onChange={(event) => setPush(event.target.checked)}
-              className="size-3 accent-ink"
-            />
-            Push to origin
-          </label>
-
-          {(duplicate || badName) && (
-            <p className="text-[10.5px] text-ink/60">
-              {duplicate
-                ? "That tag already exists."
-                : "A tag name cannot start with \"-\" or contain spaces."}
-            </p>
-          )}
-          {push && VERSION_TAG.test(trimmed) && (
-            <p className="text-[10px] leading-relaxed text-ink/35">
-              Pushing a version tag starts the release build, if the repository
-              has one.
-            </p>
-          )}
-          {hasChanges && (
-            <p className="text-[10px] leading-relaxed text-ink/35">
-              Tags the last commit — uncommitted changes are not included.
-            </p>
-          )}
-
-          <div className="flex gap-1.5">
-            <button
-              type="submit"
-              disabled={!canCreate}
-              className="flex h-6 items-center gap-1 rounded-md bg-ink px-2 text-[10.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/[0.07] disabled:text-ink/25"
-            >
-              {busy === "create" && <LoaderCircle className="size-3 animate-spin" />}
-              {push ? "Create & push" : "Create tag"}
-            </button>
-            <button
-              type="button"
-              onClick={() => setCreating(false)}
-              className="h-6 rounded-md px-2 text-[10.5px] text-ink/45 transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink"
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      )}
+          <Plus className="size-3" strokeWidth={2} />
+          New tag
+        </button>
+      </div>
 
       {open && (
         <ul className="space-y-px px-1">
-          {tags.length === 0 && !creating && (
+          {tags.length === 0 && (
             <li className="px-2 py-2 text-[10.5px] text-ink/25">
               No tags yet.
             </li>
@@ -312,6 +187,16 @@ export default function TagsSection({
             </li>
           )}
         </ul>
+      )}
+
+      {creating && (
+        <TagDialog
+          tags={tags}
+          branch={branch}
+          hasChanges={hasChanges}
+          onCreate={onCreate}
+          onClose={() => setCreating(false)}
+        />
       )}
     </div>
   );
