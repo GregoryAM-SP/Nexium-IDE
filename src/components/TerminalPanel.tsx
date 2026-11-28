@@ -114,6 +114,7 @@ export default function TerminalPanel({
 
     const id = `terminal-${crypto.randomUUID()}`;
     let disposed = false;
+    let exited = false;
     let unlisten: UnlistenFn[] = [];
     let input: { dispose: () => void } | null = null;
 
@@ -141,10 +142,12 @@ export default function TerminalPanel({
             instance.write(decodeBase64(event.payload.data));
           }),
           listen<ExitEvent>("terminal:exit", (event) => {
-            if (event.payload.id !== id) {
+            // Both the end of the output and the exit watcher report it.
+            if (event.payload.id !== id || exited) {
               return;
             }
 
+            exited = true;
             instance.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
           }),
         ]);
@@ -223,7 +226,8 @@ export default function TerminalPanel({
     sentCommand.current = command.id;
     const { id, text } = command;
 
-    void writeTerminal(session, `${text}`)
+    void writeTerminal(session, `${text}
+`)
       .then(() => {
         terminal.current?.focus();
         onCommandSentRef.current?.(id);

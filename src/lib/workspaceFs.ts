@@ -223,3 +223,16 @@ export async function deleteEntry(path: string): Promise<void> {
     }
   }
 }
+
+/** Opens a folder by path, for example a project New Project just created. */
+export async function openWorkspaceAt(path: string): Promise<WorkspaceSnapshot> {
+  if (!isTauri()) {
+    return demoWorkspace();
+  }
+
+  try {
+    return toSnapshot(await invoke<RawWorkspace>("open_workspace", { path }));
+  } catch (cause) {
+    throw toError(cause, "That folder could not be opened.");
+  }
+}

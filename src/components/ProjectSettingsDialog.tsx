@@ -2,8 +2,11 @@ import {
   AlertTriangle,
   Coffee,
   FolderCog,
+  Globe,
   Hammer,
   LoaderCircle,
+  Play,
+  Server,
   Smartphone,
   SlidersHorizontal,
   X,
@@ -24,6 +27,9 @@ import type {
   ModuleSettings,
   SettingEdit,
 } from "../lib/gradleSettings";
+import { installFor, runCommand, runFor, webSupportCommand } from "../lib/projectRun";
+import type { AppRun, ExpoRun, FlutterRun, NodeRun, ProjectRun, PythonRun } from "../lib/projectRun";
+import type { WebApp } from "../lib/web";
 
 type ProjectSettingsDialogProps = {
   projectName: string;
@@ -33,6 +39,12 @@ type ProjectSettingsDialogProps = {
   gradleJvm: string;
   /** Called after saving with the files that changed and the chosen JDK. */
   onSaved: (changed: string[], gradleJvm: string) => void;
+  /** Apps the preview can run (web, Flutter, Expo), and how they run. */
+  apps: WebApp[];
+  run: ProjectRun;
+  onSaveRun: (run: ProjectRun) => void;
+  /** Runs a command in an app's folder in the terminal. */
+  onRunCommand: (app: WebApp, command: string) => void;
   onClose: () => void;
 };
 
@@ -311,13 +323,215 @@ function JavaVersionSelect({
   );
 }
 
+const segmented = (active: boolean) =>
+  `h-6 rounded-md px-2.5 text-[11px] transition-colors duration-150 ${
+    active ? "bg-ink/[0.1] text-ink" : "text-ink/40 hover:text-ink/75"
+  }`;
+
+function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (value: boolean) => void; label: string }) {
+  return (
+    <label className="flex cursor-pointer items-center gap-2 pt-[7px] text-[11.5px] text-ink/65">
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="size-3.5 accent-current" />
+      {label}
+    </label>
+  );
+}
+
+/** How one app runs for the preview: Flutter on the web, Expo, or a dev script. */
+function RunSection({
+  app,
+  value,
+  onChange,
+  onRunCommand,
+}: {
+  app: WebApp;
+  value: AppRun;
+  onChange: (value: AppRun) => void;
+  onRunCommand: (app: WebApp, command: string) => void;
+}) {
+  const command = runCommand(app, value);
+  const where = app.dir || "project root";
+  const setup = !app.webSupport ? webSupportCommand(app) : null;
+  const action = (label: string, line: string) => (
+    <button
+      type="button"
+      onClick={() => onRunCommand(app, line)}
+      title={line}
+      className="flex h-7 items-center gap-1.5 rounded-md border border-ink/10 bg-ink/[0.02] px-2.5 text-[11px] text-ink/65 transition-colors duration-150 hover:border-ink/25 hover:text-ink"
+    >
+      <Play className="size-3" strokeWidth={1.75} />
+      {label}
+    </button>
+  );
+
+  let fields: ReactNode = null;
+
+  if (value.kind === "flutter") {
+    const set = (change: Partial<FlutterRun>) => onChange({ ...value, ...change });
+    fields = (
+      <>
+        <Field label="Build mode" hint="Debug supports hot reload; profile and release are optimised builds.">
+          <div className="inline-flex rounded-lg border border-line bg-app p-0.5">
+            {(["debug", "profile", "release"] as const).map((mode) => (
+              <button key={mode} type="button" onClick={() => set({ mode })} aria-pressed={value.mode === mode} className={segmented(value.mode === mode)}>
+                {mode[0].toUpperCase() + mode.slice(1)}
+              </button>
+            ))}
+          </div>
+        </Field>
+        <Field label="Port" hint="Where flutter run serves the app; the preview opens it.">
+          <input
+            type="number"
+            min={1024}
+            max={65535}
+            value={value.port}
+            onChange={(event) => set({ port: Number(event.target.value) || 8080 })}
+            className={`${monoInputClass} w-28`}
+          />
+        </Field>
+        <Field label="Entry point" hint="The Dart file with main().">
+          <input value={value.target} onChange={(event) => set({ target: event.target.value })} spellCheck={false} placeholder="lib/main.dart" className={monoInputClass} />
+        </Field>
+        <Field label="Dart defines" hint="One KEY=value per line, passed with --dart-define and read with String.fromEnvironment.">
+          <textarea
+            value={value.defines}
+            onChange={(event) => set({ defines: event.target.value })}
+            spellCheck={false}
+            rows={2}
+            placeholder="API_URL=http://localhost:3000"
+            className="w-full min-w-0 resize-y rounded-lg border border-line bg-app px-2.5 py-1.5 font-mono text-[11.5px] text-ink placeholder:text-ink/20 focus:border-ink/25 focus:outline-none"
+          />
+        </Field>
+        <Field label="Options">
+          <div className="space-y-1">
+            <Toggle checked={value.wasm} onChange={(wasm) => set({ wasm })} label="Build with WebAssembly (--wasm)" />
+            <Toggle checked={value.hotReloadOnSave} onChange={(hotReloadOnSave) => set({ hotReloadOnSave })} label="Hot reload when a .dart file is saved" />
+          </div>
+        </Field>
+      </>
+    );
+  } else if (value.kind === "expo") {
+    const set = (change: Partial<ExpoRun>) => onChange({ ...value, ...change });
+    fields = (
+      <>
+        <Field label="Port" hint="Metro's port; the web build is served there too.">
+          <input
+            type="number"
+            min={1024}
+            max={65535}
+            value={value.port}
+            onChange={(event) => set({ port: Number(event.target.value) || 8081 })}
+            className={`${monoInputClass} w-28`}
+          />
+        </Field>
+        <Field label="Options">
+          <Toggle checked={value.clear} onChange={(clear) => set({ clear })} label="Clear Metro's cache on start (--clear)" />
+        </Field>
+        <p className="text-[10.5px] leading-relaxed text-ink/30">
+          The preview shows the web build. To run on a phone, open Expo Go and scan the QR code that{" "}
+          <span className="font-mono">npx expo start</span> prints in the terminal.
+        </p>
+      </>
+    );
+  } else if (value.kind === "python") {
+    const set = (change: Partial<PythonRun>) => onChange({ ...value, ...change });
+    const defaultPort = app.framework === "Flask" ? "5000" : "8000";
+    fields = (
+      <>
+        <Field label="Port" hint="Leave empty for the framework's own.">
+          <input
+            value={value.port}
+            onChange={(event) => set({ port: event.target.value.replace(/[^0-9]/g, "").slice(0, 5) })}
+            placeholder={defaultPort}
+            className={`${monoInputClass} w-28`}
+          />
+        </Field>
+        <Field label="Options">
+          <Toggle
+            checked={value.reload}
+            onChange={(reload) => set({ reload })}
+            label={app.framework === "Flask" ? "Debug mode with reload on save (--debug)" : "Restart when a file changes"}
+          />
+        </Field>
+        <p className="text-[10.5px] leading-relaxed text-ink/30">
+          Runs with the project's virtual environment (.venv, venv or env) when it has one, else the Python on your PATH.
+        </p>
+      </>
+    );
+  } else {
+    const set = (change: Partial<NodeRun>) => onChange({ ...value, ...change });
+    fields = (
+      <>
+        <Field label="Dev script" hint="The package.json script the preview runs.">
+          <select value={value.script} onChange={(event) => set({ script: event.target.value })} className={`${inputClass} pr-7`}>
+            <option value="">Detected ({app.preferred ?? "none"})</option>
+            {app.scripts.map((script) => (
+              <option key={script} value={script}>
+                {script}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Port" hint="Leave empty for the tool's own port.">
+          <input
+            value={value.port}
+            onChange={(event) => set({ port: event.target.value.replace(/[^0-9]/g, "").slice(0, 5) })}
+            placeholder={app.servers[0]?.port ? String(app.servers[0].port) : "Default"}
+            className={`${monoInputClass} w-28`}
+          />
+        </Field>
+      </>
+    );
+  }
+
+  return (
+    <Section
+      icon={value.kind === "flutter" || value.kind === "expo" ? Smartphone : value.kind === "python" ? Server : Globe}
+      title={`Run · ${app.framework || "Web app"}`}
+      subtitle={`${app.name} (${where})`}
+    >
+      {setup && (
+        <p className="flex items-start gap-2 rounded-lg border border-ink/10 bg-ink/[0.03] px-2.5 py-2 text-[11px] leading-relaxed text-ink/60">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
+          <span className="flex-1">
+            {app.framework === "Flutter" ? "This app has no web support yet, so the preview cannot run it." : "The web packages are missing, so the preview cannot run it."}
+          </span>
+        </p>
+      )}
+      {fields}
+      <Field label="Runs">
+        <p className="break-all pt-[7px] font-mono text-[10.5px] leading-relaxed text-ink/45">
+          {command ?? `${app.preferred ? `${app.packageManager} run ${app.preferred}` : "Choose a script in the preview"}`}
+        </p>
+      </Field>
+      <div className="flex flex-wrap gap-2">
+        {setup && action("Add web support", setup)}
+        {!app.installed &&
+          action(app.packageManager === "python" ? "Create .venv and install" : `Run ${installFor(app)}`, installFor(app))}
+        {value.kind === "flutter" && action("flutter doctor", "flutter doctor")}
+        {value.kind === "flutter" && action("Build for the web", `flutter build web${value.mode === "debug" ? "" : ` --${value.mode}`}${value.wasm ? " --wasm" : ""}`)}
+      </div>
+    </Section>
+  );
+}
+
 export default function ProjectSettingsDialog({
   projectName,
   gradleDetected,
   gradleJvm,
   onSaved,
+  apps,
+  run,
+  onSaveRun,
+  onRunCommand,
   onClose,
 }: ProjectSettingsDialogProps) {
+  const [runDraft, setRunDraft] = useState<ProjectRun>(() =>
+    Object.fromEntries(apps.map((app) => [app.dir, runFor(run, app)])),
+  );
+  const runDirty = apps.some(
+    (app) => JSON.stringify(runDraft[app.dir]) !== JSON.stringify(runFor(run, app)),
+  );
   const [settings, setSettings] = useState<GradleSettings | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -369,7 +583,8 @@ export default function ProjectSettingsDialog({
     [settings, form],
   );
   const jvmChanged = form !== null && form.jvm.trim() !== gradleJvm;
-  const dirty = edits.length > 0 || jvmChanged;
+  const gradleDirty = edits.length > 0 || jvmChanged;
+  const dirty = gradleDirty || runDirty;
   const touchedFiles = settings
     ? [...new Set(edits.map((edit) => editFile(edit, settings)))]
     : [];
@@ -408,7 +623,7 @@ export default function ProjectSettingsDialog({
     );
 
   const save = async () => {
-    if (!form || !dirty || saving) {
+    if (!dirty || saving) {
       return;
     }
 
@@ -416,8 +631,13 @@ export default function ProjectSettingsDialog({
     setSaveError(null);
 
     try {
-      const changed = edits.length > 0 ? await applyGradleSettings(edits) : [];
-      onSaved(changed, form.jvm.trim());
+      if (runDirty) {
+        onSaveRun({ ...run, ...runDraft });
+      }
+      if (form && gradleDirty) {
+        const changed = edits.length > 0 ? await applyGradleSettings(edits) : [];
+        onSaved(changed, form.jvm.trim());
+      }
       onClose();
     } catch (cause) {
       setSaveError(cause instanceof Error ? cause.message : "Saving failed.");
@@ -433,13 +653,15 @@ export default function ProjectSettingsDialog({
 
   let body: ReactNode;
 
-  if (!gradleDetected) {
+  if (!gradleDetected && apps.length > 0) {
+    body = null;
+  } else if (!gradleDetected) {
     body = (
       <div className="px-5 py-8 text-center">
         <p className="text-[12.5px] text-ink/65">No Gradle build</p>
         <p className="mx-auto mt-1.5 max-w-sm text-[11.5px] leading-relaxed text-ink/35">
-          Project settings cover Gradle builds: JDK, SDK and Gradle versions.
-          This folder has no settings.gradle or build.gradle at its root.
+          Project settings cover how apps run in the preview (web apps,
+          Flutter, Expo) and Gradle builds. This folder has neither.
         </p>
       </div>
     );
@@ -726,7 +948,11 @@ export default function ProjectSettingsDialog({
               Project settings
             </h2>
             <p className="mt-1 truncate text-[11.5px] text-ink/45">
-              JDK, SDK and Gradle configuration for {projectName}
+              {apps.length > 0 && gradleDetected
+                ? `Run, preview and Gradle settings for ${projectName}`
+                : apps.length > 0
+                  ? `How ${projectName} runs and previews`
+                  : `JDK, SDK and Gradle configuration for ${projectName}`}
             </p>
           </div>
           <button
@@ -740,7 +966,18 @@ export default function ProjectSettingsDialog({
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {apps.map((app) => (
+            <RunSection
+              key={app.dir || "."}
+              app={app}
+              value={runDraft[app.dir] ?? runFor(run, app)}
+              onChange={(value) => setRunDraft((current) => ({ ...current, [app.dir]: value }))}
+              onRunCommand={onRunCommand}
+            />
+          ))}
+          {body}
+        </div>
 
         {saveError && (
           <p
@@ -755,10 +992,12 @@ export default function ProjectSettingsDialog({
         <div className="flex shrink-0 items-center justify-between gap-3 border-t border-ink/[0.08] px-5 py-3">
           <span className="min-w-0 truncate text-[10.5px] text-ink/30">
             {touchedFiles.length > 0
-              ? `Writes ${touchedFiles.join(", ")}`
+              ? `Writes ${touchedFiles.join(", ")}${runDirty ? " and the run settings" : ""}`
               : jvmChanged
                 ? "Saves the Gradle JDK for this machine"
-                : "No changes"}
+                : runDirty
+                  ? "Run settings are saved for this machine"
+                  : "No changes"}
           </span>
           <div className="flex shrink-0 gap-2">
             <button
@@ -767,9 +1006,9 @@ export default function ProjectSettingsDialog({
               disabled={saving}
               className="h-7 rounded-md border border-ink/10 bg-ink/[0.02] px-3 text-[11.5px] text-ink/60 transition-colors duration-150 hover:border-ink/20 hover:bg-ink/[0.05] hover:text-ink disabled:opacity-40"
             >
-              {gradleDetected ? "Cancel" : "Close"}
+              {gradleDetected || apps.length > 0 ? "Cancel" : "Close"}
             </button>
-            {gradleDetected && (
+            {(gradleDetected || apps.length > 0) && (
               <button
                 type="submit"
                 disabled={!dirty || saving}

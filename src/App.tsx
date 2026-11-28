@@ -38,7 +38,11 @@ import MarkdownPreview from "./components/MarkdownPreview";
 import type { MarkdownPreviewHandle } from "./components/MarkdownPreview";
 import SourceControlPanel from "./components/SourceControlPanel";
 import BranchMenu from "./components/BranchMenu";
+import NewProjectDialog from "./components/NewProjectDialog";
 import PublishDialog from "./components/PublishDialog";
+import RunPanel from "./components/RunPanel";
+import { loadRunChoice, loadRunTargets, saveRunChoice } from "./lib/runnable";
+import type { RunChoice, Runnable } from "./lib/runnable";
 import SettingsNav from "./components/SettingsNav";
 import type { SettingsSection } from "./components/SettingsNav";
 import ProvidersSettings from "./components/ProvidersSettings";
@@ -113,8 +117,16 @@ import {
 import type { GradleInfo, GradleProject, GradleTask } from "./lib/gradle";
 import { loadGradleJvm, saveGradleJvm } from "./lib/gradleSettings";
 import { useWebPreview } from "./lib/useWebPreview";
-import { affectsWebDetection, installCommand } from "./lib/web";
+import { affectsWebDetection, installCommand, sendDevInput } from "./lib/web";
 import type { WebApp } from "./lib/web";
+import {
+  commandIn,
+  loadProjectRun,
+  runCommand,
+  runFor,
+  saveProjectRun,
+} from "./lib/projectRun";
+import type { ProjectRun } from "./lib/projectRun";
 import { setInlineCompletionModel } from "./lib/inlineCompletion";
 import { languageForPath } from "./lib/languages";
 import { isFontPath, isImagePath } from "./lib/media";
@@ -157,6 +169,7 @@ import {
   demoWorkspace,
   newProject,
   openFolder,
+  openWorkspaceAt,
   readFile,
   readWorkspaceSources,
   refreshWorkspace,
@@ -333,11 +346,16 @@ export default function App() {
   // The Gradle panel shares the right-hand slot with the assistant.
   // Gradle and the website preview share the right-hand slot with the
   // assistant; at most one of the three is open.
-  const [sidePanel, setSidePanel] = useState<"gradle" | "preview" | null>(
+  const [sidePanel, setSidePanel] = useState<"gradle" | "preview" | "run" | null>(
     null,
   );
   const gradleOpen = sidePanel === "gradle" && !assistantOpen;
   const previewPanelOpen = sidePanel === "preview" && !assistantOpen;
+  const runPanelOpen = sidePanel === "run" && !assistantOpen;
+  // Programs the Run panel can start, and whether one is running.
+  const [runTargets, setRunTargets] = useState<Runnable[]>([]);
+  const [runChoice, setRunChoice] = useState<RunChoice | null>(null);
+  const [programRunning, setProgramRunning] = useState(false);
   const [gradle, setGradle] = useState<GradleInfo | null>(null);
   const [gradleBusy, setGradleBusy] = useState(false);
   const [gradleQuerying, setGradleQuerying] = useState(false);
@@ -346,6 +364,8 @@ export default function App() {
   const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
   // The JDK that runs Gradle, chosen per project folder on this machine.
   const [gradleJvm, setGradleJvm] = useState("");
+  // How each app in the open project runs for the preview (per machine).
+  const [projectRun, setProjectRun] = useState<ProjectRun>({});
   // The next line for the terminal to type, e.g. a Gradle task to run.
   const [terminalCommand, setTerminalCommand] = useState<{
     id: number;
@@ -532,20 +552,20 @@ export default function App() {
     }
   }, [applyWorkspace]);
 
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
   const newProjectAction = useCallback(async () => {
-    try {
-      const snapshot = await newProject();
-
-      if (!snapshot) {
-        return;
+    // The browser build has no filesystem: it keeps the sample project.
+    if (!isTauri()) {
+      try {
+        const snapshot = await newProject();
+        if (snapshot) await applyWorkspace(snapshot);
+      } catch (cause) {
+        setNotice(cause instanceof Error ? cause.message : "Could not create that project.");
       }
-
-      await applyWorkspace(snapshot);
-    } catch (cause) {
-      setNotice(
-        cause instanceof Error ? cause.message : "Could not create that project.",
-      );
+      return;
     }
+
+    setNewProjectOpen(true);
   }, [applyWorkspace]);
 
   // Ctrl+` toggles the terminal from anywhere. Capture runs before Monaco or
@@ -878,8 +898,38 @@ export default function App() {
     }
   }, [web.info]);
 
+  // Manifests (Cargo.toml, go.mod, *.csproj…) change what can run; the
+  // listing is cheap, so any change to the tree re-checks it.
+  useEffect(() => {
+    if (!tree) {
+      setRunTargets([]);
+      return;
+    }
+    let current = true;
+    void loadRunTargets()
+      .then((found) => {
+        if (current) setRunTargets(found);
+      })
+      .catch(() => {
+        if (current) setRunTargets([]);
+      });
+    return () => {
+      current = false;
+    };
+  }, [tree]);
+
+  useEffect(() => {
+    setRunChoice(rootPath ? loadRunChoice(rootPath) : null);
+  }, [rootPath]);
+
+  useEffect(() => {
+    if (runTargets.length === 0) {
+      setSidePanel((current) => (current === "run" ? null : current));
+    }
+  }, [runTargets]);
+
   const toggleSidePanel = useCallback(
-    (panel: "gradle" | "preview") => {
+    (panel: "gradle" | "preview" | "run") => {
       if (sidePanel === panel && !assistantOpen) {
         setSidePanel(null);
         return;
@@ -890,6 +940,27 @@ export default function App() {
     },
     [sidePanel, assistantOpen],
   );
+
+  useEffect(() => {
+    setProjectRun(loadProjectRun(rootPath));
+  }, [rootPath]);
+
+  const commandForApp = useCallback(
+    (app: WebApp) => runCommand(app, runFor(projectRun, app)),
+    [projectRun],
+  );
+
+  /** Types a command for an app (in its folder) into the terminal and runs it. */
+  const handleRunAppCommand = useCallback((app: WebApp, command: string) => {
+    setTerminalCommand({
+      id: nextCommandId.current++,
+      text: commandIn(app.dir, command, navigator.userAgent.includes("Windows")),
+    });
+    setProjectSettingsOpen(false);
+    setView("editor");
+    setTerminalUsed(true);
+    setTerminalOpen(true);
+  }, []);
 
   const handleInstallWeb = useCallback((app: WebApp) => {
     setTerminalCommand({
@@ -1017,6 +1088,19 @@ export default function App() {
     }
   }, [refreshGit, tree]);
 
+  const hotReloadRef = useRef<(path: string) => void>(() => undefined);
+  hotReloadRef.current = (path: string) => {
+    const running = web.dev;
+    if (!path.endsWith(".dart") || !running?.script.startsWith("flutter run")) {
+      return;
+    }
+    const app = web.info?.apps.find((entry) => entry.dir === running.dir);
+    const settings = app ? runFor(projectRun, app) : null;
+    if (settings?.kind === "flutter" && settings.hotReloadOnSave && settings.mode === "debug") {
+      void sendDevInput("r").catch(() => undefined);
+    }
+  };
+
   const saveActive = useCallback(async () => {
     const text = contents[activePath];
 
@@ -1040,6 +1124,9 @@ export default function App() {
       if (affectsWebDetection(activePath)) {
         void refreshWebRef.current();
       }
+
+      // A saved .dart file hot-reloads the Flutter app in the preview.
+      hotReloadRef.current(activePath);
     } catch (cause) {
       setNotice(cause instanceof Error ? cause.message : "Could not save.");
     }
@@ -2767,6 +2854,25 @@ export default function App() {
             preview={web}
             activePath={activePath}
             onInstall={handleInstallWeb}
+            commandFor={commandForApp}
+            onRunCommand={handleRunAppCommand}
+            onOpenSettings={() => setProjectSettingsOpen(true)}
+            onHide={() => setSidePanel(null)}
+          />
+        )}
+
+        {runTargets.length > 0 && (
+          <RunPanel
+            key={rootPath}
+            active={runPanelOpen && view !== "settings"}
+            targets={runTargets}
+            choice={runChoice}
+            onChoice={(next) => {
+              setRunChoice(next);
+              saveRunChoice(rootPath, next);
+            }}
+            onRunningChange={setProgramRunning}
+            themeId={themeId}
             onHide={() => setSidePanel(null)}
           />
         )}
@@ -2790,6 +2896,10 @@ export default function App() {
             previewOpen={previewPanelOpen}
             previewRunning={web.dev !== null || web.live !== null}
             onTogglePreview={() => toggleSidePanel("preview")}
+            runAvailable={runTargets.length > 0}
+            runOpen={runPanelOpen}
+            runRunning={programRunning}
+            onToggleRun={() => toggleSidePanel("run")}
           />
         )}
           </>
@@ -2898,6 +3008,31 @@ export default function App() {
             <CloudUpload className="size-3" strokeWidth={1.75} />
             Publish to GitHub
           </button>
+        )}
+
+        {newProjectOpen && (
+          <NewProjectDialog
+            onClose={() => setNewProjectOpen(false)}
+            onCreated={(folder, prompt) => {
+              void (async () => {
+                try {
+                  const snapshot = await openWorkspaceAt(folder);
+                  await applyWorkspace(snapshot);
+                  setNewProjectOpen(false);
+                  setNotice(`Created ${snapshot.name}.`);
+                  // "Describe it": the description waits in the assistant.
+                  if (prompt) askAssistant(prompt);
+                } catch (cause) {
+                  setNewProjectOpen(false);
+                  setNotice(
+                    cause instanceof Error
+                      ? `The project was created in ${folder}, but it could not be opened: ${cause.message}`
+                      : `The project was created in ${folder}, but it could not be opened.`,
+                  );
+                }
+              })();
+            }}
+          />
         )}
 
         {publishOpen && (
@@ -3042,6 +3177,14 @@ export default function App() {
           projectName={tree.name}
           gradleDetected={Boolean(gradle?.detected)}
           gradleJvm={gradleJvm}
+          apps={web.info?.apps ?? []}
+          run={projectRun}
+          onSaveRun={(next) => {
+            saveProjectRun(rootPath, next);
+            setProjectRun(next);
+            setNotice("Run settings saved. They apply the next time the preview starts.");
+          }}
+          onRunCommand={handleRunAppCommand}
           onSaved={(changed, jvm) => {
             saveGradleJvm(rootPath, jvm);
             setGradleJvm(jvm);

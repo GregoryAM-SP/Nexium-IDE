@@ -23,6 +23,8 @@ export type WebApp = {
   packageManager: string;
   /** node_modules exists, so the dev server can start. */
   installed: boolean;
+  /** It can run on the web (a Flutter app needs a web/ folder, Expo needs react-native-web). */
+  webSupport: boolean;
 };
 
 export type WebInfo = {
@@ -67,6 +69,7 @@ const demoInfo: WebInfo = {
       fallback: null,
       packageManager: "npm",
       installed: true,
+      webSupport: true,
     },
   ],
   pages: ["index.html"],
@@ -122,6 +125,13 @@ export async function startDevServer(
   }
 }
 
+/** Sends keys to the running server, e.g. "r" for Flutter's hot reload. */
+export async function sendDevInput(text: string): Promise<void> {
+  if (isTauri()) {
+    await invoke("web_dev_input", { text });
+  }
+}
+
 export async function stopDevServer(): Promise<void> {
   if (isTauri()) {
     await invoke("web_stop_dev");
@@ -170,7 +180,14 @@ export function scriptCommand(
 
 /** The command that installs an app's dependencies, for the terminal. */
 export function installCommand(app: WebApp, windows: boolean): string {
-  const install = `${app.packageManager} install`;
+  const install =
+    app.packageManager === "flutter"
+      ? "flutter pub get"
+      : app.packageManager === "python"
+        ? windows
+          ? "python -m venv .venv; .venv\\Scripts\\python -m pip install -r requirements.txt"
+          : "python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt"
+        : `${app.packageManager} install`;
 
   if (!app.dir) {
     return install;
@@ -191,7 +208,7 @@ export function isHtmlPath(path: string): boolean {
 
 /** Workspace files whose change can add or remove an app or page. */
 export function affectsWebDetection(path: string): boolean {
-  return /(^|\/)package\.json$/.test(path) || isHtmlPath(path);
+  return /(^|\/)(package\.json|pubspec\.yaml)$/.test(path) || isHtmlPath(path);
 }
 
 /** Encodes a workspace path for a URL, keeping the slashes. */

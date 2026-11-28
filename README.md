@@ -36,7 +36,29 @@ The interface is built from three values per theme — a page colour, an ink and
 
 ### Editor workspace
 
-- **Open or start a project** from the title bar's **File** menu (or the Explorer header, or the empty state). **Open Project…** picks an existing folder; **New Project…** asks for a name and location in a native save dialog, creates the folder in Rust (`create_workspace`), and opens it empty. The folder tree is read on the Rust side and streamed to the UI as a snapshot.
+- **Open or start a project** from the title bar's **File** menu (or the Explorer header, or the empty state). **Open Project…** picks an existing folder; **New Project…** opens the template picker (below). The folder tree is read on the Rust side and streamed to the UI as a snapshot.
+- **Project templates**: **New Project…** shows templates grouped into Web, Mobile, Backend, Desktop & systems and Other, with a search box, a name, a location (the last one used, else Documents) and the options a template supports: **TypeScript**, **Install dependencies** and **Start a git repository** (off unless you turn it on; the choice is remembered).
+  - **Built-in starters** are written from files shipped inside the app (`src-tauri/templates/`), so they work offline: HTML/CSS/JS, Bootstrap, Tailwind CSS, Node.js + Express, Flask, FastAPI, Go, C++ (CMake), Java and Kotlin with Gradle, a Python script, Markdown docs and an empty folder. The Gradle templates (Kotlin DSL, an application class and a test) also get the Gradle wrapper (`gradlew`), so they build without Gradle installed: `gradle wrapper` runs in an empty scratch project with the Gradle on PATH or, without one, the newest distribution already cached in `~/.gradle/wrapper/dists` (offline, pinned to that version), and the four wrapper files are copied in. The project name fills in titles and package names.
+  - **Generators** run the framework's own tool, so the project is always current: React, Vue, Svelte and plain Vite (`npm create vite`), Next.js (`create-next-app`), Angular (`@angular/cli new`), React Native (`create-expo-app`), Flutter (`flutter create`), Rust (`cargo new`), and C# console and ASP.NET Core Web API (`dotnet new`). Each runs non-interactively and its output streams into the dialog as it works; **Stop** ends the whole process tree. The dialog shows the exact command first.
+  - Templates whose tool is not installed are greyed out with "Needs flutter" and where to get it; the refresh button looks again after you install something. Tools are found by scanning `PATH` (the Microsoft Store's `python.exe` stub does not count).
+  - Names are checked before anything runs: any valid folder name for built-ins, lowercase package names (`my-app`) for npm and Cargo generators, and `snake_case` for Flutter, with a one-click fix. An existing non-empty folder is never overwritten.
+  - **Describe it** creates an empty folder, opens it, and puts your description in the assistant's message box; press Enter and the assistant plans and builds the project.
+- **Run panel** (the terminal button on the right rail, beside Preview): for projects that run as programs rather than pages. It finds them at the root and up to two folders down, each with its tasks, the first being the default:
+  - **Rust** (`Cargo.toml`): Run (`cargo run`), Run (release), Test, Build, Check; a library gets no Run.
+  - **Go** (`go.mod`): Run (`go run .`, when a file has `package main`), Test, Build, Vet.
+  - **.NET** (`*.csproj`, `*.fsproj`, `*.sln`): Run (`dotnet run`), Watch, Test, Build.
+  - **Python** programs (`main.py`, `app.py`, `run.py`, `cli.py`; web apps go to the preview instead): Run with the project's virtual environment, Test (`pytest`, when there are tests), Install requirements.
+  - **C++ with CMake** (`CMakeLists.txt`): Run (configure, build and start the `add_executable` target), Build, Test (`ctest`).
+  - **Flutter** on this computer (`flutter run -d windows`, `macos` or `linux`), Test, Analyze, Build web, Get packages; **Dart** packages: Run, Test, Analyze.
+  - **Gradle** builds (Java, Kotlin, Android): Run (`gradlew run`, with the `application` plugin) or Install on device / Build APK (Android), Test, Build, Clean, through the wrapper when there is one.
+  - **Node.js**: every `package.json` script (start, dev and test first), or `node <main>` when there is no start script.
+
+  Pick the program and the task (or **Custom command…**, e.g. `cargo run -- --verbose`) and press **Run**. The program gets its own terminal in the panel, so colours work and it can read what you type (`input()`, `stdin`); the header shows **Running · 12s**, then **Exit code 0 · 1.0s**, and the output ends with *Process finished with exit code N*. **Stop** ends the program and everything it started, **Restart** runs it again, the eraser clears the output. Hiding the panel keeps the program running (a dot on the rail button says so), and the last choice is remembered per project. On Windows the line runs through a small batch file with `cmd`, so quotes, `&&` and redirections work as written; elsewhere through `sh -c`.
+- **Run settings per framework** (File → **Project Settings…**, or **Run settings** in the preview panel): every app the preview can run gets a **Run** section, saved per machine (nothing is written into the project), and the preview starts the app with the command it builds. The section shows that command, plus buttons that run setup commands in the terminal.
+  - **Flutter**: detected from `pubspec.yaml` (`sdk: flutter`) and served on the web for the preview with `flutter run -d web-server --web-hostname 127.0.0.1 --web-port 8080`. Settings: build mode (debug, profile, release), port, entry point (`-t`), `--dart-define` values (one `KEY=value` per line), WebAssembly (`--wasm`) and **hot reload on save**. While it runs, the preview's toolbar has **Hot reload** (`r`) and **Hot restart** (`R`), sent to `flutter run` through its input; saving a `.dart` file in debug mode hot-reloads, and the frame refreshes once the recompile is done. An app without a `web/` folder gets **Add web support** (`flutter create . --platforms web`); there are also **flutter pub get**, **flutter doctor** and **Build for the web** buttons.
+  - **React Native (Expo)**: detected from the `expo` dependency; the preview runs the web build with `npx expo start --web --port 8081` (port and **Clear Metro's cache** are settings). An app missing its web packages gets **Add web support** (`npx expo install react-dom react-native-web @expo/metro-runtime`). To run on a phone, open Expo Go and scan the QR code `npx expo start` prints in the terminal.
+  - **Python web apps (Flask, FastAPI, Django)**: detected from the `Flask(` / `FastAPI(` assignment in `app.py`, `main.py`, `wsgi.py` and similar files (also under `app/` and `src/`), or from `manage.py` for Django, and run with their own development server so templates, routes and data work in the preview instead of the raw HTML files: `python -m flask --app app run --debug --port 5000`, `python -m uvicorn main:app --reload --port 8000`, or `python manage.py runserver 127.0.0.1:8000`. The project's virtual environment (`.venv`, `venv` or `env`) is used when there is one. An API whose root answers with JSON is previewed at its interactive docs (`/docs`). Settings: port and reload on change; **Create .venv and install** sets up a virtual environment from `requirements.txt`.
+  - **React, Vue, Svelte, Next.js, Angular and other web apps**: choose which `package.json` script the preview runs and, optionally, a port (`npm run dev -- --port 3001`, or `--port` directly for pnpm, yarn and bun).
 - **Explorer** with per-extension file icons, folders collapsed by default, inline rename, a right-click context menu (Ask AI about this file/folder, New File, New Folder, Rename, Copy Path, Delete) and a hide toggle. Delete always opens a confirmation dialog naming the target — Cancel is focused, Escape and a backdrop click cancel, and folders warn that everything inside goes with them.
 - **Editor bar**: the open file as a raised tab with dirty marker and close button, the path as mono breadcrumbs beside it (hidden for root-level files where it would repeat the tab), and, grouped on the right, the Preview toggle and the Save control with its ⌘S keycap (disabled while the buffer is clean).
 - **Status bar** in six segments: transient notices (when there is one), branch with a change-count badge (opens Source Control), relative path, language, `Ln/Col` from the Monaco caret, `UTF-8`, and the assistant model (opens Settings).
@@ -321,6 +343,8 @@ Nexium-IDE/
 │   │   ├── SettingsPage.tsx    # key entry, verification, latency list
 │   │   ├── SourceControlPanel.tsx # branch, changes, staging, commit box
 │   │   ├── DiffView.tsx        # read-only side-by-side diff of one change
+│   │   ├── NewProjectDialog.tsx # New Project: template picker, options, live generator output
+│   │   ├── RunPanel.tsx        # Run panel: program + task, its own xterm session, exit status
 │   │   └── WindowControls.tsx  # custom minimise / maximise / close
 │   └── lib/
 │       ├── themes.ts           # the twenty-four themes, persistence, applyTheme()
@@ -331,6 +355,9 @@ Nexium-IDE/
 │       ├── media.ts            # image and font paths → data URL from Rust
 │       ├── monacoSetup.ts      # worker setup and theme
 │       ├── git.ts              # status/stage/commit wrappers + browser demo repo
+│       ├── templates.ts        # New Project catalog, name rules, create_project wrapper
+│       ├── projectRun.ts       # per-project run settings (Flutter, Expo, web apps) → preview command
+│       ├── runnable.ts         # Run panel targets and the last choice per project
 │       ├── llm.ts              # provider calls: models, probes, chat, agent
 │       ├── assistantPrompt.ts  # right-click selection/file prompts for the composer
 │       ├── inlineCompletion.ts # ghost-text AI completions in the editor
@@ -348,7 +375,10 @@ Nexium-IDE/
         ├── agent.rs            # tool schema, tool loop, step notes, write events
         ├── run.rs              # a run's session id, events, view of the other sessions
         ├── store.rs            # SQLite database: sessions, messages, activity, file locks
-        └── command.rs          # run_command: shell, time limit, stopping the process tree
+        ├── command.rs          # run_command: shell, time limit, stopping the process tree
+        ├── templates.rs        # New Project: catalog, tool detection, plans, generator commands
+        ├── runnable.rs         # Run panel: runnable projects (Rust, Go, .NET, Python, CMake, Flutter, Node) and tasks
+        └── template_files.rs   # embeds the built-in starters from src-tauri/templates/
 ```
 
 ---

@@ -141,6 +141,19 @@ pub async fn run(
     timeout_seconds: u64,
     cancel: &AtomicBool,
 ) -> Result<Outcome, String> {
+    let limit = Duration::from_secs(timeout_seconds.clamp(1, MAX_TIMEOUT));
+    run_streaming(folder, command, limit, cancel, &mut |_| {}).await
+}
+
+/// Like [`run`], with no cap on `limit`, handing each piece of output to
+/// `on_output` as it arrives (for a log the user watches).
+pub async fn run_streaming(
+    folder: &Path,
+    command: &str,
+    limit: Duration,
+    cancel: &AtomicBool,
+    on_output: &mut (dyn FnMut(&str) + Send),
+) -> Result<Outcome, String> {
     let mut child = shell(command)
         .current_dir(folder)
         .stdin(Stdio::null())
@@ -151,6 +164,8 @@ pub async fn run(
         .env("NO_COLOR", "1")
         .env("FORCE_COLOR", "0")
         .env("TERM", "dumb")
+        // The Angular CLI otherwise stops to ask about analytics.
+        .env("NG_CLI_ANALYTICS", "false")
         .spawn()
         .map_err(|error| format!("Could not start the command: {error}"))?;
 
@@ -161,9 +176,27 @@ pub async fn run(
     ];
 
     let started = Instant::now();
-    let limit = Duration::from_secs(timeout_seconds.clamp(1, MAX_TIMEOUT));
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut sent = 0usize;
+
+    let mut forward = |final_flush: bool| {
+        let Ok(bytes) = output.lock() else { return };
+        let fresh = &bytes[sent..];
+        // Hold back a character split across reads, unless this is the end.
+        let usable = match std::str::from_utf8(fresh) {
+            Ok(_) => fresh.len(),
+            Err(error) if error.error_len().is_none() && !final_flush => error.valid_up_to(),
+            Err(_) => fresh.len(),
+        };
+        // A CR at the very end may be the first half of a CRLF.
+        let usable = if !final_flush && usable > 0 && fresh[usable - 1] == b'\r' { usable - 1 } else { usable };
+        if usable > 0 {
+            let text = String::from_utf8_lossy(&fresh[..usable]).replace("\r\n", "\n");
+            sent += usable;
+            on_output(&text);
+        }
+    };
 
     let status = loop {
         match child.try_wait() {
@@ -184,12 +217,14 @@ pub async fn run(
             break None;
         }
 
+        forward(false);
         tokio::time::sleep(POLL).await;
     };
 
     for reader in readers.into_iter().flatten() {
         let _ = reader.join();
     }
+    forward(true);
 
     let bytes = output.lock().map(|bytes| bytes.clone()).unwrap_or_default();
 
@@ -226,6 +261,21 @@ mod tests {
         let failed = block(run(&folder, "exit 3", 30, &never)).unwrap();
         assert_eq!(failed.exit_code, Some(3));
         assert!(!failed.succeeded());
+    }
+
+    #[test]
+    fn streams_output_as_it_arrives() {
+        let folder = std::env::temp_dir();
+        let never = AtomicBool::new(false);
+        let mut pieces = String::new();
+        let command = if cfg!(windows) { "echo one && echo two" } else { "echo one; echo two" };
+        let outcome = block(run_streaming(&folder, command, Duration::from_secs(30), &never, &mut |text| {
+            pieces.push_str(text)
+        }))
+        .unwrap();
+        assert!(outcome.succeeded());
+        assert!(pieces.contains("one") && pieces.contains("two"));
+        assert_eq!(pieces.trim(), outcome.output.trim());
     }
 
     #[test]

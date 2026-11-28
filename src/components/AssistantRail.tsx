@@ -1,4 +1,4 @@
-import { Globe, Hammer, Sparkles } from "lucide-react";
+import { Globe, Hammer, Sparkles, SquareTerminal } from "lucide-react";
 
 import { RailButton } from "./ActivityRail";
 
@@ -17,6 +17,12 @@ type AssistantRailProps = {
   /** A dev or live server is running; drawn as a dot on the button. */
   previewRunning: boolean;
   onTogglePreview: () => void;
+  /** Shown when the folder has a program to run (Rust, Go, .NET, Python…). */
+  runAvailable: boolean;
+  runOpen: boolean;
+  /** A program is running; drawn as a dot on the button. */
+  runRunning: boolean;
+  onToggleRun: () => void;
 };
 
 /**
@@ -34,6 +40,10 @@ export default function AssistantRail({
   previewOpen,
   previewRunning,
   onTogglePreview,
+  runAvailable,
+  runOpen,
+  runRunning,
+  onToggleRun,
 }: AssistantRailProps) {
   return (
     <div className="flex w-[52px] shrink-0 flex-col items-center gap-1.5 border-l border-line bg-rail py-3">
@@ -75,6 +85,24 @@ export default function AssistantRail({
             <span
               aria-hidden
               title="A preview server is running"
+              className="pointer-events-none absolute top-0.5 right-0.5 size-2 rounded-full bg-emerald-400 ring-2 ring-rail"
+            />
+          )}
+        </div>
+      )}
+
+      {runAvailable && (
+        <div className="relative">
+          <RailButton
+            active={runOpen}
+            label={runOpen ? "Hide the Run panel" : "Run the program"}
+            icon={SquareTerminal}
+            onClick={onToggleRun}
+          />
+          {runRunning && (
+            <span
+              aria-hidden
+              title="A program is running"
               className="pointer-events-none absolute top-0.5 right-0.5 size-2 rounded-full bg-emerald-400 ring-2 ring-rail"
             />
           )}

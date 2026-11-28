@@ -6,8 +6,11 @@ mod gradle;
 mod gradle_settings;
 mod llm;
 mod run;
+mod runnable;
 mod secrets;
 mod store;
+mod template_files;
+mod templates;
 mod text_calls;
 mod terminal;
 mod web;
@@ -30,6 +33,8 @@ struct AppState {
     store: Mutex<Option<Arc<store::Store>>>,
     terminals: Mutex<HashMap<String, terminal::Session>>,
     web: web::WebState,
+    /// Stop flag of the New Project generator that is running, if any.
+    creating: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 fn current_root(state: &State<'_, AppState>) -> Result<PathBuf, String> {
@@ -271,6 +276,154 @@ fn github_suggest_name(state: State<'_, AppState>) -> String {
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
     github::suggest_repo_name(&name)
+}
+
+#[derive(serde::Serialize)]
+struct TemplateCatalog {
+    templates: Vec<templates::Template>,
+    tools: std::collections::BTreeMap<&'static str, bool>,
+}
+
+/// The New Project templates, and which developer tools are installed.
+#[tauri::command]
+async fn project_templates() -> Result<TemplateCatalog, String> {
+    blocking(|| {
+        Ok(TemplateCatalog {
+            templates: templates::catalog(),
+            tools: templates::installed_tools(),
+        })
+    })
+    .await
+}
+
+/// Longest a generator (with its dependency install) may take.
+const CREATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Creates a project from a template: writes the built-in files or runs the
+/// framework's generator (streaming its output as `project-create` events),
+/// installs dependencies if asked, and starts a git repository if asked.
+/// Returns the new project's folder; the UI then opens it.
+#[tauri::command]
+async fn create_project(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    choice: templates::Choice,
+) -> Result<String, String> {
+    use tauri::Emitter;
+
+    let planned = {
+        let choice = choice.clone();
+        blocking(move || templates::plan(&choice)).await?
+    };
+    let tools = blocking(|| Ok(templates::installed_tools())).await?;
+    if let Some(tool) = templates::missing_tool(&choice.template, &tools) {
+        return Err(format!("This template needs {tool}, which was not found. Install it (and restart Nexium Studio so it is on PATH), then try again."));
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut creating = state.creating.lock().map_err(|_| "The app state is unavailable.".to_string())?;
+        if creating.is_some() {
+            return Err("A project is already being created.".into());
+        }
+        *creating = Some(cancel.clone());
+    }
+
+    let emit = |kind: &str, text: &str| {
+        let _ = app.emit("project-create", serde_json::json!({ "kind": kind, "text": text }));
+    };
+
+    let outcome: Result<(), String> = async {
+        if !planned.files.is_empty() || planned.steps.is_empty() {
+            emit("step", "Writing the template's files");
+            let folder = planned.folder.clone();
+            let files = planned.files.clone();
+            blocking(move || {
+                templates::write_files(&templates::Plan {
+                    template: "",
+                    folder,
+                    files,
+                    steps: Vec::new(),
+                    git: false,
+                })
+            })
+            .await?;
+        }
+
+        for step in &planned.steps {
+            emit("step", &step.title);
+            emit("output", &format!("$ {}\n", step.command));
+            let folder = templates::step_folder(&planned, step);
+            let mut log = String::new();
+            let result = command::run_streaming(&folder, &step.command, CREATE_LIMIT, &cancel, &mut |text| {
+                log.push_str(text);
+                emit("output", text);
+            })
+            .await?;
+
+            if result.cancelled {
+                return Err("Stopped. The project folder may be incomplete; delete it or try again.".into());
+            }
+            if result.timed_out {
+                return Err(format!("{} took longer than {} minutes and was stopped.", step.title, CREATE_LIMIT.as_secs() / 60));
+            }
+            if result.exit_code != Some(0) {
+                let tail: Vec<&str> = log.lines().filter(|line| !line.trim().is_empty()).collect();
+                let tail = tail[tail.len().saturating_sub(4)..].join("\n");
+                return Err(format!(
+                    "{} failed (exit code {}).{}",
+                    step.title,
+                    result.exit_code.map_or("none".into(), |code| code.to_string()),
+                    if tail.is_empty() { String::new() } else { format!("\n{tail}") }
+                ));
+            }
+        }
+
+        if !planned.folder.is_dir() {
+            return Err(format!("The generator finished but {} was not created.", planned.folder.display()));
+        }
+
+        if planned.template.ends_with("-gradle") {
+            emit("step", "Adding the Gradle wrapper");
+            templates::add_gradle_wrapper(&planned.folder, &cancel, &mut |text| emit("output", text)).await?;
+        }
+
+        {
+            let folder = planned.folder.clone();
+            let template = planned.template;
+            blocking(move || {
+                templates::finish(&templates::Plan { template, folder, files: Vec::new(), steps: Vec::new(), git: false })
+            })
+            .await?;
+        }
+
+        if planned.git {
+            emit("step", "Starting a git repository");
+            let folder = planned.folder.clone();
+            blocking(move || {
+                if git::is_own_repo(&folder) { Ok(()) } else { git::init(&folder) }
+            })
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Ok(mut creating) = state.creating.lock() {
+        *creating = None;
+    }
+
+    outcome.map(|_| planned.folder.to_string_lossy().to_string())
+}
+
+/// Stops the New Project generator that is running.
+#[tauri::command]
+fn create_project_cancel(state: State<'_, AppState>) {
+    if let Ok(creating) = state.creating.lock() {
+        if let Some(flag) = creating.as_ref() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Creates the repository on GitHub, makes it the folder's `origin`
@@ -611,6 +764,12 @@ fn web_start_dev(
     web::start_dev(&app, &state.web, &root, &dir, &script, command.as_deref(), manager.as_deref())
 }
 
+/// Sends keys to the running server, e.g. `r` for Flutter's hot reload.
+#[tauri::command]
+fn web_dev_input(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    web::send_input(&state.web, &text)
+}
+
 #[tauri::command]
 async fn web_stop_dev(state: State<'_, AppState>) -> Result<(), String> {
     // Async so the wait on taskkill never runs on the window's main thread.
@@ -641,12 +800,24 @@ fn terminal_start(
     id: String,
     rows: u16,
     cols: u16,
+    run: Option<String>,
+    dir: Option<String>,
 ) -> Result<String, String> {
     // The shell always starts in the open project, never in the app's own
-    // working directory.
+    // working directory; a run may start in a folder inside it.
     let root = current_root(&state)?;
+    let folder = match dir.as_deref().filter(|dir| !dir.is_empty()) {
+        Some(dir) => workspace::safe_join(&root, dir)?,
+        None => root,
+    };
 
-    terminal::start(&app, root, &state.terminals, id, rows, cols)
+    terminal::start(&app, folder, &state.terminals, id, rows, cols, run.as_deref())
+}
+
+/// Programs in the workspace the Run panel can start, with their tasks.
+#[tauri::command]
+async fn run_targets(state: State<'_, AppState>) -> Result<Vec<runnable::Runnable>, String> {
+    with_root(&state, |root| Ok(runnable::detect(root))).await
 }
 
 #[tauri::command]
@@ -982,10 +1153,14 @@ pub fn run() {
             store: Mutex::new(None),
             terminals: Mutex::new(HashMap::new()),
             web: web::WebState::default(),
+            creating: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             open_workspace,
             create_workspace,
+            project_templates,
+            create_project,
+            create_project_cancel,
             read_workspace_file,
             read_media_file,
             read_workspace_sources,
@@ -1031,6 +1206,8 @@ pub fn run() {
             web_status,
             web_start_dev,
             web_stop_dev,
+            web_dev_input,
+            run_targets,
             web_start_live,
             web_stop_live,
             web_open_external,

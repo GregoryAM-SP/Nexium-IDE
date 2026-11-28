@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -14,7 +15,35 @@ use tauri::{AppHandle, Emitter};
 pub struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Shared with the thread that reports the exit code.
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// A script written to run a program, removed with the session.
+    script: Option<PathBuf>,
+}
+
+impl Session {
+    /// Ends the program and everything it started (cargo → the built binary).
+    fn stop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            // A program that already ended may have had its id reused.
+            let running = matches!(child.try_wait(), Ok(None));
+            #[cfg(windows)]
+            if let Some(pid) = child.process_id().filter(|_| running) {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
+            }
+            let _ = child.kill();
+        }
+        if let Some(script) = self.script.take() {
+            let _ = std::fs::remove_file(script);
+        }
+    }
 }
 
 /// Raw terminal output, base64 encoded so a read that splits a multi-byte
@@ -28,6 +57,8 @@ struct Output {
 #[derive(Clone, Serialize)]
 struct Exit {
     id: String,
+    /// The program's exit code, when it is known.
+    code: Option<u32>,
 }
 
 fn size(rows: u16, cols: u16) -> PtySize {
@@ -59,8 +90,33 @@ fn shell() -> (CommandBuilder, String) {
     (CommandBuilder::new(path), name)
 }
 
-/// Starts a shell in `root` and streams its output to `terminal:data` events.
-/// Returns the shell's display name for the panel header.
+/// Runs one command line instead of an interactive shell. On Windows it goes
+/// through a small batch file, so quotes, `&&` and redirections in the line
+/// reach cmd exactly as written.
+fn program(id: &str, line: &str) -> Result<(CommandBuilder, String, Option<PathBuf>), String> {
+    #[cfg(windows)]
+    {
+        let script = std::env::temp_dir().join(format!("nexium-run-{}.cmd", id.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "")));
+        std::fs::write(&script, format!("@echo off\r\n{line}\r\n"))
+            .map_err(|error| format!("The run script could not be written: {error}"))?;
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.args(["/D", "/C"]);
+        command.arg(&script);
+        Ok((command, line.to_string(), Some(script)))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", line]);
+        Ok((command, line.to_string(), None))
+    }
+}
+
+/// Starts a shell in `root` (or, with `run`, that one command line in
+/// `root`) and streams its output to `terminal:data` events. Returns the
+/// shell's display name, or the command line, for the panel header.
 pub fn start(
     app: &AppHandle,
     root: PathBuf,
@@ -68,12 +124,19 @@ pub fn start(
     id: String,
     rows: u16,
     cols: u16,
+    run: Option<&str>,
 ) -> Result<String, String> {
     let pair = native_pty_system()
         .openpty(size(rows, cols))
         .map_err(|error| format!("The terminal could not be created: {error}"))?;
 
-    let (mut command, shell) = shell();
+    let (mut command, shell, script) = match run {
+        Some(line) => program(&id, line)?,
+        None => {
+            let (command, shell) = shell();
+            (command, shell, None)
+        }
+    };
 
     command.cwd(root);
 
@@ -83,6 +146,7 @@ pub fn start(
         .slave
         .spawn_command(command)
         .map_err(|error| format!("The shell could not start: {error}"))?;
+    let child = Arc::new(Mutex::new(child));
 
     // The child owns the slave side now. Holding it here would keep the master
     // from ever reporting that the shell exited.
@@ -109,9 +173,33 @@ pub fn start(
             Session {
                 master: pair.master,
                 writer,
-                child,
+                child: child.clone(),
+                script,
             },
         );
+
+    // The pseudo-console's output does not always end when the program does
+    // (ConPTY keeps it open), so the exit is watched on its own.
+    {
+        let app = app.clone();
+        let id = id.clone();
+        std::thread::spawn(move || loop {
+            let status = match child.lock() {
+                Ok(mut child) => child.try_wait(),
+                Err(_) => return,
+            };
+            match status {
+                Ok(Some(status)) => {
+                    // Let the last output arrive first.
+                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = app.emit("terminal:exit", Exit { id, code: Some(status.exit_code()) });
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(150)),
+                Err(_) => return,
+            }
+        });
+    }
 
     let app = app.clone();
 
@@ -140,7 +228,7 @@ pub fn start(
             }
         }
 
-        let _ = app.emit("terminal:exit", Exit { id });
+        let _ = app.emit("terminal:exit", Exit { id, code: None });
     });
 
     Ok(shell)
@@ -195,7 +283,7 @@ pub fn kill(sessions: &Mutex<HashMap<String, Session>>, id: &str) {
         .and_then(|mut guard| guard.remove(id));
 
     if let Some(mut session) = removed {
-        let _ = session.child.kill();
+        session.stop();
     }
 }
 
@@ -207,6 +295,6 @@ pub fn kill_all(sessions: &Mutex<HashMap<String, Session>>) {
         .unwrap_or_default();
 
     for mut session in running {
-        let _ = session.child.kill();
+        session.stop();
     }
 }

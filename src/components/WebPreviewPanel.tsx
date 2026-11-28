@@ -8,8 +8,10 @@ import {
   Monitor,
   PanelRightClose,
   Play,
+  RotateCcw,
   RotateCw,
   ScrollText,
+  Settings2,
   Smartphone,
   Square,
   Maximize2,
@@ -23,7 +25,8 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 
 import DeviceFrame, { DEVICES } from "./DeviceFrame";
 import type { DeviceId } from "./DeviceFrame";
-import { openInBrowser, pageUrl, scriptCommand } from "../lib/web";
+import { openInBrowser, pageUrl, scriptCommand, sendDevInput } from "../lib/web";
+import { webSupportCommand } from "../lib/projectRun";
 import type { WebApp } from "../lib/web";
 import type { WebPreview } from "../lib/useWebPreview";
 
@@ -32,6 +35,11 @@ type WebPreviewPanelProps = {
   /** The file open in the editor, offered as the live server's page. */
   activePath: string;
   onInstall: (app: WebApp) => void;
+  /** The command Project settings set for an app, or null for its default. */
+  commandFor: (app: WebApp) => string | null;
+  /** Runs a command in the app's folder in the terminal. */
+  onRunCommand: (app: WebApp, command: string) => void;
+  onOpenSettings: () => void;
   onHide: () => void;
 };
 
@@ -71,14 +79,20 @@ const CUSTOM = "\u0000custom";
 const WITH_NPM = "npm\u0000";
 
 /** The script to preselect: the likeliest server, else a typed command. */
-function defaultScript(app: WebApp | null): string {
+function defaultScript(app: WebApp | null, configured: string | null): string {
+  if (configured) {
+    return CUSTOM;
+  }
   return app?.preferred ?? (app ? CUSTOM : "");
 }
 
 /** What the custom command field starts with. */
-function defaultCommand(app: WebApp | null): string {
+function defaultCommand(app: WebApp | null, configured: string | null): string {
   if (!app) {
     return "";
+  }
+  if (configured) {
+    return configured;
   }
   if (app.fallback) {
     return app.fallback;
@@ -100,6 +114,9 @@ export default function WebPreviewPanel({
   preview,
   activePath,
   onInstall,
+  commandFor,
+  onRunCommand,
+  onOpenSettings,
   onHide,
 }: WebPreviewPanelProps) {
   const { info, dev, live, logs, exited, busy, error } = preview;
@@ -112,8 +129,9 @@ export default function WebPreviewPanel({
   const [externalError, setExternalError] = useState<string | null>(null);
   const [appIndex, setAppIndex] = useState(0);
   const app = apps[Math.min(appIndex, apps.length - 1)] ?? null;
-  const [script, setScript] = useState(() => defaultScript(app));
-  const [customCommand, setCustomCommand] = useState(() => defaultCommand(app));
+  const configured = app ? commandFor(app) : null;
+  const [script, setScript] = useState(() => defaultScript(app, configured));
+  const [customCommand, setCustomCommand] = useState(() => defaultCommand(app, configured));
   const custom = script === CUSTOM;
   const withNpm = script.startsWith(WITH_NPM);
   const scriptName = withNpm ? script.slice(WITH_NPM.length) : script;
@@ -135,9 +153,28 @@ export default function WebPreviewPanel({
   const logEnd = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
-    setScript(defaultScript(app));
-    setCustomCommand(defaultCommand(app));
-  }, [app?.dir, app?.preferred]);
+    setScript(defaultScript(app, configured));
+    setCustomCommand(defaultCommand(app, configured));
+  }, [app?.dir, app?.preferred, configured]);
+
+  // Flutter's web server takes keys: r hot-reloads, R restarts. When no
+  // browser tab is connected to it (the preview frame does not count as its
+  // debug client), the recompiled app shows after reloading the frame.
+  const flutterRunning = mode === "dev" && Boolean(dev?.script.startsWith("flutter run"));
+  const seenLogs = useRef(logs.length);
+  useEffect(() => {
+    const fresh = logs.slice(Math.min(seenLogs.current, logs.length));
+    seenLogs.current = logs.length;
+    if (
+      flutterRunning &&
+      fresh.some((line) => /Recompile complete|Restarted application|No client connected/i.test(line))
+    ) {
+      setNonce((current) => current + 1);
+    }
+  }, [logs, flutterRunning]);
+  const flutterKey = (key: "r" | "R") => {
+    void sendDevInput(key).catch(() => undefined);
+  };
 
   const canStart = custom ? customCommand.trim() !== "" : script !== "";
   const start = () => {
@@ -352,6 +389,35 @@ export default function WebPreviewPanel({
               )}
             </div>
 
+            {!app.webSupport && webSupportCommand(app) && (
+              <div className="mt-3 flex items-start gap-2 rounded-lg border border-ink/10 bg-ink/[0.03] px-2.5 py-2">
+                <AlertTriangle className="mt-0.5 size-3 shrink-0 text-ink/45" strokeWidth={1.75} />
+                <div className="min-w-0 flex-1 text-[10.5px] leading-relaxed text-ink/50">
+                  {app.framework === "Flutter"
+                    ? "This Flutter app has no web support yet, so it cannot be previewed."
+                    : "This Expo app is missing its web packages, so it cannot be previewed."}
+                  <button
+                    type="button"
+                    onClick={() => onRunCommand(app, webSupportCommand(app) ?? "")}
+                    className="ml-1 text-ink/80 underline decoration-ink/30 underline-offset-2 hover:decoration-ink"
+                  >
+                    Add web support
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {(app.framework === "Flutter" || app.framework === "Expo" || app.packageManager === "python" || app.servers.length > 0) && (
+              <button
+                type="button"
+                onClick={onOpenSettings}
+                className="mt-2 flex items-center gap-1.5 text-[10.5px] text-ink/40 transition-colors duration-150 hover:text-ink/75"
+              >
+                <Settings2 className="size-3" strokeWidth={1.75} />
+                {configured ? "Run settings (customised)" : "Run settings"}
+              </button>
+            )}
+
             {!app.installed && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-ink/10 bg-ink/[0.03] px-2.5 py-2">
                 <AlertTriangle className="mt-0.5 size-3 shrink-0 text-ink/45" strokeWidth={1.75} />
@@ -362,7 +428,9 @@ export default function WebPreviewPanel({
                     onClick={() => onInstall(app)}
                     className="ml-1 text-ink/80 underline decoration-ink/30 underline-offset-2 hover:decoration-ink"
                   >
-                    Run {app.packageManager} install
+                    {app.packageManager === "python"
+                      ? "Create a virtual environment and install requirements.txt"
+                      : `Run ${app.packageManager === "flutter" ? "flutter pub get" : `${app.packageManager} install`}`}
                   </button>
                 </div>
               </div>
@@ -477,6 +545,28 @@ export default function WebPreviewPanel({
             >
               <ScrollText className="size-3.5" strokeWidth={1.75} />
             </button>
+          )}
+          {flutterRunning && (
+            <>
+              <button
+                type="button"
+                onClick={() => flutterKey("r")}
+                title="Hot reload (r)"
+                aria-label="Hot reload"
+                className={iconButton}
+              >
+                <Zap className="size-3.5" strokeWidth={1.75} />
+              </button>
+              <button
+                type="button"
+                onClick={() => flutterKey("R")}
+                title="Hot restart (R)"
+                aria-label="Hot restart"
+                className={iconButton}
+              >
+                <RotateCcw className="size-3.5" strokeWidth={1.75} />
+              </button>
+            </>
           )}
           {frameUrl && (
             <button

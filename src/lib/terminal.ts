@@ -5,13 +5,19 @@ export function terminalAvailable(): boolean {
   return isTauri();
 }
 
+/**
+ * Starts a shell, or with `run`, that one command line in `dir` (a folder
+ * inside the project), whose exit ends the session.
+ */
 export async function startTerminal(
   id: string,
   rows: number,
   cols: number,
+  run: string | null = null,
+  dir: string | null = null,
 ): Promise<string> {
   try {
-    return await invoke<string>("terminal_start", { id, rows, cols });
+    return await invoke<string>("terminal_start", { id, rows, cols, run, dir });
   } catch (cause) {
     throw toError(cause, "The terminal could not start.");
   }

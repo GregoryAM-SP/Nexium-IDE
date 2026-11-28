@@ -1,0 +1,4 @@
+/* Your styles, on top of Bootstrap. */
+header {
+  background: radial-gradient(circle at top, rgba(13, 110, 253, 0.18), transparent 60%);
+}

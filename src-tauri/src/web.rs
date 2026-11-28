@@ -68,6 +68,9 @@ pub struct WebApp {
     pub fallback: Option<String>,
     pub package_manager: String,
     pub installed: bool,
+    /// The app can be built for the web: false for a Flutter app without a
+    /// `web/` folder, or an Expo app without react-native-web.
+    pub web_support: bool,
 }
 
 #[derive(Serialize)]
@@ -79,7 +82,8 @@ pub struct WebInfo {
     pub pages: Vec<String>,
 }
 
-const FRAMEWORKS: [(&str, &str); 16] = [
+const FRAMEWORKS: [(&str, &str); 17] = [
+    ("expo", "Expo"),
     ("next", "Next.js"),
     ("nuxt", "Nuxt"),
     ("@remix-run/dev", "Remix"),
@@ -130,7 +134,8 @@ const BUILD_COMMANDS: [&str; 14] = [
 
 /// Commands that start a dev or preview server, and the port each listens on
 /// when nothing says otherwise. Longer phrases come before their prefixes.
-const SERVER_COMMANDS: [(&str, u16); 24] = [
+const SERVER_COMMANDS: [(&str, u16); 25] = [
+    ("expo start", 8081),
     ("vite preview", 4173),
     ("next dev", 3000),
     ("next start", 3000),
@@ -215,10 +220,10 @@ fn port_flag(command: &str) -> Option<u16> {
     let words: Vec<&str> = command.split_whitespace().collect();
 
     for (index, word) in words.iter().enumerate() {
-        if let Some(value) = word.strip_prefix("--port=") {
+        if let Some(value) = word.strip_prefix("--port=").or_else(|| word.strip_prefix("--web-port=")) {
             return value.trim_matches(['"', '\'']).parse().ok();
         }
-        if matches!(*word, "--port" | "-p") {
+        if matches!(*word, "--port" | "-p" | "--web-port") {
             return words.get(index + 1)?.trim_matches(['"', '\'']).parse().ok();
         }
     }
@@ -248,6 +253,14 @@ fn vite_config_port(dir: &Path) -> Option<u16> {
 
 /// The port a server command is expected to listen on.
 fn expected_port(dir: &Path, command: &str) -> Option<u16> {
+    // `manage.py runserver 127.0.0.1:8000` (or just `8000`).
+    if let Some(rest) = command.split("runserver").nth(1) {
+        let address = rest.split_whitespace().find(|word| !word.starts_with('-'));
+        let port = address
+            .map(|address| address.rsplit(':').next().unwrap_or(address))
+            .and_then(|port| port.parse().ok());
+        return port.or(Some(8000));
+    }
     port_flag(command).or_else(|| match server_tool(command)? {
         ("vite" | "vite dev" | "vite serve" | "remix vite:dev", port) => vite_config_port(dir).or(Some(port)),
         (_, port) => Some(port),
@@ -401,6 +414,7 @@ fn package_manager(dir: &Path, root: &Path) -> String {
 /// server, e.g. `npx vite` in a project that only lists the dependency.
 fn fallback_command(framework: &str, manager: &str) -> Option<String> {
     let tool = match framework {
+        "Expo" => "expo start --web",
         "Vite" | "SvelteKit" => "vite",
         "Next.js" => "next dev",
         "Astro" => "astro dev",
@@ -449,7 +463,13 @@ fn read_app(root: &Path, dir: &Path) -> Option<WebApp> {
         .map(|(_, label)| label.to_string())
         .unwrap_or_default();
 
-    let servers = server_scripts(dir, scripts_map);
+    let mut servers = server_scripts(dir, scripts_map);
+    if framework == "Expo" {
+        if let Some(index) = servers.iter().position(|server| server.command.contains("--web")) {
+            let web = servers.remove(index);
+            servers.insert(0, web);
+        }
+    }
 
     // A package with no server script and no web tooling is a library, a
     // tool config or a CLI, not something to preview.
@@ -481,6 +501,150 @@ fn read_app(root: &Path, dir: &Path) -> Option<WebApp> {
         servers,
         package_manager: manager,
         installed: dir.join("node_modules").is_dir() || root.join("node_modules").is_dir(),
+        web_support: !matches!(json.get("dependencies").and_then(|deps| deps.get("expo")), Some(_))
+            || has_dependency("react-native-web"),
+    })
+}
+
+/// The default command that serves a Flutter app for the preview.
+pub const FLUTTER_WEB: &str = "flutter run -d web-server --web-hostname 127.0.0.1 --web-port 8080";
+
+/// A Flutter app (a pubspec.yaml that depends on the Flutter SDK), served for
+/// the preview with `flutter run -d web-server`.
+fn read_flutter_app(root: &Path, dir: &Path) -> Option<WebApp> {
+    let pubspec = fs::read_to_string(dir.join("pubspec.yaml")).ok()?;
+    let flutter = pubspec.lines().any(|line| line.trim().replace(' ', "") == "sdk:flutter");
+    if !flutter {
+        return None;
+    }
+
+    let name = pubspec
+        .lines()
+        .find_map(|line| line.strip_prefix("name:"))
+        .map(|name| name.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "app".into())
+        });
+    let relative = dir
+        .strip_prefix(root)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+
+    Some(WebApp {
+        dir: relative,
+        name,
+        framework: "Flutter".into(),
+        scripts: Vec::new(),
+        servers: Vec::new(),
+        preferred: None,
+        fallback: Some(FLUTTER_WEB.into()),
+        package_manager: "flutter".into(),
+        installed: dir.join(".dart_tool").is_dir(),
+        web_support: dir.join("web").join("index.html").is_file(),
+    })
+}
+
+/// A web app, a Flutter app or a Python web app in `dir`.
+fn read_any_app(root: &Path, dir: &Path) -> Option<WebApp> {
+    read_app(root, dir)
+        .or_else(|| read_flutter_app(root, dir))
+        .or_else(|| read_python_app(root, dir))
+}
+
+/// The Python that runs a project: its virtual environment's, else the one on PATH.
+pub fn python_for(dir: &Path) -> String {
+    for venv in [".venv", "venv", "env"] {
+        let python = if cfg!(windows) {
+            dir.join(venv).join("Scripts").join("python.exe")
+        } else {
+            dir.join(venv).join("bin").join("python")
+        };
+        if python.is_file() {
+            return if cfg!(windows) {
+                format!("{venv}\\Scripts\\python")
+            } else {
+                format!("{venv}/bin/python")
+            };
+        }
+    }
+    if cfg!(windows) { "python".into() } else { "python3".into() }
+}
+
+/// Files a Python web app's entry point is usually in.
+const PYTHON_ENTRIES: [&str; 8] = ["app.py", "main.py", "wsgi.py", "asgi.py", "server.py", "api.py", "application.py", "run.py"];
+
+/// The `name = Flask(` / `name = FastAPI(` assignment in a file, as (module, variable).
+fn python_entry(dir: &Path, constructor: &str) -> Option<(String, String)> {
+    let mut candidates: Vec<PathBuf> = PYTHON_ENTRIES.iter().map(|file| dir.join(file)).collect();
+    for sub in ["app", "src"] {
+        candidates.extend(PYTHON_ENTRIES.iter().map(|file| dir.join(sub).join(file)));
+    }
+    for path in candidates {
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for line in text.lines() {
+            let Some(position) = line.find(&format!("{constructor}(")) else { continue };
+            let left = line[..position].trim_end();
+            let Some(variable) = left.strip_suffix('=').map(str::trim) else { continue };
+            if variable.is_empty() || !variable.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let relative = path.strip_prefix(dir).ok()?.with_extension("");
+            let module = relative.to_string_lossy().replace(['\\', '/'], ".");
+            return Some((module, variable.to_string()));
+        }
+    }
+    None
+}
+
+/// Whether the project's dependency files mention a package.
+fn python_depends_on(dir: &Path, package: &str) -> bool {
+    ["requirements.txt", "pyproject.toml", "Pipfile", "setup.py", "setup.cfg"].iter().any(|file| {
+        fs::read_to_string(dir.join(file)).is_ok_and(|text| {
+            text.to_ascii_lowercase()
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .any(|word| word == package)
+        })
+    })
+}
+
+/// A Flask, FastAPI or Django app, run with its own development server so
+/// templates and routes work in the preview.
+fn read_python_app(root: &Path, dir: &Path) -> Option<WebApp> {
+    let python = python_for(dir);
+    let (framework, command) = if dir.join("manage.py").is_file() && python_depends_on(dir, "django")
+        || fs::read_to_string(dir.join("manage.py")).is_ok_and(|text| text.contains("django"))
+    {
+        ("Django", format!("{python} manage.py runserver 127.0.0.1:8000"))
+    } else if let Some((module, variable)) = python_entry(dir, "FastAPI") {
+        let target = format!("{module}:{variable}");
+        ("FastAPI", format!("{python} -m uvicorn {target} --reload --host 127.0.0.1 --port 8000"))
+    } else if let Some((module, variable)) = python_entry(dir, "Flask") {
+        let target = if variable == "app" { module } else { format!("{module}:{variable}") };
+        ("Flask", format!("{python} -m flask --app {target} run --debug --host 127.0.0.1 --port 5000"))
+    } else {
+        return None;
+    };
+
+    let relative = dir
+        .strip_prefix(root)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let venv = [".venv", "venv", "env"].iter().any(|venv| dir.join(venv).join("pyvenv.cfg").is_file());
+
+    Some(WebApp {
+        dir: relative,
+        name: dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "app".into()),
+        framework: framework.into(),
+        scripts: Vec::new(),
+        servers: Vec::new(),
+        preferred: None,
+        fallback: Some(command),
+        package_manager: "python".into(),
+        // Without a virtual environment the packages may still be installed
+        // globally; only a missing requirements install is worth a warning.
+        installed: venv || !dir.join("requirements.txt").is_file(),
+        web_support: true,
     })
 }
 
@@ -527,7 +691,7 @@ fn page_rank(page: &str) -> (usize, usize, String) {
 }
 
 pub fn detect(root: &Path) -> WebInfo {
-    let mut apps: Vec<WebApp> = read_app(root, root).into_iter().collect();
+    let mut apps: Vec<WebApp> = read_any_app(root, root).into_iter().collect();
 
     // Front ends often live one level down: `web/`, `frontend/`, `apps/site`.
     if let Ok(entries) = fs::read_dir(root) {
@@ -540,7 +704,7 @@ pub fn detect(root: &Path) -> WebInfo {
         dirs.sort();
 
         for dir in dirs {
-            if let Some(app) = read_app(root, &dir) {
+            if let Some(app) = read_any_app(root, &dir) {
                 apps.push(app);
                 continue;
             }
@@ -549,7 +713,7 @@ pub fn detect(root: &Path) -> WebInfo {
                 for child in children.flatten() {
                     let path = child.path();
                     if path.is_dir() && !skipped(&child.file_name().to_string_lossy()) {
-                        apps.extend(read_app(root, &path));
+                        apps.extend(read_any_app(root, &path));
                     }
                 }
             }
@@ -572,6 +736,8 @@ pub fn detect(root: &Path) -> WebInfo {
 
 struct DevServer {
     child: Child,
+    /// Input for servers that take keys (Flutter's r / R / q).
+    input: Option<std::process::ChildStdin>,
     dir: String,
     script: String,
     url: Option<String>,
@@ -754,6 +920,25 @@ fn kill_tree(child: &mut Child) {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Commands whose server listens for keys on its input: `flutter run`.
+fn takes_keys(custom: Option<&str>) -> bool {
+    custom.is_some_and(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some("flutter") && words.next() == Some("run")
+    })
+}
+
+/// Sends keys to the running server, e.g. `r` for Flutter's hot reload.
+pub fn send_input(state: &WebState, text: &str) -> Result<(), String> {
+    let mut guard = state.dev.lock().map_err(|_| "The preview state is unavailable.".to_string())?;
+    let server = guard.as_mut().ok_or("Nothing is running.")?;
+    let input = server.input.as_mut().ok_or("This server does not take keys.")?;
+    input
+        .write_all(format!("{text}\n").as_bytes())
+        .and_then(|_| input.flush())
+        .map_err(|error| format!("The server did not take the input: {error}"))
 }
 
 pub fn stop_dev(state: &WebState) {
@@ -1018,7 +1203,7 @@ pub fn start_dev(
         // Dev servers that open a browser tab on start would leave the IDE.
         .env("BROWSER", "none")
         .env("FORCE_COLOR", "0")
-        .stdin(Stdio::null())
+        .stdin(if takes_keys(custom) { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1050,6 +1235,7 @@ pub fn start_dev(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let input = child.stdin.take();
 
     if let Some(note) = note {
         log(app, &state.logs, note);
@@ -1067,6 +1253,7 @@ pub fn start_dev(
             .map_err(|_| "The preview state is unavailable.".to_string())?;
         *guard = Some(DevServer {
             child,
+            input,
             dir: dir.to_string(),
             script: label.clone(),
             url: None,
@@ -1348,6 +1535,17 @@ fn offer_url(
                     set_blocked(&app, &dev, pid, url);
                     return;
                 }
+                // An API answers its root with JSON; its interactive docs
+                // (FastAPI's /docs) are the page worth showing.
+                Probe::NotPage(what) if is_origin(&url) => {
+                    let docs = format!("{}/docs", url.trim_end_matches('/'));
+                    if probe(&docs) == Probe::Page {
+                        log(&app, &logs, format!("[{url} answered with {what}; previewing the API docs at {docs}]"));
+                        set_url(&app, &dev, pid, docs);
+                        return;
+                    }
+                    last = Probe::NotPage(what);
+                }
                 other => last = other,
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -1357,6 +1555,13 @@ fn offer_url(
             log(&app, &logs, format!("[{url} answered with {what}, not a web page, so it is not previewed]"));
         }
     });
+}
+
+/// `http://host:port` or `http://host:port/`: an address with no path.
+fn is_origin(url: &str) -> bool {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .is_some_and(|rest| !rest.trim_end_matches('/').contains('/'))
 }
 
 /// Records a page that cannot be shown in the panel, for "Open in browser".
@@ -1683,6 +1888,87 @@ mod tests {
     }
 
     #[test]
+    fn detects_flutter_and_expo_apps() {
+        let root = std::env::temp_dir().join(format!("nexium-web-mobile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("flutter_app/lib")).unwrap();
+        fs::create_dir_all(root.join("expo-app")).unwrap();
+        fs::create_dir_all(root.join("dart_cli")).unwrap();
+
+        fs::write(
+            root.join("flutter_app/pubspec.yaml"),
+            "name: flutter_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+        // A plain Dart package is not a Flutter app.
+        fs::write(root.join("dart_cli/pubspec.yaml"), "name: dart_cli\ndependencies:\n  args: ^2.0.0\n").unwrap();
+        fs::write(
+            root.join("expo-app/package.json"),
+            r#"{"name":"expo-app","scripts":{"start":"expo start","android":"expo start --android","web":"expo start --web"},"dependencies":{"expo":"~54.0.0","react":"19.1.0","react-native":"0.81.0"}}"#,
+        )
+        .unwrap();
+
+        let info = detect(&root);
+        let flutter = info.apps.iter().find(|app| app.framework == "Flutter").expect("flutter app");
+        assert_eq!(flutter.name, "flutter_app");
+        assert_eq!(flutter.dir, "flutter_app");
+        assert_eq!(flutter.fallback.as_deref(), Some(FLUTTER_WEB));
+        assert!(!flutter.web_support, "no web/ folder yet");
+        assert!(!flutter.installed);
+        assert!(!info.apps.iter().any(|app| app.name == "dart_cli"));
+
+        let expo = info.apps.iter().find(|app| app.framework == "Expo").expect("expo app");
+        assert_eq!(expo.preferred.as_deref(), Some("web"), "the web script comes first");
+        assert!(!expo.web_support, "react-native-web is missing");
+
+        fs::create_dir_all(root.join("flutter_app/web")).unwrap();
+        fs::write(root.join("flutter_app/web/index.html"), "<html></html>").unwrap();
+        let info = detect(&root);
+        assert!(info.apps.iter().any(|app| app.framework == "Flutter" && app.web_support));
+
+        assert_eq!(port_flag("flutter run -d web-server --web-port 8642"), Some(8642));
+        assert_eq!(port_flag("flutter run -d web-server --web-port=9000"), Some(9000));
+        assert!(takes_keys(Some("flutter run -d web-server")));
+        assert!(!takes_keys(Some("flutter build web")));
+        assert!(!takes_keys(None));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detects_python_web_apps() {
+        let root = std::env::temp_dir().join(format!("nexium-web-python-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["flask_site/templates", "api", "blog", "scripts"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("flask_site/app.py"), "from flask import Flask\napp = Flask(__name__)\n").unwrap();
+        fs::write(root.join("flask_site/requirements.txt"), "flask>=3.0\n").unwrap();
+        fs::write(root.join("flask_site/templates/index.html"), "<h1>{{ title }}</h1>").unwrap();
+        fs::write(root.join("api/main.py"), "from fastapi import FastAPI\n\nservice = FastAPI(title=\"x\")\n").unwrap();
+        fs::write(root.join("blog/manage.py"), "import django\n").unwrap();
+        fs::write(root.join("scripts/main.py"), "print('hi')\n").unwrap();
+
+        let info = detect(&root);
+        let python = python_for(&root);
+        let flask = info.apps.iter().find(|app| app.framework == "Flask").expect("flask");
+        assert_eq!(
+            flask.fallback.as_deref(),
+            Some(format!("{python} -m flask --app app run --debug --host 127.0.0.1 --port 5000").as_str())
+        );
+        assert!(!flask.installed, "requirements.txt without a virtual environment");
+        let fastapi = info.apps.iter().find(|app| app.framework == "FastAPI").expect("fastapi");
+        assert!(fastapi.fallback.as_deref().unwrap().contains("-m uvicorn main:service --reload"));
+        let django = info.apps.iter().find(|app| app.framework == "Django").expect("django");
+        assert!(django.fallback.as_deref().unwrap().ends_with("manage.py runserver 127.0.0.1:8000"));
+        assert!(!info.apps.iter().any(|app| app.dir == "scripts"), "a plain script is not a web app");
+
+        assert_eq!(expected_port(&root, "python manage.py runserver 127.0.0.1:8001"), Some(8001));
+        assert_eq!(expected_port(&root, "python manage.py runserver"), Some(8000));
+        assert_eq!(expected_port(&root, "python -m flask --app app run --port 5050"), Some(5050));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn opens_only_local_addresses_externally() {
         for url in [
             "https://example.com/",
@@ -1995,6 +2281,127 @@ mod tests {
 
     /// Starts this repository's own `dev` script (Vite with strictPort on
     /// 5173) while something else holds 5173, as a second copy would.
+    #[test]
+    #[ignore = "needs Flutter on PATH and NEXIUM_FLUTTER_APP pointing at a Flutter app with web support"]
+    fn serves_flutter_on_the_web_and_hot_reloads() {
+        let root = PathBuf::from(std::env::var("NEXIUM_FLUTTER_APP").expect("NEXIUM_FLUTTER_APP"));
+        let events = Recorder(Arc::new(Mutex::new(Vec::new())));
+        let state = WebState::default();
+        let line = "flutter run -d web-server --web-hostname 127.0.0.1 --web-port 8653";
+
+        // Stops flutter run even when an assertion fails.
+        struct StopOnDrop<'a>(&'a WebState);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                stop_dev(self.0);
+            }
+        }
+        let _stop = StopOnDrop(&state);
+
+        start_dev(&events, &state, &root, "", "", Some(line), None).unwrap();
+        let logs = |state: &WebState| status(state).logs.join("\n");
+        let wait_for = |needle: &str, seconds: u64| {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(seconds) {
+                if logs(&state).contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            false
+        };
+
+        assert!(wait_for("is being served at http://127.0.0.1:8653", 240), "{}", logs(&state));
+        assert!(wait_for("q Quit", 30), "flutter run lists its keys once it takes them");
+        let url = status(&state).dev.and_then(|dev| dev.url).unwrap_or_default();
+        assert!(url.starts_with("http://127.0.0.1:8653"), "{url}");
+
+        send_input(&state, "r").unwrap();
+        assert!(wait_for("Performing hot reload", 30), "{}", logs(&state));
+        send_input(&state, "R").unwrap();
+        assert!(wait_for("Performing hot restart", 60), "{}", logs(&state));
+
+        stop_dev(&state);
+        assert!(send_input(&state, "r").is_err(), "nothing runs after Stop");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(TcpStream::connect(("127.0.0.1", 8653)).is_err(), "Stop ends flutter run and its server");
+    }
+
+    #[test]
+    #[ignore = "needs Python with Flask, FastAPI and uvicorn installed"]
+    fn serves_python_templates_with_their_own_servers() {
+        use crate::templates::{plan, write_files, Choice};
+
+        let parent = std::env::temp_dir().join(format!("nexium-python-serve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+
+        let get = |url: &str| -> String {
+            let address = url.trim_start_matches("http://").trim_end_matches('/');
+            let (host_port, path) = address.split_once('/').map(|(a, b)| (a, format!("/{b}"))).unwrap_or((address, "/".into()));
+            let mut stream = TcpStream::connect(host_port).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            write!(stream, "GET {path} HTTP/1.0\r\nHost: {host_port}\r\n\r\n").unwrap();
+            let mut body = String::new();
+            let _ = stream.read_to_string(&mut body);
+            body
+        };
+
+        for (template, name, page, expect) in [
+            ("flask", "Flask Site", "", "<h1>Flask Site</h1>"),
+            ("fastapi", "Fast Api", "", "swagger-ui"),
+        ] {
+            let choice = Choice {
+                template: template.into(),
+                parent: parent.to_string_lossy().into(),
+                name: name.into(),
+                typescript: false,
+                install: false,
+                git: false,
+            };
+            let project = plan(&choice).unwrap();
+            write_files(&project).unwrap();
+
+            let info = detect(&project.folder);
+            let app = info.apps.first().unwrap_or_else(|| panic!("{template} not detected"));
+            // A free port, so a server already on 5000 or 8000 does not matter.
+            let free = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+            let command = app
+                .fallback
+                .clone()
+                .unwrap()
+                .replace("--port 5000", &format!("--port {free}"))
+                .replace("--port 8000", &format!("--port {free}"));
+            let state = WebState::default();
+            let events = Recorder(Arc::new(Mutex::new(Vec::new())));
+            struct StopOnDrop<'a>(&'a WebState);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    stop_dev(self.0);
+                }
+            }
+            let _stop = StopOnDrop(&state);
+            start_dev(&events, &state, &project.folder, "", "", Some(&command), None).unwrap();
+
+            let started = std::time::Instant::now();
+            let mut url = None;
+            while started.elapsed() < Duration::from_secs(60) && url.is_none() {
+                url = status(&state).dev.and_then(|dev| dev.url);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            let url = url.unwrap_or_else(|| panic!("{template}: no address\n{}", status(&state).logs.join("\n")));
+            // FastAPI's root is JSON, so the preview shows its /docs page.
+            if template == "fastapi" {
+                assert!(url.ends_with("/docs"), "{url}");
+            }
+            let body = get(&format!("{}/{page}", url.trim_end_matches('/')));
+            stop_dev(&state);
+            assert!(body.contains(expect), "{template} at {url}: {body}");
+            assert!(!body.contains("{{"), "{template}: the template was rendered");
+        }
+        let _ = fs::remove_dir_all(&parent);
+    }
+
     #[test]
     #[ignore = "needs this repo's node_modules and its package manager on PATH"]
     fn previews_this_repo_with_its_port_taken() {
