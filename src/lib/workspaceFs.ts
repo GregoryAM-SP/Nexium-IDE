@@ -101,6 +101,61 @@ export async function newProject(): Promise<WorkspaceSnapshot | null> {
   }
 }
 
+/**
+ * The folder open when the app last closed, so a restart (an update installs
+ * on close) comes back to it instead of the empty "open a folder" screen.
+ */
+const LAST_PROJECT_KEY = "nexium.lastProject";
+
+export function rememberProject(root: string) {
+  if (!isTauri() || !root) {
+    return;
+  }
+
+  try {
+    localStorage.setItem(LAST_PROJECT_KEY, root);
+  } catch {
+    // Unavailable storage just means the next start opens on the empty screen.
+  }
+}
+
+export function forgetProject() {
+  try {
+    localStorage.removeItem(LAST_PROJECT_KEY);
+  } catch {
+    // Nothing stored, nothing to forget.
+  }
+}
+
+function lastProject(): string | null {
+  try {
+    return localStorage.getItem(LAST_PROJECT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Opens the folder that was open when the app last closed, or null when there
+ * was none. A folder that was moved or deleted since is forgotten, and the
+ * error says which one it was.
+ */
+export async function reopenLastProject(): Promise<WorkspaceSnapshot | null> {
+  const path = isTauri() ? lastProject() : null;
+
+  if (!path) {
+    return null;
+  }
+
+  try {
+    return toSnapshot(await invoke<RawWorkspace>("open_workspace", { path }));
+  } catch (cause) {
+    forgetProject();
+    const reason = toError(cause, "it is no longer there").message;
+    throw new Error(`Your last project could not be reopened (${path}): ${reason}`);
+  }
+}
+
 /** Re-lists an open folder so files created on disk show up in the explorer. */
 export async function refreshWorkspace(
   root: string,

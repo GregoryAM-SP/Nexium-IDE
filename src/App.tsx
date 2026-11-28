@@ -173,6 +173,8 @@ import {
   readFile,
   readWorkspaceSources,
   refreshWorkspace,
+  rememberProject,
+  reopenLastProject,
   renameEntry,
   writeFile,
 } from "./lib/workspaceFs";
@@ -527,6 +529,7 @@ export default function App() {
   const applyWorkspace = useCallback(async (snapshot: WorkspaceSnapshot) => {
     setTree(snapshot.tree);
     setRootPath(snapshot.root);
+    rememberProject(snapshot.root);
     setWorkspaceKey((current) => current + 1);
     setContents({});
     setDirty({});
@@ -2039,6 +2042,29 @@ export default function App() {
   contentsRef.current = contents;
   const rootRef = useRef("");
   rootRef.current = rootPath;
+
+  // Start where the user left off: the project open when the app last closed,
+  // including the restart that installs an update. A folder opened in the
+  // meantime wins.
+  useEffect(() => {
+    let cancelled = false;
+
+    void reopenLastProject()
+      .then((snapshot) => {
+        if (snapshot && !cancelled && !rootRef.current) {
+          return applyWorkspace(snapshot);
+        }
+      })
+      .catch((cause) => {
+        if (!cancelled) {
+          setNotice(toError(cause, "Your last project could not be reopened.").message);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyWorkspace]);
 
   useEffect(() => {
     if (!isTauri()) {

@@ -357,7 +357,7 @@ pub fn write_files(plan: &Plan) -> Result<(), String> {
 /// Gradle to run `gradle wrapper` with: the one on PATH, else the newest
 /// distribution the wrapper of another project already downloaded
 /// (`~/.gradle/wrapper/dists`), so no Gradle install is needed.
-fn find_gradle() -> Option<(String, Option<String>)> {
+pub fn find_gradle() -> Option<(String, Option<String>)> {
     let dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();

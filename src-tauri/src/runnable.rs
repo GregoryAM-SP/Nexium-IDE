@@ -231,10 +231,12 @@ fn gradle(dir: &Path) -> Option<Runnable> {
     if !build_files.iter().any(|file| dir.join(file).is_file()) {
         return None;
     }
+    // The wrapper, else Gradle on PATH, else a distribution another
+    // project's wrapper already downloaded.
     let gradle = if dir.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" }).is_file() {
-        if cfg!(windows) { "gradlew.bat" } else { "./gradlew" }
+        if cfg!(windows) { "gradlew.bat".to_string() } else { "./gradlew".to_string() }
     } else {
-        "gradle"
+        crate::templates::find_gradle().map(|(gradle, _)| gradle).unwrap_or_else(|| "gradle".into())
     };
     // The application or Android plugin, in the root build or a module (app/).
     let scripts: Vec<String> = ["build.gradle.kts", "build.gradle", "app/build.gradle.kts", "app/build.gradle"]

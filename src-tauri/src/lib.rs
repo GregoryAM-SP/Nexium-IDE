@@ -385,7 +385,15 @@ async fn create_project(
 
         if planned.template.ends_with("-gradle") {
             emit("step", "Adding the Gradle wrapper");
-            templates::add_gradle_wrapper(&planned.folder, &cancel, &mut |text| emit("output", text)).await?;
+            // The project is complete without the wrapper; a failure here is a note, not an error.
+            if let Err(problem) =
+                templates::add_gradle_wrapper(&planned.folder, &cancel, &mut |text| emit("output", text)).await
+            {
+                emit(
+                    "output",
+                    &format!("\n{problem} The project is ready without it: the Run and Gradle panels use the Gradle that was found, and `gradle wrapper` adds it later.\n"),
+                );
+            }
         }
 
         {
