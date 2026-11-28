@@ -14,6 +14,7 @@ use crate::llm;
 use crate::llm::{ChatMessage, Endpoint};
 use crate::run::{self, RunContext};
 use crate::store::{self, ClaimResult};
+use crate::text_calls;
 use crate::workspace;
 
 const MAX_STEPS: usize = 30;
@@ -26,6 +27,9 @@ const MAX_TURNS_WITHOUT_PROGRESS: usize = 12;
 const MAX_CONTINUATIONS: usize = 4;
 /// Times the model is sent back to work when it stops with objectives open.
 const MAX_OBJECTIVE_NUDGES: usize = 2;
+/// Times in a row the model is sent back when it stops before acting: only
+/// thinking, or "Let me create the file…" with no tool call.
+const MAX_STALL_NUDGES: usize = 3;
 /// Retries of a request that failed before the model sent anything.
 const MAX_RETRIES: usize = 2;
 /// How long a run keeps waiting out a provider's rate limit (or overload)
@@ -35,6 +39,9 @@ const RATE_LIMIT_PATIENCE: Duration = Duration::from_secs(15 * 60);
 const RATE_LIMIT_BACKOFF: [u64; 6] = [5, 10, 20, 30, 45, 60];
 /// Reply tokens asked for per turn.
 const REPLY_TOKENS: u64 = 4096;
+/// The most room a reply is given after one was cut off by the limit: a
+/// whole file written in one tool call needs far more than REPLY_TOKENS.
+const MAX_REPLY_TOKENS: u64 = 16_384;
 /// Longest objectives list the agent may keep for one task.
 const MAX_OBJECTIVES: usize = 12;
 const MAX_OBJECTIVE_CHARS: usize = 140;
@@ -262,7 +269,11 @@ fn tool_schema() -> Value {
                         },
                         "content": {
                             "type": "string",
-                            "description": "The complete new contents of the file."
+                            "description": "The complete new contents of the file (or, with append, the part to add to its end)."
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": "Add content to the end of the file instead of replacing it. Use it to write a large file in parts of about 150 lines: the first part without append, the rest with append."
                         }
                     },
                     "required": ["path", "content"]
@@ -365,6 +376,37 @@ fn tool_schema() -> Value {
     ])
 }
 
+/// Cleans what models get wrong in paths: surrounding quotes or backticks
+/// (`"\"\""`, `'src'`), `.` or `./` for the folder itself, a leading `./`.
+fn clean_path(path: &str) -> String {
+    let mut path = path.trim();
+    loop {
+        let stripped = ['"', '\'', '`'].iter().find_map(|quote| {
+            path.strip_prefix(*quote).and_then(|rest| rest.strip_suffix(*quote))
+        });
+        match stripped {
+            Some(inner) => path = inner.trim(),
+            None => break,
+        }
+    }
+    let path = path.trim_start_matches("./");
+    match path {
+        "." | "/" | "\\" => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// The call's arguments with its paths cleaned.
+fn normalize_args(mut args: Value) -> Value {
+    if let Some(object) = args.as_object_mut() {
+        if let Some(Value::String(path)) = object.get("path") {
+            let cleaned = clean_path(path);
+            object.insert("path".into(), Value::String(cleaned));
+        }
+    }
+    args
+}
+
 fn argument<'a>(args: &'a Value, key: &str) -> &'a str {
     args.get(key).and_then(|value| value.as_str()).unwrap_or("")
 }
@@ -380,6 +422,9 @@ fn describe_call(name: &str, args: &Value) -> String {
             }
         }
         "read_file" => format!("Reading {}", argument(args, "path")),
+        "write_file" if args.get("append").and_then(Value::as_bool).unwrap_or(false) => {
+            format!("Adding to {}", argument(args, "path"))
+        }
         "write_file" => format!("Writing {}", argument(args, "path")),
         "edit_file" => format!("Editing {}", argument(args, "path")),
         "search_text" => format!("Searching for \"{}\"", argument(args, "query")),
@@ -603,6 +648,9 @@ fn prepare_change(root: &Path, name: &str, args: &Value) -> Result<Change, Strin
     };
 
     let after = match name {
+        "write_file" if args.get("append").and_then(Value::as_bool).unwrap_or(false) => {
+            format!("{}{}", before.as_deref().unwrap_or(""), argument(args, "content"))
+        }
         "write_file" => argument(args, "content").to_string(),
         "edit_file" => {
             let Some(current) = before.as_deref() else {
@@ -889,7 +937,7 @@ fn is_code_file(path: &str) -> bool {
     ) && !lower.ends_with("license")
 }
 
-const VERIFY_PROMPT: &str = "Before you finish: you changed code but have not checked it yet. Run the project's relevant checks with run_command (its tests, type-check, build or lint, whichever it has) and fix anything that fails. If the project has no checks you can run, re-read the parts you changed once and fix any mistake. Then give your final answer, including how you verified the change.";
+const VERIFY_PROMPT: &str = "Before you finish: you changed code but have not checked it yet. If the project already has checks (tests, type-check, build or lint in package.json scripts, Cargo.toml, a Makefile and so on), run the relevant ones with run_command and fix anything that fails. Use only checks the project already has: do not install tools, download packages or write new files or scripts just to check your work. If it has none (a plain HTML/CSS site, for example), re-read the parts you changed once, fix any mistake, and finish. Then give your final answer, including how you verified the change.";
 
 fn policy(root: &Path, others: &str) -> String {
     let listing = workspace::list(root, "", 200).unwrap_or_else(|_| "(unavailable)".into());
@@ -912,8 +960,10 @@ fn policy(root: &Path, others: &str) -> String {
          3. Change: make focused edits that fit the codebase. To change an existing file use edit_file with an exact, unique old_string; use write_file only for new files or full rewrites, and only after reading the file. \
          Don't reformat, rename or refactor code you were not asked to touch, and keep behaviour you were not asked to change.\n\
          4. Verify: after changing code, run the project's own checks with run_command (tests, type-check, build or lint, whichever it has: look at package.json scripts, Cargo.toml, Makefile, pyproject.toml and so on). \
-         Prefer quick, targeted commands, and fix what fails. Commands run on {os} through {shell}, so use that shell's syntax; run_command already has a time limit.\n\
+         Prefer quick, targeted commands, and fix what fails. Use the checks the project already has; don't install tools or create files just to check your work. Commands run on {os} through {shell}, so use that shell's syntax; run_command already has a time limit.\n\
          5. Finish: carry the task through to the end in this reply. Never stop part-way to ask whether to continue, and do not end with a plan of what you will do next; do it. \
+         When you say you will do something (\"Let me create…\", \"Now I'll edit…\"), make that tool call in the same reply: a reply without a tool call ends your turn. \
+         Create and change files with write_file and edit_file; never paste a file's code into your answer instead of writing it. \
          Then summarise what you changed (with file paths), how you verified it, and anything left open.\n\n\
          The user reviews each edit and command and may reject it. If something is rejected, do not repeat it; take a different approach or ask what they want.\n\
          For questions, answer from the code you read and cite `path:line`. When the message already contains the code to look at, answer directly instead of exploring the folder first.\n\
@@ -1097,6 +1147,66 @@ impl Failure {
     }
 }
 
+/// Reports what the run is doing when the timeline has nothing new to show:
+/// waiting for the first token, or receiving a tool call (which can take a
+/// minute for a whole file). The UI shows it as a live status line.
+fn emit_activity(app: &RunContext, phase: &str, call: Option<&ToolCall>) {
+    let mut payload = json!({ "phase": phase });
+    if let Some(call) = call {
+        payload["tool"] = json!(call.name);
+        payload["chars"] = json!(call.arguments.len());
+        if let Some(path) = partial_path(&call.arguments) {
+            payload["path"] = json!(clean_path(&path));
+        }
+    }
+    let _ = app.emit("agent-activity", payload);
+}
+
+/// The `path` argument of a tool call that is still arriving, once its value
+/// is complete.
+fn partial_path(arguments: &str) -> Option<String> {
+    let key = arguments.find("\"path\"")?;
+    let rest = &arguments[key + "\"path\"".len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let mut value = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(value),
+            '\\' => match chars.next()? {
+                'n' => value.push('\n'),
+                't' => value.push('\t'),
+                other => value.push(other),
+            },
+            other => value.push(other),
+        }
+    }
+    None
+}
+
+/// Limits tool-call progress to a few updates a second.
+#[derive(Default)]
+struct CallProgress {
+    name: String,
+    chars: usize,
+    at: Option<std::time::Instant>,
+}
+
+impl CallProgress {
+    fn due(&mut self, call: &ToolCall) -> bool {
+        let now = std::time::Instant::now();
+        let due = call.name != self.name
+            || self.at.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
+                && call.arguments.len() != self.chars;
+        if due {
+            self.name = call.name.clone();
+            self.chars = call.arguments.len();
+            self.at = Some(now);
+        }
+        due
+    }
+}
+
 async fn stream_turn(
     client: &reqwest::Client,
     endpoint: &Endpoint,
@@ -1104,6 +1214,7 @@ async fn stream_turn(
     app: &RunContext,
     cancel: &AtomicBool,
 ) -> Result<StreamedTurn, Failure> {
+    emit_activity(app, "waiting", None);
     let response = endpoint
         .post(client, "chat/completions")
         .header("Accept", "text/event-stream")
@@ -1128,6 +1239,8 @@ async fn stream_turn(
     let mut buffer = String::new();
     let mut turn = StreamedTurn::default();
     let mut calls: Vec<Option<ToolCall>> = Vec::new();
+    let mut progress = CallProgress::default();
+    let mut composing = false;
     let mut idle = Box::pin(tokio::time::sleep(CANCEL_POLL));
 
     loop {
@@ -1168,6 +1281,16 @@ async fn stream_turn(
         while let Some(position) = buffer.find('\n') {
             let line: String = buffer.drain(..=position).collect();
 
+            // Comment lines keep the connection open while the provider
+            // holds back a tool call it is still writing.
+            if line.starts_with(':') && calls.is_empty() && !(turn.content.is_empty() && turn.reasoning.is_empty()) {
+                if !composing {
+                    composing = true;
+                    emit_activity(app, "composing", None);
+                }
+                continue;
+            }
+
             let Some(value) = parse_sse_line(&line) else {
                 continue;
             };
@@ -1199,7 +1322,16 @@ async fn stream_turn(
             };
 
             for payload in apply_delta(delta, &mut turn, &mut calls) {
+                composing = false;
                 let _ = app.emit("agent-delta", payload);
+            }
+
+            if delta.get("tool_calls").is_some() {
+                if let Some(call) = calls.iter().flatten().last() {
+                    if !call.name.is_empty() && progress.due(call) {
+                        emit_activity(app, "calling", Some(call));
+                    }
+                }
             }
         }
     }
@@ -1274,6 +1406,7 @@ async fn request_turn(
         }
     }
 
+    emit_activity(app, "waiting", None);
     let value = send(client, endpoint, body).await?;
     let choice = value.get("choices").and_then(|choices| choices.get(0));
     let mut turn = turn_from_message(
@@ -1494,6 +1627,49 @@ async fn wait_unless_cancelled(seconds: u64, cancel: &AtomicBool) -> bool {
     !cancel.load(Ordering::SeqCst)
 }
 
+/// Turns tool calls written into the reply (or, failing that, its thinking)
+/// into real calls, and takes their markup out of the text.
+fn recover_text_calls(turn: &mut StreamedTurn, tools: &Value) {
+    let names: Vec<&str> = tools
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (calls, rest) = text_calls::recover(&turn.content, &names);
+    if !calls.is_empty() {
+        turn.content = rest;
+    } else {
+        let (calls, rest) = text_calls::recover(&turn.reasoning, &names);
+        if calls.is_empty() {
+            return;
+        }
+        turn.reasoning = rest;
+        set_calls(turn, calls);
+        return;
+    }
+    set_calls(turn, calls);
+
+    fn set_calls(turn: &mut StreamedTurn, calls: Vec<text_calls::TextCall>) {
+        turn.tool_calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| ToolCall {
+                id: format!("text_call_{index}"),
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect();
+        // The calls are whole; a cut-off reply is not continued past them.
+        if turn.finish_reason == "length" {
+            turn.finish_reason = "tool_calls".into();
+        }
+    }
+}
+
 fn valid_arguments(arguments: &str) -> bool {
     arguments.trim().is_empty() || serde_json::from_str::<Value>(arguments).is_ok()
 }
@@ -1501,7 +1677,10 @@ fn valid_arguments(arguments: &str) -> bool {
 /// What the model is told when its reply was cut off, so it picks up where
 /// it stopped instead of starting over.
 fn continuation_prompt(turn: &StreamedTurn) -> &'static str {
-    if turn.content.trim().is_empty() {
+    if lost_tool_call(turn) {
+        "Your last reply hit the output length limit while you were writing a tool call, so the call was lost and nothing was saved. \
+         Write large files in parts: call write_file with the first part (about 150 lines), then call write_file with append: true for each further part. Keep each call short."
+    } else if turn.content.trim().is_empty() {
         "You ran out of room before answering (the thinking used it all). Continue now: make the next tool call or write the answer, and keep any further thinking brief."
     } else if turn.finish_reason == "interrupted" {
         "The connection dropped while you were replying. Continue exactly where your last message stopped, without repeating what you already wrote."
@@ -1510,8 +1689,158 @@ fn continuation_prompt(turn: &StreamedTurn) -> &'static str {
     }
 }
 
+/// The reply hit the length limit with little visible output: the tokens went
+/// into a tool call that the provider dropped because it was incomplete
+/// (NVIDIA NIM, for one, sends a tool call only once it is whole).
+fn lost_tool_call(turn: &StreamedTurn) -> bool {
+    turn.finish_reason == "length"
+        && turn.tool_calls.is_empty()
+        && turn.content.trim().is_empty()
+        // Thinking that filled the limit would be thousands of characters.
+        && turn.reasoning.len() < 2_000
+}
+
 fn open_objectives(objectives: &[Objective]) -> Vec<&Objective> {
     objectives.iter().filter(|o| o.status != "done").collect()
+}
+
+/// Why a reply without tool calls looks like the model stopped before acting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stall {
+    /// Only thinking came back: no answer and no tool call.
+    ThinkingOnly,
+    /// The reply ends by announcing a step ("Let me create the file…").
+    Announced,
+    /// The user asked for a change, nothing was written, and the reply
+    /// holds the code instead.
+    CodeInReply,
+}
+
+impl Stall {
+    fn prompt(self) -> &'static str {
+        match self {
+            Stall::ThinkingOnly => "Your last reply held only thinking: no tool call and no answer, so nothing happened. Act on your plan now and make the next tool call (for example list_files, read_file, write_file or edit_file). If the task is already finished, write the final answer instead.",
+            Stall::Announced => "You said what you would do next but did not call a tool, so nothing happened and the user is still waiting. Do it now: make that tool call (write_file to create a file, edit_file to change one, run_command to run something). Do not describe the step again or ask for permission; the user already asked for this. If the work is in fact finished, write the final answer.",
+            Stall::CodeInReply => "You put the code in your reply, but the user asked for changes to the project and no file has been written. Write it into the project now with write_file (new files) or edit_file (existing ones). Then finish with a short summary of what you changed instead of the full code.",
+        }
+    }
+
+    fn notice(self) -> &'static str {
+        match self {
+            Stall::ThinkingOnly => "The model stopped after thinking; continuing",
+            Stall::Announced => "The model described its next step without taking it; continuing",
+            Stall::CodeInReply => "The model showed the code instead of writing it; writing the files",
+        }
+    }
+}
+
+/// Phrases that end a reply politely without promising a step.
+const NOT_A_STEP: [&str; 14] = [
+    "let me know",
+    "if you'd like",
+    "if you would like",
+    "would you like",
+    "do you want",
+    "want me to",
+    "should i",
+    "shall i",
+    "i'll wait",
+    "i will wait",
+    "i'll be happy",
+    "i'd be happy",
+    "i'm happy to",
+    "feel free",
+];
+
+/// Openings of a sentence that promise the next step.
+const STEP_OPENINGS: [&str; 16] = [
+    "let me ",
+    "let's ",
+    "i'll ",
+    "i will ",
+    "i'm going to ",
+    "i am going to ",
+    "i'm now going to ",
+    "now i'll ",
+    "now i will ",
+    "now let me ",
+    "next, i'll ",
+    "next i'll ",
+    "next, let me ",
+    "first, i'll ",
+    "first, let me ",
+    "i need to ",
+];
+
+/// Whether the reply's last paragraph announces a step instead of ending.
+fn announces_step(content: &str) -> bool {
+    let last = content
+        .trim()
+        .rsplit("\n\n")
+        .find(|paragraph| !paragraph.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if last.is_empty() || last.ends_with('?') || last.contains("```") {
+        return false;
+    }
+
+    let lower = last.to_lowercase().replace('\u{2019}', "'");
+    if NOT_A_STEP.iter().any(|phrase| lower.contains(phrase)) {
+        return false;
+    }
+    if lower.ends_with(':') || lower.ends_with("...") || lower.ends_with('\u{2026}') {
+        return true;
+    }
+
+    // Any sentence of the last paragraph that opens with a promise.
+    lower
+        .split(['.', '!', '\n'])
+        .map(|sentence| sentence.trim_start_matches(|c: char| !c.is_alphanumeric()))
+        .any(|sentence| STEP_OPENINGS.iter().any(|opening| sentence.starts_with(opening)))
+}
+
+/// Lines of the longest fenced code block in the reply.
+fn longest_code_block(content: &str) -> usize {
+    let mut longest = 0;
+    let mut current: Option<usize> = None;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            current = match current {
+                Some(lines) => {
+                    longest = longest.max(lines);
+                    None
+                }
+                None => Some(0),
+            };
+        } else if let Some(lines) = current.as_mut() {
+            *lines += 1;
+        }
+    }
+    longest.max(current.unwrap_or(0))
+}
+
+/// Whether the user's message asks for something to be made or changed.
+fn asks_for_change(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    [
+        "create", "make ", "build", "add ", "write", "implement", "fix", "update", "change", "edit",
+        "refactor", "generate", "set up", "setup", "scaffold", "rename", "remove", "delete", "replace",
+        "convert", "move ", "improve", "redesign", "style",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb))
+}
+
+/// Why this reply (with no tool calls) should not end the run, if it should not.
+fn stall_of(content: &str, reasoning: &str, request: &str, changed_files: bool) -> Option<Stall> {
+    let content = content.trim();
+    if content.is_empty() {
+        return (!reasoning.trim().is_empty()).then_some(Stall::ThinkingOnly);
+    }
+    if !changed_files && asks_for_change(request) && longest_code_block(content) >= 12 {
+        return Some(Stall::CodeInReply);
+    }
+    announces_step(content).then_some(Stall::Announced)
 }
 
 /// Sent when the model stops while objectives are still open.
@@ -1635,6 +1964,13 @@ pub async fn run(
     }
 
     let client = llm::client()?;
+    // What the user asked for in this run.
+    let request = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
     let mut conversation: Vec<Value> = Vec::new();
     let mut tools_enabled = root.is_some();
     let mut streaming = true;
@@ -1689,6 +2025,14 @@ pub async fn run(
     // Code changed since the last command ran, and whether a check was asked for.
     let mut unchecked_code = false;
     let mut verify_asked = false;
+    // Stops before acting, sent back in a row; and whether any file changed.
+    let mut stall_nudges = 0usize;
+    // Room for each reply; raised when a tool call is lost to the limit, and
+    // lowered back if the provider refuses that much.
+    let mut reply_tokens = REPLY_TOKENS;
+    let mut reply_tokens_capped = false;
+    let mut code_nudged = false;
+    let mut changed_files = false;
 
     if app.store.is_none() {
         if let Some(list) = prepared.as_array_mut() {
@@ -1710,7 +2054,7 @@ pub async fn run(
         let mut body = json!({
             "model": model,
             "messages": conversation,
-            "max_tokens": REPLY_TOKENS,
+            "max_tokens": reply_tokens,
         });
 
         if tools_enabled {
@@ -1772,8 +2116,53 @@ pub async fn run(
                 .await
                 .map_err(Failure::message)?
             }
+            Err(Failure::Http { status: 400 | 422, .. }) if reply_tokens > REPLY_TOKENS => {
+                reply_tokens = REPLY_TOKENS;
+                reply_tokens_capped = true;
+                let note = make_step(
+                    next_step_id,
+                    "notice",
+                    format!("{} refused longer replies; asking for the file in parts", endpoint.name),
+                    None,
+                    "done",
+                );
+                next_step_id += 1;
+                let _ = app.emit("agent-step", note.clone());
+                steps.push(note);
+                conversation.push(json!({
+                    "role": "user",
+                    "content": "Your previous reply was too long for one tool call. Write large files in parts: call write_file with the first part (about 150 lines), then call write_file with append: true for each further part.",
+                }));
+                continue;
+            }
             Err(failure) => return Err(failure.message()),
         };
+        let mut turn = turn;
+
+        // A tool call lost to the length limit: try the same turn again with
+        // more room before asking the model to split its work.
+        if lost_tool_call(&turn) && !reply_tokens_capped && reply_tokens < MAX_REPLY_TOKENS {
+            reply_tokens = (reply_tokens * 2).min(MAX_REPLY_TOKENS);
+            let note = make_step(
+                next_step_id,
+                "notice",
+                format!(
+                    "The reply hit the length limit before its tool call was complete; trying again with room for {} tokens",
+                    reply_tokens
+                ),
+                None,
+                "done",
+            );
+            next_step_id += 1;
+            let _ = app.emit("agent-step", note.clone());
+            steps.push(note);
+            continue;
+        }
+
+        // A call the server did not recognise arrives as text; run it anyway.
+        if tools_enabled && turn.tool_calls.is_empty() {
+            recover_text_calls(&mut turn, &prepared);
+        }
 
         let content = turn.content.trim().to_string();
 
@@ -1786,6 +2175,39 @@ pub async fn run(
                 reasoning_so_far.push_str(&turn.reasoning);
                 conversation.push(json!({ "role": "assistant", "content": turn.content }));
                 conversation.push(json!({ "role": "user", "content": continuation_prompt(&turn) }));
+                continue;
+            }
+
+            // Stopped before acting: send it back to take the step.
+            let stall = if tools_enabled {
+                stall_of(
+                    &format!("{answer_so_far}{}", turn.content),
+                    &turn.reasoning,
+                    &request,
+                    changed_files,
+                )
+                .filter(|stall| match stall {
+                    Stall::CodeInReply => !code_nudged,
+                    _ => stall_nudges < MAX_STALL_NUDGES,
+                })
+            } else {
+                None
+            };
+            if let Some(stall) = stall {
+                if stall == Stall::CodeInReply {
+                    code_nudged = true;
+                } else {
+                    stall_nudges += 1;
+                }
+                answer_so_far.clear();
+                reasoning_so_far.clear();
+                conversation.push(json!({ "role": "assistant", "content": turn.content }));
+                conversation.push(json!({ "role": "user", "content": stall.prompt() }));
+
+                let note = make_step(next_step_id, "notice", stall.notice().to_string(), None, "done");
+                next_step_id += 1;
+                let _ = app.emit("agent-step", note.clone());
+                steps.push(note);
                 continue;
             }
 
@@ -1892,8 +2314,9 @@ pub async fn run(
                 continue;
             }
 
-            let args: Value =
-                serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+            let args: Value = normalize_args(
+                serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({})),
+            );
 
             // The checklist is shown as its own card, not as a tool step.
             if call.name == "set_objectives" {
@@ -2006,6 +2429,7 @@ pub async fn run(
             };
 
             if ok && is_change(&call.name) {
+                changed_files = true;
                 let _ = app.emit("workspace:file-changed", file.to_string());
                 if is_code_file(file) {
                     unchecked_code = true;
@@ -2046,6 +2470,7 @@ pub async fn run(
             if ok {
                 turns_without_progress = 0;
                 nudges = 0;
+                stall_nudges = 0;
             }
 
             calls_since_objectives += 1;
@@ -2303,6 +2728,121 @@ mod tests {
     }
 
     #[test]
+    fn cleans_paths_and_reads_partial_calls() {
+        for (raw, clean) in [
+            ("\"\"", ""),
+            ("''", ""),
+            (" \"src\" ", "src"),
+            ("`src/app.ts`", "src/app.ts"),
+            (".", ""),
+            ("./", ""),
+            ("./index.html", "index.html"),
+            ("index.html", "index.html"),
+        ] {
+            assert_eq!(clean_path(raw), clean, "{raw}");
+        }
+        assert_eq!(normalize_args(json!({ "path": "\"\"" }))["path"], "");
+
+        assert_eq!(partial_path("{\"path\": \"site/index.html\", \"content\": \"<!doc"), Some("site/index.html".into()));
+        assert_eq!(partial_path("{\"path\": \"site/ind"), None);
+        assert_eq!(partial_path("{\"content\": \"x"), None);
+    }
+
+    #[test]
+    fn spots_a_tool_call_lost_to_the_limit() {
+        let lost = StreamedTurn {
+            reasoning: "Let me start by creating the project structure.".into(),
+            finish_reason: "length".into(),
+            ..Default::default()
+        };
+        assert!(lost_tool_call(&lost));
+        assert!(continuation_prompt(&lost).contains("append: true"));
+
+        let long_thinking = StreamedTurn { reasoning: "x".repeat(9_000), ..lost_clone(&lost) };
+        assert!(!lost_tool_call(&long_thinking));
+        let answered = StreamedTurn { content: "Here is".into(), ..lost_clone(&lost) };
+        assert!(!lost_tool_call(&answered));
+        let stopped = StreamedTurn { finish_reason: "stop".into(), ..lost_clone(&lost) };
+        assert!(!lost_tool_call(&stopped));
+
+        fn lost_clone(turn: &StreamedTurn) -> StreamedTurn {
+            StreamedTurn {
+                content: turn.content.clone(),
+                reasoning: turn.reasoning.clone(),
+                tool_calls: Vec::new(),
+                finish_reason: turn.finish_reason.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn notices_a_stop_before_acting() {
+        let request = "Help me create a basic website for my product.";
+        // Thinking only.
+        assert_eq!(stall_of("", "I need to create index.html first.", request, false), Some(Stall::ThinkingOnly));
+        assert_eq!(stall_of("", "", request, false), None);
+        // Announced steps.
+        for reply in [
+            "I'll start by creating the HTML file.",
+            "The folder is empty. Let me create the project structure.",
+            "Now I'll add the styles:",
+            "Creating the files now...",
+            "Great, that worked.\n\nNext, I'll write script.js.",
+            "Let\u{2019}s add the stylesheet.",
+        ] {
+            assert_eq!(stall_of(reply, "", request, true), Some(Stall::Announced), "{reply}");
+        }
+        // Proper endings.
+        for reply in [
+            "Hello! How can I help you today?",
+            "Done: created index.html and styles.css.",
+            "The site is ready. Let me know if you'd like changes.",
+            "Want me to add a contact form?",
+            "I've added the page. I'd be happy to add more sections.",
+            "I will need the logo file to continue. Could you add it to the folder?",
+        ] {
+            assert_eq!(stall_of(reply, "", request, true), None, "{reply}");
+        }
+
+        // Code in the reply instead of files, only when a change was asked for.
+        let code = format!("Here it is:\n```html\n{}```", "<p>line</p>\n".repeat(15));
+        assert_eq!(stall_of(&code, "", request, false), Some(Stall::CodeInReply));
+        assert_eq!(stall_of(&code, "", request, true), None);
+        assert_eq!(stall_of(&code, "", "Explain how the router works", false), None);
+    }
+
+    #[test]
+    fn recovers_calls_written_as_text() {
+        let tools = tool_schema();
+        let mut turn = StreamedTurn {
+            content: "Creating it.\n<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.html\", \"content\": \"x\"}}</tool_call>".into(),
+            finish_reason: "stop".into(),
+            ..Default::default()
+        };
+        recover_text_calls(&mut turn, &tools);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "write_file");
+        assert_eq!(turn.content, "Creating it.");
+
+        // From the thinking, when the reply has none.
+        let mut thinking = StreamedTurn {
+            reasoning: "Plan.\n<tool_call>{\"name\": \"list_files\", \"arguments\": {}}</tool_call>".into(),
+            ..Default::default()
+        };
+        recover_text_calls(&mut thinking, &tools);
+        assert_eq!(thinking.tool_calls[0].name, "list_files");
+        assert_eq!(thinking.reasoning, "Plan.");
+
+        // Unknown tools stay text.
+        let mut other = StreamedTurn {
+            content: "<tool_call>{\"name\": \"format_disk\", \"arguments\": {}}</tool_call>".into(),
+            ..Default::default()
+        };
+        recover_text_calls(&mut other, &tools);
+        assert!(other.tool_calls.is_empty());
+    }
+
+    #[test]
     fn waits_out_rate_limits() {
         let http = |status, retry_after| Failure::Http { status, message: String::new(), retry_after };
         assert!(rate_limited(&http(429, None)));
@@ -2332,7 +2872,11 @@ mod tests {
 
     #[test]
     fn continues_cut_off_replies() {
-        let mut turn = StreamedTurn { finish_reason: "length".into(), ..Default::default() };
+        let mut turn = StreamedTurn {
+            finish_reason: "length".into(),
+            reasoning: "a long chain of thought ".repeat(400),
+            ..Default::default()
+        };
         assert!(turn.cut_off());
         assert!(continuation_prompt(&turn).contains("thinking"));
         turn.content = "Half an answ".into();

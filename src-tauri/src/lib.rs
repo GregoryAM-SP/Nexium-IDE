@@ -8,6 +8,7 @@ mod llm;
 mod run;
 mod secrets;
 mod store;
+mod text_calls;
 mod terminal;
 mod web;
 mod workspace;

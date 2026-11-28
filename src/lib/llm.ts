@@ -75,6 +75,22 @@ export type AgentDelta = {
   text: string;
 };
 
+/**
+ * What a run is doing when the timeline has nothing new to show: waiting for
+ * the model, thinking, writing its reply, or receiving a tool call (a whole
+ * file can take a minute to arrive).
+ */
+export type RunActivity = {
+  phase: "waiting" | "thinking" | "answering" | "composing" | "calling";
+  tool?: string;
+  path?: string;
+  /** Characters of the tool call's arguments received so far. */
+  chars?: number;
+  /** When this phase began, and when anything last arrived (ms). */
+  since: number;
+  at: number;
+};
+
 export type AgentReply = {
   text: string;
   reasoning: string | null;

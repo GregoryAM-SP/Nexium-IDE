@@ -137,6 +137,7 @@ import type {
   AgentStep,
   ApprovalRequest,
   ChatMessage,
+  RunActivity,
 } from "./lib/llm";
 import { isTauri, toError } from "./lib/tauriBridge";
 import {
@@ -183,7 +184,7 @@ const AUTO_APPROVE_KEY = "nexium.assistant.autoApprove";
 type SessionRuntime = {
   messages: AssistantMessage[];
   condensed: CondensedHistory | null;
-  live: { blocks: MessageBlock[] } | null;
+  live: { blocks: MessageBlock[]; activity?: RunActivity | null } | null;
   pending: boolean;
   condensing: boolean;
   approvals: Record<number, ApprovalRequest>;
@@ -405,7 +406,39 @@ export default function App() {
 
       const next = update(blocks);
       liveBlocks.current[id] = next;
-      patchSession(id, () => ({ live: { blocks: next } }));
+      patchSession(id, (runtime) => ({ live: { ...runtime.live, blocks: next } }));
+    },
+    [patchSession],
+  );
+  // What the run is doing right now, for the live status line.
+  const setActivity = useCallback(
+    (id: string, next: Omit<RunActivity, "since" | "at"> | null) => {
+      if (!liveBlocks.current[id]) {
+        return;
+      }
+
+      patchSession(id, (runtime) => {
+        if (!runtime.live) {
+          return {};
+        }
+
+        const now = Date.now();
+        const previous = runtime.live.activity;
+        const samePhase =
+          previous &&
+          next &&
+          previous.phase === next.phase &&
+          previous.tool === next.tool;
+
+        return {
+          live: {
+            ...runtime.live,
+            activity: next
+              ? { ...next, since: samePhase ? previous.since : now, at: now }
+              : null,
+          },
+        };
+      });
     },
     [patchSession],
   );
@@ -1873,14 +1906,28 @@ export default function App() {
     attach<AgentStep & { session?: string }>("agent-step", ({ session, ...step }) => {
       if (session) {
         updateLive(session, (blocks) => upsertStep(blocks, step));
+        // The step shows what happens now.
+        setActivity(session, null);
       }
     });
 
     attach<AgentDelta & { session?: string }>("agent-delta", ({ session, ...delta }) => {
       if (session) {
         updateLive(session, (blocks) => appendDelta(blocks, delta));
+        setActivity(session, {
+          phase: delta.kind === "reasoning" ? "thinking" : "answering",
+        });
       }
     });
+
+    attach<Omit<RunActivity, "since" | "at"> & { session?: string }>(
+      "agent-activity",
+      ({ session, ...activity }) => {
+        if (session) {
+          setActivity(session, activity);
+        }
+      },
+    );
 
     attach<ApprovalRequest>("agent-approval", (request) => {
       const session = request.session;
@@ -1898,7 +1945,7 @@ export default function App() {
         stop();
       }
     };
-  }, [patchSession, updateLive]);
+  }, [patchSession, setActivity, updateLive]);
 
   // The assistant can rewrite a file through its tools; keep the editor in sync.
   const contentsRef = useRef<Record<string, string>>({});

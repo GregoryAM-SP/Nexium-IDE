@@ -56,7 +56,7 @@ import type { ModelOption, ModelRef } from "../lib/assistantSettings";
 import { estimateTokens, formatTokens } from "../lib/contextBudget";
 import type { CondensedHistory } from "../lib/contextBudget";
 import { lineDiff } from "../lib/lineDiff";
-import type { AgentStep, ApprovalRequest, Objective } from "../lib/llm";
+import type { AgentStep, ApprovalRequest, Objective, RunActivity } from "../lib/llm";
 import MarkdownMessage from "./MarkdownMessage";
 import { UNTITLED } from "../lib/sessions";
 import type { SessionSummary } from "../lib/sessions";
@@ -69,7 +69,7 @@ type AiAssistantProps = {
   /** The model the assistant is using, if one is set up. */
   model: ModelRef | null;
   pending: boolean;
-  live: { blocks: MessageBlock[] } | null;
+  live: { blocks: MessageBlock[]; activity?: RunActivity | null } | null;
   contextPath: string | null;
   /** Every turned-on model of every connected provider. */
   models: ModelOption[];
@@ -1786,33 +1786,85 @@ function ApprovalCard({
 }
 
 type LiveRunProps = Omit<TimelineProps, "blocks" | "live"> & {
-  live: { blocks: MessageBlock[] } | null;
+  live: { blocks: MessageBlock[]; activity?: RunActivity | null } | null;
   model: string;
 };
 
+function sizeOf(chars: number): string {
+  return chars < 1024 ? `${chars} B` : `${(chars / 1024).toFixed(1)} KB`;
+}
+
+/** The status line for a tool call that is still arriving. */
+function callStatus(activity: RunActivity): string {
+  const path = activity.path ? activity.path : "a file";
+  const size = activity.chars ? ` · ${sizeOf(activity.chars)}` : "";
+
+  switch (activity.tool) {
+    case "write_file":
+      return `Writing ${path}${size}`;
+    case "edit_file":
+      return `Preparing an edit to ${path}${size}`;
+    case "read_file":
+      return `Opening ${path}`;
+    case "list_files":
+      return "Listing files";
+    case "search_text":
+      return "Searching";
+    case "run_command":
+      return "Preparing a command";
+    case "set_objectives":
+      return "Planning objectives";
+    default:
+      return activity.tool ? `Calling ${activity.tool}` : "Preparing the next step";
+  }
+}
+
+/** Seconds without new output after which the status line says so. */
+const QUIET_AFTER = 15;
+
 function LiveRun({ live, model, ...timeline }: LiveRunProps) {
-  const [seconds, setSeconds] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const started = useRef(Date.now());
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setSeconds(Math.floor((Date.now() - started.current) / 1000));
-    }, 1000);
-
+    const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
 
+  const seconds = Math.max(0, Math.floor((now - started.current) / 1000));
   const blocks = live?.blocks ?? [];
+  const activity = live?.activity ?? null;
   const last = blocks[blocks.length - 1];
   const waitingOnUser = blocks.some(
     (block) => block.type === "step" && block.step.status === "awaiting",
   );
-  // Text or thinking that is still arriving shows its own progress; between
-  // steps (or before the first token) a quiet status line does.
-  const idle =
-    !waitingOnUser &&
-    (!last ||
-      (last.type === "step" && last.step.status !== "running"));
+  const since = (time: number) => Math.max(0, Math.floor((now - time) / 1000));
+  const quiet = activity ? since(activity.at) : 0;
+
+  // Always say what is happening, so a long tool call or a slow model never
+  // looks frozen. A running step shows its own spinner.
+  let status: string | null = null;
+  if (waitingOnUser) {
+    status = null;
+  } else if (activity?.phase === "calling") {
+    status = `${callStatus(activity)}… ${since(activity.since)}s`;
+  } else if (activity?.phase === "waiting") {
+    status = `${model ? `Waiting for ${model}` : "Waiting for the model"}… ${since(activity.since)}s`;
+  } else if (activity?.phase === "composing") {
+    status = `Composing the next step… ${since(activity.since)}s`;
+  } else if (activity?.phase === "thinking") {
+    status = `Thinking… ${since(activity.since)}s`;
+  } else if (activity?.phase === "answering") {
+    status = quiet >= QUIET_AFTER ? "Writing the reply…" : null;
+  } else if (!last) {
+    status = `${model ? `Waiting for ${model}` : "Thinking"}… ${seconds}s`;
+  } else if (last.type !== "step" || last.step.status !== "running") {
+    status = "Working…";
+  }
+  const idle = status !== null;
+  const slowStart =
+    (blocks.length === 0 && seconds >= 20) ||
+    (activity?.phase === "waiting" && since(activity.since) >= 20);
 
   return (
     <div className="space-y-2.5">
@@ -1825,16 +1877,27 @@ function LiveRun({ live, model, ...timeline }: LiveRunProps) {
       )}
 
       {idle && (
-        <div className="space-y-1">
+        <div className="space-y-1" role="status" aria-live="polite">
           <p className="flex items-center gap-1.5 text-[11px] text-ink/40">
-            <LoaderCircle className="size-3 animate-spin" />
-            {blocks.length === 0
-              ? `${model ? `Waiting for ${model}` : "Thinking"}… ${seconds}s`
-              : "Working…"}
+            <LoaderCircle className="size-3 shrink-0 animate-spin" />
+            <span className="min-w-0 truncate">{status}</span>
+            {activity && activity.phase !== "waiting" && quiet >= QUIET_AFTER && (
+              <span className="shrink-0 text-ink/25">· no new output for {quiet}s</span>
+            )}
           </p>
-          {blocks.length === 0 && seconds >= 20 && (
+          {slowStart && (
             <p className="text-[10px] leading-relaxed text-ink/25">
               Large models can take a minute or more before the first token.
+            </p>
+          )}
+          {activity?.phase === "composing" && since(activity.since) >= 15 && (
+            <p className="text-[10px] leading-relaxed text-ink/25">
+              The model is writing its next tool call; some providers send it only once it is complete, so a whole file can take a minute or two.
+            </p>
+          )}
+          {activity?.phase === "calling" && activity.tool === "write_file" && since(activity.since) >= 20 && (
+            <p className="text-[10px] leading-relaxed text-ink/25">
+              The model sends the whole file before it is written; big files take a while.
             </p>
           )}
         </div>

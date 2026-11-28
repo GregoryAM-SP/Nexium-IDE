@@ -80,6 +80,38 @@ export function appendDelta(
  * answer text the first answer block. Messages saved before this rule
  * display joined too.
  */
+const TOOL_NAMES =
+  "read_file|write_file|edit_file|list_files|search_text|run_command|set_objectives|session_status|message_sessions";
+
+/** Tool-call markup some models write as text; the backend runs those calls. */
+const TOOL_MARKUP: RegExp[] = [
+  /<tool_call>[\s\S]*?(?:<\/tool_call>|$)/g,
+  /<function_call>[\s\S]*?(?:<\/function_call>|$)/g,
+  new RegExp(String.raw`<function=(?:${TOOL_NAMES})>[\s\S]*?(?:<\/function>|$)`, "g"),
+  /<\|tool_calls_section_begin\|>[\s\S]*?(?:<\|tool_calls_section_end\|>|$)/g,
+  /<\|tool_call_begin\|>[\s\S]*?(?:<\|tool_call_end\|>|$)/g,
+  /<｜tool▁calls▁begin｜>[\s\S]*?(?:<｜tool▁calls▁end｜>|$)/g,
+  /<｜tool▁call▁begin｜>[\s\S]*?(?:<｜tool▁call▁end｜>|$)/g,
+  /\[TOOL_CALLS\][\s\S]*$/g,
+  new RegExp(
+    String.raw`${"`".repeat(3)}(?:json|tool_call)?\s*\{\s*"(?:name|tool)"\s*:\s*"(?:${TOOL_NAMES})"[\s\S]*?(?:${"`".repeat(3)}|$)`,
+    "g",
+  ),
+];
+
+/** The text with any tool-call markup taken out. */
+export function hideToolMarkup(text: string): string {
+  if (!/<tool_call>|<function|<\||<｜|\[TOOL_CALLS\]|```/.test(text)) {
+    return text;
+  }
+
+  let result = text;
+  for (const pattern of TOOL_MARKUP) {
+    result = result.replace(pattern, "");
+  }
+  return result === text ? text : result.replace(/\n{3,}/g, "\n\n");
+}
+
 export function mergeBlocks(blocks: MessageBlock[]): MessageBlock[] {
   const merged: MessageBlock[] = [];
   let segment: { reasoning?: number; text?: number } = {};
@@ -106,7 +138,12 @@ export function mergeBlocks(blocks: MessageBlock[]): MessageBlock[] {
     }
   }
 
-  return merged;
+  // Calls written as text are shown as steps; their markup is not.
+  return merged
+    .map((block) =>
+      block.type === "step" ? block : { ...block, text: hideToolMarkup(block.text) },
+    )
+    .filter((block) => block.type === "step" || block.text.trim() !== "");
 }
 
 const squash = (text: string) => text.replace(/\s+/g, " ").trim();
