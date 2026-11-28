@@ -36,6 +36,7 @@ import {
   X,
   Zap,
   Layers,
+  ListPlus,
   Archive,
   ArchiveRestore,
   History,
@@ -48,7 +49,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import { objectivesOf } from "../lib/assistantMessages";
+import { mergeBlocks, objectivesOf } from "../lib/assistantMessages";
 import type { AssistantMessage, MessageBlock } from "../lib/assistantMessages";
 import { sameModel } from "../lib/assistantSettings";
 import type { ModelOption, ModelRef } from "../lib/assistantSettings";
@@ -115,6 +116,12 @@ type AiAssistantProps = {
   condensing: boolean;
   canCondense: boolean;
   onCondense: () => void;
+  /** Messages waiting for the current reply to finish, in order. */
+  queue: { id: number; text: string }[];
+  /** A Stop or an error paused the queue. */
+  queuePaused: boolean;
+  onRemoveQueued: (id: number) => void;
+  onResumeQueue: () => void;
   /** Saved sessions of this project, most recent first. */
   sessions: SessionSummary[];
   /** The session shown; null for a new one not yet started. */
@@ -166,6 +173,10 @@ export default function AiAssistant({
   condensing,
   canCondense,
   onCondense,
+  queue,
+  queuePaused,
+  onRemoveQueued,
+  onResumeQueue,
   sessions,
   activeSessionId,
   runningSessionIds,
@@ -284,8 +295,9 @@ export default function AiAssistant({
     setAtBottom(true);
   }, [messages, pending, live, approvals]);
 
-  const canSend =
-    configured && !pending && !condensing && prompt.trim().length > 0;
+  // While the assistant works, sending queues the message instead.
+  const canSend = configured && prompt.trim().length > 0;
+  const queueing = pending || condensing;
 
   const submit = () => {
     if (!canSend) {
@@ -554,6 +566,80 @@ export default function AiAssistant({
               <span className="truncate font-mono">{contextPath}</span>
             </div>
           )}
+          {queue.length > 0 && (
+            <div className="mb-2 rounded-xl border border-ink/[0.08] bg-ink/[0.02] px-2.5 py-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.16em] text-ink/40">
+                  <ListPlus className="size-3" strokeWidth={1.75} />
+                  Queued · {queue.length}
+                </span>
+                {queuePaused ? (
+                  <button
+                    type="button"
+                    onClick={onResumeQueue}
+                    title="Send the queued messages, one after another"
+                    className="flex h-6 items-center gap-1 rounded-md bg-ink px-2 text-[10.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90"
+                  >
+                    <Play className="size-3" strokeWidth={2} />
+                    {pending ? "Resume after this reply" : "Resume"}
+                  </button>
+                ) : (
+                  <span className="text-[10px] text-ink/30">
+                    {pending ? "Sent one by one after this reply" : "Sending…"}
+                  </span>
+                )}
+              </div>
+              {queuePaused && (
+                <p className="mt-1 text-[10.5px] leading-relaxed text-ink/40">
+                  Paused after the last reply stopped or failed.
+                </p>
+              )}
+              <ol className="mt-1.5 space-y-1">
+                {queue.map((item, index) => (
+                  <li
+                    key={item.id}
+                    className="group flex items-start gap-2 rounded-md px-1.5 py-1 hover:bg-ink/[0.04]"
+                  >
+                    <span className="mt-px w-4 shrink-0 text-right font-mono text-[10px] text-ink/25">
+                      {index + 1}
+                    </span>
+                    <span
+                      title={item.text}
+                      className="min-w-0 flex-1 truncate text-[11.5px] text-ink/70"
+                    >
+                      {item.text}
+                    </span>
+                    <span className="flex shrink-0 items-center opacity-0 transition-opacity duration-150 focus-within:opacity-100 group-hover:opacity-100">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPrompt((current) =>
+                            current.trim() ? `${current}\n\n${item.text}` : item.text,
+                          );
+                          onRemoveQueued(item.id);
+                          promptRef.current?.focus();
+                        }}
+                        aria-label={`Edit queued message ${index + 1}`}
+                        title="Edit (moves it back into the message box)"
+                        className={iconButton}
+                      >
+                        <Pencil className="size-3" strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveQueued(item.id)}
+                        aria-label={`Remove queued message ${index + 1}`}
+                        title="Remove from the queue"
+                        className={iconButton}
+                      >
+                        <X className="size-3" strokeWidth={2} />
+                      </button>
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
           <div className="rounded-xl border border-ink/[0.08] bg-ink/[0.03] transition-colors duration-150 focus-within:border-ink/20 focus-within:bg-ink/[0.045]">
             {configured && (
               <div
@@ -687,12 +773,12 @@ export default function AiAssistant({
                 }
               }}
               rows={2}
-              disabled={!configured || pending}
+              disabled={!configured}
               placeholder={
                 !configured
                   ? "Connect a model in Settings"
-                  : pending
-                    ? "The assistant is working…"
+                  : queueing
+                    ? "Add a message; it is sent when this reply finishes…"
                     : "Ask, or describe a change…"
               }
               aria-label="Message the assistant"
@@ -713,16 +799,29 @@ export default function AiAssistant({
                   Enter to send · Shift+Enter for newline
                 </span>
               )}
-              {pending ? (
-                <button
-                  type="button"
-                  onClick={onStop}
-                  aria-label="Stop the assistant"
-                  title="Stop the assistant"
-                  className="flex size-7 items-center justify-center rounded-lg border border-ink/15 text-ink/60 transition-colors duration-150 hover:border-ink/40 hover:bg-ink/[0.06] hover:text-ink"
-                >
-                  <Square className="size-3 fill-current" />
-                </button>
+              {queueing ? (
+                <span className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={submit}
+                    disabled={!canSend}
+                    aria-label="Queue message"
+                    title="Queue this message: it is sent when the current reply finishes (Enter)"
+                    className="flex h-7 items-center gap-1 rounded-lg bg-ink px-2 text-[10.5px] font-medium text-app transition-colors duration-150 hover:bg-ink/90 disabled:bg-ink/10 disabled:text-ink/30"
+                  >
+                    <ListPlus className="size-3.5" strokeWidth={2} />
+                    Queue
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onStop}
+                    aria-label="Stop the assistant"
+                    title="Stop the assistant (the queue pauses)"
+                    className="flex size-7 items-center justify-center rounded-lg border border-ink/15 text-ink/60 transition-colors duration-150 hover:border-ink/40 hover:bg-ink/[0.06] hover:text-ink"
+                  >
+                    <Square className="size-3 fill-current" />
+                  </button>
+                </span>
               ) : (
                 <button
                   type="button"
@@ -897,7 +996,8 @@ function Timeline({
   large,
   live = false,
 }: TimelineProps) {
-  const groups = useMemo(() => groupBlocks(blocks), [blocks]);
+  // Saved turns may hold interleaved pieces; show each turn joined.
+  const groups = useMemo(() => groupBlocks(mergeBlocks(blocks)), [blocks]);
   const objectives = useMemo(() => objectivesOf(blocks), [blocks]);
 
   return (

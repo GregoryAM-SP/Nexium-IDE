@@ -22,47 +22,87 @@ export type AssistantMessage = {
   outOfSteps?: boolean;
 };
 
-/**
- * Streamed text joins the block before it when that block is the same kind.
- * A whitespace-only piece of the other kind (some providers send a stray
- * "
+/** Where the current model turn starts: just after the last tool step. */
+function segmentStart(blocks: MessageBlock[]): number {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    if (blocks[index].type === "step") {
+      return index + 1;
+    }
+  }
 
-" of answer in the middle of thinking) joins the current block instead
- * of starting a new one, so one reply never splits into several.
+  return 0;
+}
+
+/**
+ * Adds a streamed piece to the turn. Between two tool steps a turn keeps one
+ * thinking block and one answer block: some models interleave the two as
+ * they stream ("thinking, Hello, thinking, ! How can I help"), and every
+ * piece joins the block of its kind instead of starting a new one, so the
+ * answer reads as one and the thinking stays in one place. A whitespace-only
+ * piece with no block of its kind yet joins the newest block.
  */
 export function appendDelta(
   blocks: MessageBlock[],
   delta: AgentDelta,
 ): MessageBlock[] {
   const type = delta.kind === "reasoning" ? "reasoning" : "text";
-  const last = blocks[blocks.length - 1];
+  const from = segmentStart(blocks);
+  let target = -1;
 
-  if (last && last.type !== "step" && (last.type === type || delta.text.trim() === "")) {
-    return [...blocks.slice(0, -1), { type: last.type, text: last.text + delta.text }];
+  for (let index = from; index < blocks.length; index += 1) {
+    if (blocks[index].type === type) {
+      target = index;
+    }
   }
 
-  return [...blocks, { type, text: delta.text }];
+  if (target < 0 && delta.text.trim() === "" && blocks.length > from) {
+    target = blocks.length - 1;
+  }
+
+  if (target < 0) {
+    return [...blocks, { type, text: delta.text }];
+  }
+
+  const block = blocks[target];
+
+  if (block.type === "step") {
+    return [...blocks, { type, text: delta.text }];
+  }
+
+  const next = [...blocks];
+  next[target] = { type: block.type, text: block.text + delta.text };
+  return next;
 }
 
 /**
- * Drops whitespace-only text and thinking, then joins neighbours of the same
- * kind: what was one stream reads as one block, also for messages saved
- * before streaming was joined this way.
+ * The same rule for a finished or saved turn: whitespace-only pieces go, and
+ * between tool steps all thinking joins the first thinking block and all
+ * answer text the first answer block. Messages saved before this rule
+ * display joined too.
  */
 export function mergeBlocks(blocks: MessageBlock[]): MessageBlock[] {
   const merged: MessageBlock[] = [];
+  let segment: { reasoning?: number; text?: number } = {};
 
   for (const block of blocks) {
-    if (block.type !== "step" && block.text.trim() === "") {
+    if (block.type === "step") {
+      merged.push(block);
+      segment = {};
       continue;
     }
 
-    const last = merged[merged.length - 1];
+    if (block.text.trim() === "") {
+      continue;
+    }
 
-    if (block.type !== "step" && last && last.type === block.type) {
-      merged[merged.length - 1] = { type: block.type, text: last.text + block.text };
-    } else {
+    const existing = segment[block.type];
+
+    if (existing === undefined) {
+      segment[block.type] = merged.length;
       merged.push(block);
+    } else {
+      const current = merged[existing] as { type: "text" | "reasoning"; text: string };
+      merged[existing] = { type: block.type, text: current.text + block.text };
     }
   }
 

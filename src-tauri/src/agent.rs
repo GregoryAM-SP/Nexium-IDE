@@ -28,6 +28,11 @@ const MAX_CONTINUATIONS: usize = 4;
 const MAX_OBJECTIVE_NUDGES: usize = 2;
 /// Retries of a request that failed before the model sent anything.
 const MAX_RETRIES: usize = 2;
+/// How long a run keeps waiting out a provider's rate limit (or overload)
+/// before it gives up. Stop ends the wait at any time.
+const RATE_LIMIT_PATIENCE: Duration = Duration::from_secs(15 * 60);
+/// Waits between attempts when the provider does not say how long to wait.
+const RATE_LIMIT_BACKOFF: [u64; 6] = [5, 10, 20, 30, 45, 60];
 /// Reply tokens asked for per turn.
 const REPLY_TOKENS: u64 = 4096;
 /// Longest objectives list the agent may keep for one task.
@@ -1060,7 +1065,12 @@ fn turn_from_message(message: &Value) -> StreamedTurn {
 
 enum Failure {
     Transport(String),
-    Http { status: u16, message: String },
+    Http {
+        status: u16,
+        message: String,
+        /// Seconds the provider asked to wait (`Retry-After`), if it said.
+        retry_after: Option<u64>,
+    },
     EmptyStream,
     Cancelled,
 }
@@ -1105,10 +1115,12 @@ async fn stream_turn(
     let status = response.status().as_u16();
 
     if !(200..=299).contains(&status) {
+        let retry_after = retry_after(&response);
         let detail = llm::read_detail(response).await;
         return Err(Failure::Http {
             status,
             message: llm::describe(&endpoint.name, status, detail.as_deref()),
+            retry_after,
         });
     }
 
@@ -1224,10 +1236,12 @@ async fn send(
     let status = response.status().as_u16();
 
     if !(200..=299).contains(&status) {
+        let retry_after = retry_after(&response);
         let detail = llm::read_detail(response).await;
         return Err(Failure::Http {
             status,
             message: llm::describe(&endpoint.name, status, detail.as_deref()),
+            retry_after,
         });
     }
 
@@ -1289,6 +1303,171 @@ fn retryable(failure: &Failure) -> bool {
             matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 520..=529)
         }
         Failure::EmptyStream | Failure::Cancelled => false,
+    }
+}
+
+/// The provider's `Retry-After`, in seconds (the HTTP-date form is ignored).
+fn retry_after(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| seconds.ceil() as u64)
+}
+
+/// The provider is limiting or overloaded, not broken: worth waiting out.
+/// Some report it mid-stream as an error event instead of a status code.
+fn rate_limited(failure: &Failure) -> bool {
+    match failure {
+        Failure::Http { status, .. } => matches!(status, 429 | 503 | 529),
+        Failure::Transport(message) => {
+            let lower = message.to_lowercase();
+            lower.contains("rate limit")
+                || lower.contains("rate_limit")
+                || lower.contains("too many requests")
+                || lower.contains("overloaded")
+        }
+        Failure::EmptyStream | Failure::Cancelled => false,
+    }
+}
+
+/// Seconds before rate-limited attempt `attempt` (1-based): what the
+/// provider asked for (within reason), else a growing pause.
+fn rate_limit_delay(failure: &Failure, attempt: usize) -> u64 {
+    if let Failure::Http { retry_after: Some(seconds), .. } = failure {
+        return (*seconds).clamp(1, 120);
+    }
+
+    RATE_LIMIT_BACKOFF[(attempt.max(1) - 1).min(RATE_LIMIT_BACKOFF.len() - 1)]
+}
+
+fn rate_limit_reason(failure: &Failure) -> &'static str {
+    match failure {
+        Failure::Http { status: 503 | 529, .. } => "is overloaded",
+        _ => "is rate-limiting requests",
+    }
+}
+
+fn spoken_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+/// Sends one turn and keeps it going: a rate limit (or overload) is waited
+/// out for up to `RATE_LIMIT_PATIENCE`, with one note in the timeline that
+/// counts the attempts; other passing failures are retried `MAX_RETRIES`
+/// times. Stop ends any wait.
+#[allow(clippy::too_many_arguments)]
+async fn request_patiently(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    body: &mut Value,
+    app: &RunContext,
+    streaming: &mut bool,
+    cancel: &AtomicBool,
+    next_step_id: &mut usize,
+    steps: &mut Vec<AgentStep>,
+) -> Result<StreamedTurn, Failure> {
+    let started = std::time::Instant::now();
+    let mut limited = 0usize;
+    let mut other = 0usize;
+    let mut note: Option<AgentStep> = None;
+
+    let show = |step: AgentStep, steps: &mut Vec<AgentStep>| {
+        let _ = app.emit("agent-step", step.clone());
+        match steps.iter_mut().find(|existing| existing.id == step.id) {
+            Some(existing) => *existing = step,
+            None => steps.push(step),
+        }
+    };
+
+    loop {
+        match request_turn(client, endpoint, body, app, streaming, cancel).await {
+            Ok(turn) => {
+                if let Some(mut waited) = note.take() {
+                    waited.status = "done".into();
+                    waited.title = format!(
+                        "{} was rate-limiting requests; waited {} and continued",
+                        endpoint.name,
+                        spoken_duration(started.elapsed())
+                    );
+                    waited.detail = None;
+                    show(waited, steps);
+                }
+                return Ok(turn);
+            }
+            Err(failure) if rate_limited(&failure) && started.elapsed() < RATE_LIMIT_PATIENCE => {
+                limited += 1;
+                let wait = rate_limit_delay(&failure, limited);
+                let id = match &note {
+                    Some(existing) => existing.id,
+                    None => {
+                        let id = *next_step_id;
+                        *next_step_id += 1;
+                        id
+                    }
+                };
+                let waiting = make_step(
+                    id,
+                    "notice",
+                    format!(
+                        "{} {}; trying again in {wait}s (attempt {})",
+                        endpoint.name,
+                        rate_limit_reason(&failure),
+                        limited + 1
+                    ),
+                    Some("The assistant waits and carries on by itself; press Stop to give up.".into()),
+                    "running",
+                );
+                show(waiting.clone(), steps);
+                note = Some(waiting);
+
+                if !wait_unless_cancelled(wait, cancel).await {
+                    return Err(Failure::Cancelled);
+                }
+            }
+            Err(failure) if rate_limited(&failure) => {
+                if let Some(mut waited) = note.take() {
+                    waited.status = "error".into();
+                    waited.title = format!(
+                        "{} kept rate-limiting requests for {}",
+                        endpoint.name,
+                        spoken_duration(started.elapsed())
+                    );
+                    waited.detail = None;
+                    show(waited, steps);
+                }
+                return Err(Failure::Transport(format!(
+                    "{} kept rate-limiting requests for {}, so the assistant stopped waiting. The free allowance may be used up for now: try again later, or switch provider.",
+                    endpoint.name,
+                    spoken_duration(started.elapsed())
+                )));
+            }
+            Err(failure) if retryable(&failure) && other < MAX_RETRIES => {
+                other += 1;
+                let wait = retry_delay(&failure, other);
+                let notice = make_step(
+                    *next_step_id,
+                    "notice",
+                    format!("The request failed; retrying in {wait}s ({other} of {MAX_RETRIES})"),
+                    Some(failure.message()),
+                    "done",
+                );
+                *next_step_id += 1;
+                show(notice, steps);
+
+                if !wait_unless_cancelled(wait, cancel).await {
+                    return Err(Failure::Cancelled);
+                }
+            }
+            Err(failure) => return Err(failure),
+        }
     }
 }
 
@@ -1544,39 +1723,23 @@ pub async fn run(
         }
 
 
-        let mut attempt = 0usize;
-        let outcome = loop {
-            match request_turn(&client, endpoint, &mut body, app, &mut streaming, cancel).await {
-                Err(failure)
-                    if attempt < MAX_RETRIES
-                        && retryable(&failure)
-                        && !(tools_enabled && iteration == 0 && failure.tools_rejected()) =>
-                {
-                    attempt += 1;
-                    let wait = retry_delay(&failure, attempt);
-                    let note = make_step(
-                        next_step_id,
-                        "notice",
-                        format!("The request failed; retrying in {wait}s ({attempt} of {MAX_RETRIES})"),
-                        Some(failure.message()),
-                        "done",
-                    );
-                    next_step_id += 1;
-                    let _ = app.emit("agent-step", note.clone());
-                    steps.push(note);
-
-                    if !wait_unless_cancelled(wait, cancel).await {
-                        return Err(Failure::Cancelled.message());
-                    }
-                }
-                other => break other,
-            }
-        };
+        let outcome = request_patiently(
+            &client,
+            endpoint,
+            &mut body,
+            app,
+            &mut streaming,
+            cancel,
+            &mut next_step_id,
+            &mut steps,
+        )
+        .await;
+        let first_turn = iteration == 0;
         iteration += 1;
 
         let turn = match outcome {
             Ok(turn) => turn,
-            Err(failure) if tools_enabled && iteration == 0 && failure.tools_rejected() => {
+            Err(failure) if tools_enabled && first_turn && failure.tools_rejected() => {
                 let reason = failure.message();
                 tools_enabled = false;
 
@@ -1596,9 +1759,18 @@ pub async fn run(
                     object.remove("tool_choice");
                 }
 
-                request_turn(&client, endpoint, &mut body, app, &mut streaming, cancel)
-                    .await
-                    .map_err(Failure::message)?
+                request_patiently(
+                    &client,
+                    endpoint,
+                    &mut body,
+                    app,
+                    &mut streaming,
+                    cancel,
+                    &mut next_step_id,
+                    &mut steps,
+                )
+                .await
+                .map_err(Failure::message)?
             }
             Err(failure) => return Err(failure.message()),
         };
@@ -1942,8 +2114,18 @@ pub async fn run(
         final_body["stream"] = json!(true);
     }
 
-    if let Ok(turn) = request_turn(&client, endpoint, &mut final_body, app, &mut streaming, cancel)
-        .await
+    let mut final_step_id = steps.iter().map(|step| step.id).max().unwrap_or(0) + 1;
+    if let Ok(turn) = request_patiently(
+        &client,
+        endpoint,
+        &mut final_body,
+        app,
+        &mut streaming,
+        cancel,
+        &mut final_step_id,
+        &mut steps,
+    )
+    .await
     {
         let text = if turn.content.trim().is_empty() {
             turn.reasoning.trim().to_string()
@@ -2109,7 +2291,7 @@ mod tests {
 
     #[test]
     fn retries_only_failures_that_can_pass_next_time() {
-        let http = |status| Failure::Http { status, message: String::new() };
+        let http = |status| Failure::Http { status, message: String::new(), retry_after: None };
         assert!(retryable(&Failure::Transport("reset".into())));
         assert!(retryable(&http(429)));
         assert!(retryable(&http(503)));
@@ -2118,6 +2300,34 @@ mod tests {
         assert!(!retryable(&Failure::Cancelled));
         assert_eq!(retry_delay(&http(429), 2), 20);
         assert_eq!(retry_delay(&http(500), 1), 3);
+    }
+
+    #[test]
+    fn waits_out_rate_limits() {
+        let http = |status, retry_after| Failure::Http { status, message: String::new(), retry_after };
+        assert!(rate_limited(&http(429, None)));
+        assert!(rate_limited(&http(503, None)));
+        assert!(rate_limited(&http(529, None)));
+        assert!(!rate_limited(&http(500, None)));
+        assert!(!rate_limited(&http(401, None)));
+        assert!(rate_limited(&Failure::Transport("Rate limit exceeded for model".into())));
+        assert!(rate_limited(&Failure::Transport("429 Too Many Requests".into())));
+        assert!(!rate_limited(&Failure::Transport("connection reset".into())));
+        assert!(!rate_limited(&Failure::Cancelled));
+
+        // The provider's Retry-After wins, within reason.
+        assert_eq!(rate_limit_delay(&http(429, Some(7)), 1), 7);
+        assert_eq!(rate_limit_delay(&http(429, Some(0)), 1), 1);
+        assert_eq!(rate_limit_delay(&http(429, Some(3600)), 1), 120);
+        // Otherwise the pause grows and then holds at a minute.
+        let waits: Vec<u64> = (1..=8).map(|attempt| rate_limit_delay(&http(429, None), attempt)).collect();
+        assert_eq!(waits, vec![5, 10, 20, 30, 45, 60, 60, 60]);
+        let total: u64 = (1..=40).map(|attempt| rate_limit_delay(&http(429, None), attempt)).sum();
+        assert!(total > RATE_LIMIT_PATIENCE.as_secs(), "patience, not the attempt count, ends the wait");
+
+        assert_eq!(rate_limit_reason(&http(503, None)), "is overloaded");
+        assert_eq!(spoken_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(spoken_duration(Duration::from_secs(9)), "9s");
     }
 
     #[test]

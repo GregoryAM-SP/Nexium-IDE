@@ -187,7 +187,15 @@ type SessionRuntime = {
   pending: boolean;
   condensing: boolean;
   approvals: Record<number, ApprovalRequest>;
+  /** Messages sent while the assistant was busy, in order; each goes out
+   * when the reply before it finishes. */
+  queue: QueuedPrompt[];
+  /** A Stop or an error pauses the queue until the user resumes it. */
+  queuePaused: boolean;
 };
+
+/** A message waiting its turn. */
+export type QueuedPrompt = { id: number; text: string };
 
 const EMPTY_RUNTIME: SessionRuntime = {
   messages: [],
@@ -196,6 +204,8 @@ const EMPTY_RUNTIME: SessionRuntime = {
   pending: false,
   condensing: false,
   approvals: {},
+  queue: [],
+  queuePaused: false,
 };
 
 /** The Rust client reports a dead connection when a provider stays silent. */
@@ -1512,10 +1522,13 @@ export default function App() {
   ]);
 
   const handleSendPrompt = useCallback(
-    async (text: string, earlier: AssistantMessage[] = assistantMessages) => {
+    async (text: string, earlierMessages?: AssistantMessage[], targetSession?: string) => {
       // Everything below belongs to this session, even if the user switches
-      // to another one while it runs.
-      const sessionId = activeSessionId ?? (await startSession(text));
+      // to another one while it runs. A queued message names its session.
+      const sessionId = targetSession ?? activeSessionId ?? (await startSession(text));
+      const runtime = runtimesRef.current[sessionId];
+      const earlier = earlierMessages ?? runtime?.messages ?? [];
+      const condensed = runtime?.condensed ?? null;
       const setMessages = (
         update: (messages: AssistantMessage[]) => AssistantMessage[],
       ) => patchSession(sessionId, (runtime) => ({ messages: update(runtime.messages) }));
@@ -1641,6 +1654,8 @@ export default function App() {
             blocks: blocks.length > 0 && stopped ? blocks : undefined,
           },
         ]);
+        // Whatever is queued waits until the user says to go on.
+        patchSession(sessionId, () => ({ queuePaused: true }));
       };
 
       patchSession(sessionId, () => ({ pending: true }));
@@ -1695,11 +1710,9 @@ export default function App() {
     [
       activeContent,
       activeSessionId,
-      assistantMessages,
       autoApprove,
       chatTarget,
       condenseHistory,
-      condensed,
       contextPath,
       openFileContextChars,
       patchSession,
@@ -1709,6 +1722,71 @@ export default function App() {
       updateLive,
     ],
   );
+
+  /**
+   * The composer's send: straight away when the session is free, otherwise
+   * onto its queue, to go out when the current reply finishes.
+   */
+  const handleSubmit = useCallback(
+    (text: string) => {
+      const id = activeSessionId;
+      const runtime = id ? runtimesRef.current[id] : undefined;
+
+      if (id && runtime && (runtime.pending || runtime.condensing)) {
+        patchSession(id, (current) => ({
+          queue: [...current.queue, { id: nextMessageId.current++, text }],
+        }));
+        return;
+      }
+
+      void handleSendPrompt(text);
+    },
+    [activeSessionId, handleSendPrompt, patchSession],
+  );
+
+  // When a session is free and has something queued (and is not paused),
+  // the next message goes out. Every session's queue runs, shown or not.
+  const dispatching = useRef(new Set<string>());
+  const [queueTick, setQueueTick] = useState(0);
+  useEffect(() => {
+    for (const [id, runtime] of Object.entries(runtimes)) {
+      if (
+        runtime.pending ||
+        runtime.condensing ||
+        runtime.queuePaused ||
+        runtime.queue.length === 0 ||
+        dispatching.current.has(id)
+      ) {
+        continue;
+      }
+
+      const [next, ...rest] = runtime.queue;
+      dispatching.current.add(id);
+      patchSession(id, () => ({ queue: rest }));
+      void handleSendPrompt(next.text, undefined, id).finally(() => {
+        dispatching.current.delete(id);
+        // Look again: the run may have ended before this cleared.
+        setQueueTick((tick) => tick + 1);
+      });
+    }
+  }, [handleSendPrompt, patchSession, queueTick, runtimes]);
+
+  const handleRemoveQueued = useCallback(
+    (queuedId: number) => {
+      if (activeSessionId) {
+        patchSession(activeSessionId, (runtime) => ({
+          queue: runtime.queue.filter((item) => item.id !== queuedId),
+        }));
+      }
+    },
+    [activeSessionId, patchSession],
+  );
+
+  const handleResumeQueue = useCallback(() => {
+    if (activeSessionId) {
+      patchSession(activeSessionId, () => ({ queuePaused: false }));
+    }
+  }, [activeSessionId, patchSession]);
 
   const handleDecide = useCallback(
     (stepId: number, accept: boolean) => {
@@ -2107,6 +2185,10 @@ export default function App() {
     onCondense: () => void handleCondenseNow(),
     onRetry: handleRetry,
     onContinue: handleContinue,
+    queue: activeRuntime.queue,
+    queuePaused: activeRuntime.queuePaused,
+    onRemoveQueued: handleRemoveQueued,
+    onResumeQueue: handleResumeQueue,
     autoApprove,
     onToggleAutoApprove: toggleAutoApprove,
     sessions,
@@ -2286,7 +2368,7 @@ export default function App() {
               onToggleExplorer={() => setExplorerOpen((open) => !open)}
               fullscreen
               onToggleFullscreen={() => setAssistantFull(false)}
-              onSend={handleSendPrompt}
+              onSend={handleSubmit}
               seed={assistantSeed}
               onSeedConsumed={consumeAssistantSeed}
               onStop={() => void cancelAgent(activeSessionId ?? undefined)}
@@ -2609,7 +2691,7 @@ export default function App() {
               setAssistantOpen(true);
               setAssistantFull(true);
             }}
-            onSend={handleSendPrompt}
+            onSend={handleSubmit}
             seed={assistantSeed}
             onSeedConsumed={consumeAssistantSeed}
             onStop={() => void cancelAgent(activeSessionId ?? undefined)}
